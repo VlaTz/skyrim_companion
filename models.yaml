@@ -1,0 +1,28 @@
+# Манифест моделей для tools/download_models.py.
+# Всё скачивается в папку models/. enabled: false — пропустить.
+# Запуск:  python tools/download_models.py            (все enabled)
+#          python tools/download_models.py --only whisper:large-v3-ru
+
+whisper:
+  # Готовые модели в формате CTranslate2 — скачиваются как есть.
+  - name: small                 # ~480 МБ, быстро на CPU — модель по умолчанию
+    repo: Systran/faster-whisper-small
+    enabled: true
+  - name: medium                # ~1.5 ГБ, точнее, на CPU медленнее
+    repo: Systran/faster-whisper-medium
+    enabled: false
+  - name: large-v3-turbo        # ~1.6 ГБ, лучший вариант для GPU
+    repo: mobiuslabsgmbh/faster-whisper-large-v3-turbo
+    enabled: false
+  # Модель в формате transformers — после скачивания конвертируется в CTranslate2.
+  - name: large-v3-ru           # дообучена на русском, 3 ГБ -> ~1.6 ГБ после конвертации
+    repo: antony66/whisper-large-v3-russian
+    quantization: int8_float16
+    enabled: false
+
+xtts:
+  # Выразительный TTS с клонированием голоса по референсу, поддерживает русский.
+  # Лицензия весов — Coqui Public Model License: только некоммерческое использование.
+  - name: XTTS-v2               # ~1.9 ГБ
+    repo: coqui/XTTS-v2
+    enabled: true

@@ -1,0 +1,101 @@
+"""Синтез речи: XTTS-v2 (Coqui) с голосом и эмоциями по референсам персонажа.
+
+Референсы лежат в characters/<персонаж>/voice/<эмоция>/*.wav. При запуске для каждой
+эмоции один раз считается условие голоса (GPT-латент + эмбеддинг диктора), дальше
+синтез только подставляет нужное.
+"""
+
+from __future__ import annotations
+
+import logging
+import time
+from pathlib import Path
+from typing import Iterator
+
+import numpy as np
+import soundfile as sf
+import torch
+
+from companion.config import TTSConfig
+from companion.emotions import DEFAULT_EMOTION, EMOTIONS
+
+log = logging.getLogger(__name__)
+
+
+def _load_audio(audiopath, sampling_rate):
+    """Замена TTS.tts.models.xtts.load_audio: torchaudio в новых версиях читает wav
+    через torchcodec, которому нужен системный FFmpeg. soundfile + soxr обходятся без него."""
+    import soxr
+
+    audio, sr = sf.read(audiopath, dtype="float32", always_2d=True)
+    audio = audio.mean(axis=1)
+    if sr != sampling_rate:
+        audio = soxr.resample(audio, sr, sampling_rate)
+    return torch.from_numpy(np.clip(audio, -1, 1)).unsqueeze(0)
+
+
+class XttsTTS:
+    def __init__(self, cfg: TTSConfig, models_path: Path, voice_dir: Path):
+        import TTS.tts.models.xtts as xtts_module
+        from TTS.tts.configs.xtts_config import XttsConfig
+        from TTS.tts.models.xtts import Xtts
+
+        xtts_module.load_audio = _load_audio
+
+        model_dir = models_path / "xtts" / cfg.model
+        if not (model_dir / "model.pth").is_file():
+            raise FileNotFoundError(
+                f"Нет модели XTTS в {model_dir}. Запусти: python tools/download_models.py --only xtts"
+            )
+        self.cfg = cfg
+        t = time.perf_counter()
+        config = XttsConfig()
+        config.load_json(str(model_dir / "config.json"))
+        self.model = Xtts.init_from_config(config)
+        self.model.load_checkpoint(config, checkpoint_dir=str(model_dir), use_deepspeed=False)
+        self.model.to(cfg.device).eval()
+        self.sample_rate = config.audio.output_sample_rate
+
+        self.presets: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
+        for emotion in EMOTIONS:
+            refs = sorted((voice_dir / emotion).glob("*.wav"))
+            if refs:
+                self.presets[emotion] = self.model.get_conditioning_latents(audio_path=[str(p) for p in refs])
+        if DEFAULT_EMOTION not in self.presets:
+            raise FileNotFoundError(
+                f"Нет референсов {voice_dir / DEFAULT_EMOTION}/*.wav. Собери: python tools/make_voice_refs.py"
+            )
+        missing = [e for e in EMOTIONS if e not in self.presets]
+        if missing:
+            log.warning("Нет референсов для эмоций %s — будет %s", missing, DEFAULT_EMOTION)
+
+        # Прогрев: первая генерация на GPU заметно медленнее.
+        self.synthesize("Привет.", DEFAULT_EMOTION)
+        log.info("XTTS '%s' загружен на %s за %.1f с, эмоции: %s",
+                 cfg.model, cfg.device, time.perf_counter() - t, ", ".join(self.presets))
+
+    def _preset(self, emotion: str | None) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.presets.get(emotion or DEFAULT_EMOTION, self.presets[DEFAULT_EMOTION])
+
+    def _params(self) -> dict:
+        return dict(temperature=self.cfg.temperature, speed=self.cfg.speed, enable_text_splitting=True)
+
+    @torch.inference_mode()
+    def synthesize(self, text: str, emotion: str | None = None) -> tuple[np.ndarray, int]:
+        """Возвращает float32 моно и частоту дискретизации."""
+        t = time.perf_counter()
+        gpt_latent, speaker = self._preset(emotion)
+        out = self.model.inference(text, self.cfg.language, gpt_latent, speaker, **self._params())
+        audio = np.asarray(out["wav"], dtype=np.float32)
+        log.info("TTS %.2f с: %.1f с аудио [%s]", time.perf_counter() - t, len(audio) / self.sample_rate,
+                 emotion or DEFAULT_EMOTION)
+        return audio, self.sample_rate
+
+    @torch.inference_mode()
+    def stream(self, text: str, emotion: str | None = None) -> Iterator[np.ndarray]:
+        """Отдаёт аудио кусками по мере генерации — воспроизведение начинается раньше."""
+        gpt_latent, speaker = self._preset(emotion)
+        for chunk in self.model.inference_stream(text, self.cfg.language, gpt_latent, speaker,
+                                                 stream_chunk_size=self.cfg.stream_chunk_size,
+                                                 **self._params()):
+            yield chunk.detach().float().cpu().numpy().reshape(-1)

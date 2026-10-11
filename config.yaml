@@ -1,0 +1,61 @@
+# Настройки голосового сервиса. Пути — относительно корня проекта.
+
+models_dir: models
+
+# Персонаж: папка в characters/ — prompt.md (личность) и voice/<эмоция>/*.wav (голос).
+character: gosling
+
+server:
+  host: 127.0.0.1
+  port: 8765
+
+push_to_talk:
+  enabled: true
+  # Имя клавиши pynput: f1..f12, alt_r, ctrl_r, shift_r, caps_lock ... или символ: "v", "b"
+  # F5/F9 в Скайриме — быстрое сохранение/загрузка, их не занимаем.
+  key: f8
+  min_duration: 0.3   # секунды; более короткие нажатия игнорируются
+
+# true — без LLM: распознанная фраза просто озвучивается обратно (проверка голоса).
+# false — отвечает LLM (секция llm ниже).
+echo: false
+
+audio:
+  input_device: null    # null — устройство Windows по умолчанию; номер или часть имени
+  output_device: null
+  sample_rate: 16000    # частота записи (Whisper ждёт 16 кГц)
+
+stt:
+  model: large-v3-turbo # папка в models/whisper/ (small — быстрее и легче, но ошибается чаще)
+  device: cuda          # cuda | cpu  (на GPU в ~12 раз быстрее, +~0.4 ГБ VRAM для small)
+  compute_type: int8_float16   # cuda: int8_float16 или float16; cpu: int8
+  language: ru
+  beam_size: 5
+  vad_filter: true      # отсекает тишину и убирает «галлюцинации» на шуме
+  # Словарь-подсказка: Whisper охотнее пишет эти слова правильно. Дополняй по ходу игры.
+  initial_prompt: >-
+    Скайрим, Вайтран, Маркарт, Солитьюд, Виндхельм, Рифтен, Ту'ум, двемеры,
+    Довакин, тан, Ульфрик Буревестник, драугр, Совнгард, Лидия, хускарл, Гослинг.
+
+tts:
+  model: XTTS-v2        # папка в models/xtts/
+  device: cuda          # cuda | cpu (на CPU в разы медленнее реального времени)
+  language: ru
+  temperature: 0.7      # выше — живее и разнообразнее, но больше риск оговорок
+  speed: 1.0            # темп речи
+  stream: true          # озвучивать по мере синтеза: звук начинается раньше
+  stream_chunk_size: 20 # меньше — раньше первый звук, но больше накладных расходов
+
+llm:
+  # Любой сервер с OpenAI-совместимым API:
+  #   LM Studio   http://localhost:1234/v1   (вкладка Developer -> Start Server)
+  #   Ollama      http://localhost:11434/v1
+  #   OpenRouter  https://openrouter.ai/api/v1   (нужен ключ)
+  base_url: http://localhost:1234/v1
+  model: local-model    # имя модели на сервере (LM Studio показывает его в Developer)
+  api_key_env: LLM_API_KEY  # переменная окружения с ключом; локальным серверам не нужен
+  temperature: 0.8
+  max_tokens: 300
+  history_turns: 10     # сколько последних обменов репликами помнит
+  json_mode: false      # true — просить сервер строго JSON (поддерживают не все)
+  timeout: 60

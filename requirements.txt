@@ -1,0 +1,27 @@
+# PyTorch ставится отдельно, с CUDA 12.8 (нужна для RTX 50xx):
+#   python -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+
+# STT
+faster-whisper>=1.2
+
+# TTS: XTTS-v2 — голос персонажа и эмоции по референсам
+coqui-tts[codec]>=0.27
+# coqui-tts 0.27 не работает с transformers 5.x (нет isin_mps_friendly)
+transformers>=4.57,<5
+# проверено на numpy 1.26
+numpy<2
+
+# Audio I/O, hotkey
+sounddevice>=0.5
+soundfile>=0.12
+soxr>=0.3
+pynput>=1.7
+
+# LLM (любой OpenAI-совместимый сервер)
+openai>=1.40
+
+# Service
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pyyaml>=6
+huggingface_hub>=0.24
