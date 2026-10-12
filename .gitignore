@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+models/
+*.wav
+*.log
+
+# Project exclude paths
+/datasets/
+# Secrets and personal settings
+config.local.yaml
+.idea/
+/build/

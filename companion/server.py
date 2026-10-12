@@ -4,7 +4,10 @@
     POST /stt             — тело: аудиофайл (wav/flac/ogg) -> {"text": ...}
     POST /tts             — {"text", "emotion"?, "play"?} -> audio/wav
     POST /chat            — {"text", "game_context"?, "play"?} -> {"text", "emotion"} (ответ компаньона)
-    WS   /events          — поток событий (речь игрока, ответы компаньона)
+    POST /game/event      — событие из игры {"type", "data"} (см. companion/game/state.py)
+    GET  /game/state      — что сервис знает об игре + текст для LLM
+    GET  /game/commands   — команды плагину (сказать реплику, …); держит запрос до ?wait= секунд
+    WS   /events          — поток событий (речь игрока, ответы компаньона, события игры)
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import time
 from contextlib import asynccontextmanager
 
 import numpy as np
@@ -19,10 +23,15 @@ import soundfile as sf
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
+from companion.brain import Brain
 from companion.config import Config
 from companion.emotions import EMOTIONS
+from companion.game.dialogue import DialogueTexts
+from companion.game.state import GameEvent, GameState
+from companion.tools import build_tools
+from companion.voice.npc_voice import NpcVoice
 from companion.voice.service import VoiceService
 
 log = logging.getLogger(__name__)
@@ -36,7 +45,7 @@ class TTSRequest(BaseModel):
 
 class ChatRequest(BaseModel):
     text: str                   # реплика игрока
-    game_context: str = ""      # что происходит в игре (локация, бой, ...)
+    game_context: str = ""      # что происходит в игре; пусто — из /game/event
     play: bool = True           # озвучить ответ в динамики сервиса
 
 
@@ -57,18 +66,68 @@ class EventHub:
             q.put_nowait(event)
 
 
+class CommandQueue:
+    """Команды плагину. Плагин держит «долгий» GET /game/commands, сервис отвечает, как только
+    появилась команда, — задержка почти нулевая без открытого порта в самой игре."""
+
+    STALE = 5.0  # с: команда, которую плагин так и не забрал, к этому времени уже неактуальна
+
+    def __init__(self) -> None:
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.queue: asyncio.Queue | None = None
+        self.polling = 0           # сколько запросов плагина сейчас ждут
+        self.last_poll = 0.0
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop, self.queue = loop, asyncio.Queue()
+
+    def send(self, command: dict) -> None:  # из любого потока
+        if self.loop and self.queue:
+            self.loop.call_soon_threadsafe(self.queue.put_nowait, (time.monotonic(), command))
+
+    def connected(self) -> bool:
+        return self.polling > 0 or time.monotonic() - self.last_poll < 30
+
+    async def take(self, wait: float) -> list[dict]:
+        self.polling += 1
+        try:
+            items = [await asyncio.wait_for(self.queue.get(), timeout=wait)]
+            while not self.queue.empty():
+                items.append(self.queue.get_nowait())
+        except asyncio.TimeoutError:
+            return []
+        finally:
+            self.polling -= 1
+            self.last_poll = time.monotonic()
+        now = time.monotonic()
+        return [command for ts, command in items if now - ts < self.STALE]
+
+
 def create_app(cfg: Config) -> FastAPI:
     hub = EventHub()
-    state: dict[str, VoiceService] = {}
+    game = GameState(cfg.map, cfg.game.interface_bsa, dialogue=DialogueTexts(cfg.game.data_dir))
+    commands = CommandQueue()
+    npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
+                         lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
+    state: dict = {}
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         hub.loop = asyncio.get_running_loop()
-        service = await run_in_threadpool(VoiceService, cfg, hub.publish)
+        commands.start(hub.loop)
+        service = await run_in_threadpool(
+            lambda: VoiceService(cfg, hub.publish, game_context=game.describe, npc_voice=npc_voice))
         service.start_push_to_talk()
         state["voice"] = service
+        if service.llm:
+            service.llm.set_tools(build_tools(game))
+        if cfg.brain.enabled and service.llm:
+            state["brain"] = Brain(cfg.brain, service, game)
+            state["brain"].start()
         log.info("Сервис готов: http://%s:%d", cfg.server.host, cfg.server.port)
         yield
+        if "brain" in state:
+            state["brain"].stop()
         service.stop()
 
     app = FastAPI(title="Skyrim Companion — voice", lifespan=lifespan)
@@ -127,6 +186,27 @@ def create_app(cfg: Config) -> FastAPI:
         if req.play:
             asyncio.get_running_loop().run_in_executor(None, voice().speak, reply.text, reply.emotion)
         return {"text": reply.text, "emotion": reply.emotion}
+
+    @app.post("/game/event")
+    def game_event(event: GameEvent):
+        try:
+            changes = game.apply(event)
+        except ValidationError as e:
+            raise HTTPException(422, f"Неверные поля {event.type}: {e}")
+        texts = [c.text for c in changes]
+        if changes:  # служебные (карта, квесты, сведения об игроке, say_result) в журнал не пишем
+            hub.publish({"type": "game_event", "event": event.type, "changes": texts})
+        if "brain" in state and changes:
+            state["brain"].notify(changes)
+        return {"changes": texts}
+
+    @app.get("/game/state")
+    def game_state():
+        return {**game.snapshot(), "context": game.describe()}
+
+    @app.get("/game/commands")
+    async def game_commands(wait: float = 20):
+        return {"commands": await commands.take(min(wait, 25))}
 
     @app.websocket("/events")
     async def events(ws: WebSocket):

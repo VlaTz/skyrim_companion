@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Iterator
@@ -34,6 +35,28 @@ def _load_audio(audiopath, sampling_rate):
     return torch.from_numpy(np.clip(audio, -1, 1)).unsqueeze(0)
 
 
+def split_text(text: str, limit: int) -> list[str]:
+    """Режет текст на куски не длиннее limit символов: по предложениям, длинное предложение —
+    по запятой или пробелу. Своя разбивка вместо встроенной в XTTS: та требует spacy."""
+    pieces: list[str] = []
+    for sentence in re.split(r"(?<=[.!?…])\s+", text.strip()):
+        while len(sentence) > limit:
+            cut = max(sentence.rfind(",", 0, limit), sentence.rfind(" ", 0, limit))
+            if cut <= 0:
+                cut = limit - 1
+            pieces.append(sentence[:cut + 1].strip())
+            sentence = sentence[cut + 1:].strip()
+        if sentence:
+            pieces.append(sentence)
+    merged: list[str] = []  # короткие соседние предложения — вместе, пока влезают
+    for piece in pieces:
+        if merged and len(merged[-1]) + 1 + len(piece) <= limit:
+            merged[-1] += " " + piece
+        else:
+            merged.append(piece)
+    return merged
+
+
 class XttsTTS:
     def __init__(self, cfg: TTSConfig, models_path: Path, voice_dir: Path):
         import TTS.tts.models.xtts as xtts_module
@@ -55,6 +78,7 @@ class XttsTTS:
         self.model.load_checkpoint(config, checkpoint_dir=str(model_dir), use_deepspeed=False)
         self.model.to(cfg.device).eval()
         self.sample_rate = config.audio.output_sample_rate
+        self.char_limit = self.model.tokenizer.char_limits.get(cfg.language, 200)
 
         self.presets: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
         for emotion in EMOTIONS:
@@ -78,15 +102,17 @@ class XttsTTS:
         return self.presets.get(emotion or DEFAULT_EMOTION, self.presets[DEFAULT_EMOTION])
 
     def _params(self) -> dict:
-        return dict(temperature=self.cfg.temperature, speed=self.cfg.speed, enable_text_splitting=True)
+        return dict(temperature=self.cfg.temperature, speed=self.cfg.speed, enable_text_splitting=False)
 
     @torch.inference_mode()
     def synthesize(self, text: str, emotion: str | None = None) -> tuple[np.ndarray, int]:
         """Возвращает float32 моно и частоту дискретизации."""
         t = time.perf_counter()
         gpt_latent, speaker = self._preset(emotion)
-        out = self.model.inference(text, self.cfg.language, gpt_latent, speaker, **self._params())
-        audio = np.asarray(out["wav"], dtype=np.float32)
+        audio = np.concatenate([
+            np.asarray(self.model.inference(piece, self.cfg.language, gpt_latent, speaker, **self._params())["wav"],
+                       dtype=np.float32)
+            for piece in split_text(text, self.char_limit)])
         log.info("TTS %.2f с: %.1f с аудио [%s]", time.perf_counter() - t, len(audio) / self.sample_rate,
                  emotion or DEFAULT_EMOTION)
         return audio, self.sample_rate
@@ -95,7 +121,8 @@ class XttsTTS:
     def stream(self, text: str, emotion: str | None = None) -> Iterator[np.ndarray]:
         """Отдаёт аудио кусками по мере генерации — воспроизведение начинается раньше."""
         gpt_latent, speaker = self._preset(emotion)
-        for chunk in self.model.inference_stream(text, self.cfg.language, gpt_latent, speaker,
-                                                 stream_chunk_size=self.cfg.stream_chunk_size,
-                                                 **self._params()):
-            yield chunk.detach().float().cpu().numpy().reshape(-1)
+        for piece in split_text(text, self.char_limit):
+            for chunk in self.model.inference_stream(piece, self.cfg.language, gpt_latent, speaker,
+                                                     stream_chunk_size=self.cfg.stream_chunk_size,
+                                                     **self._params()):
+                yield chunk.detach().float().cpu().numpy().reshape(-1)

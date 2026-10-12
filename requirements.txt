@@ -25,3 +25,6 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pyyaml>=6
 huggingface_hub>=0.24
+
+# Чтение архивов игры SE (сжаты LZ4): файлы лица для Gosling.esp (tools/build_gosling_esp.py)
+lz4>=4

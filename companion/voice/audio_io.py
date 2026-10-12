@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
+import time
 from typing import Callable, Iterable
 
 import numpy as np
@@ -41,19 +43,62 @@ def play(audio: np.ndarray, sample_rate: int, device: int | str | None = None) -
 
 
 def play_stream(chunks: Iterable[np.ndarray], sample_rate: int, device: int | str | None = None,
-                on_first: Callable[[], None] | None = None) -> np.ndarray:
-    """Играет куски по мере поступления (блокирует до конца), возвращает всё аудио целиком."""
+                on_first: Callable[[], None] | None = None, prebuffer: float = 0.0) -> np.ndarray:
+    """Играет куски по мере генерации (блокирует до конца), возвращает всё аудио целиком.
+
+    Генерация идёт в отдельном потоке и уходит вперёд, пока звучит уже готовое; звук стартует,
+    когда накоплено prebuffer секунд (или генерация закончилась). Запас сглаживает моменты,
+    когда синтез медленнее речи — например, пока игра нагружает видеокарту."""
+    done = object()
+    q: queue.Queue = queue.Queue()
+    t0 = time.perf_counter()
+    gen_time: list[float] = []
+
+    def produce() -> None:
+        try:
+            for chunk in chunks:
+                q.put(np.clip(np.asarray(chunk, np.float32).reshape(-1), -1, 1))
+        except BaseException as e:  # noqa: BLE001 — передаём в поток воспроизведения
+            q.put(e)
+            return
+        gen_time.append(time.perf_counter() - t0)
+        q.put(done)
+
+    threading.Thread(target=produce, daemon=True, name="tts-stream").start()
+
     played: list[np.ndarray] = []
+    pending: list[np.ndarray] = []
+    target = int(prebuffer * sample_rate)
     with sd.OutputStream(samplerate=sample_rate, channels=1, dtype="float32", latency="high",
                          device=resolve_device(device, "output")) as out:
-        for chunk in chunks:
-            chunk = np.clip(np.asarray(chunk, np.float32).reshape(-1), -1, 1)
-            if not played and on_first:
+
+        def start() -> None:
+            if on_first:
                 on_first()
-            out.write(chunk.reshape(-1, 1))
-            played.append(chunk)
+            for c in pending:
+                out.write(c.reshape(-1, 1))
+            pending.clear()
+
+        started = False
+        while (item := q.get()) is not done:
+            if isinstance(item, BaseException):
+                raise item
+            played.append(item)
+            if started:
+                out.write(item.reshape(-1, 1))
+            else:
+                pending.append(item)
+                if sum(len(c) for c in pending) >= target:
+                    start()
+                    started = True
+        if not started:
+            start()
     # выход из with ждёт, пока доиграет буфер
-    return np.concatenate(played) if played else np.zeros(0, np.float32)
+    audio = np.concatenate(played) if played else np.zeros(0, np.float32)
+    if gen_time and len(audio):
+        log.info("Синтез %.1f с аудио за %.1f с (x%.2f от реального времени)",
+                 len(audio) / sample_rate, gen_time[0], gen_time[0] / (len(audio) / sample_rate))
+    return audio
 
 
 class PushToTalkRecorder:
