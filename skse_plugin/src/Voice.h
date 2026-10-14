@@ -16,7 +16,7 @@ namespace voice
 	// Где Гослинг: {"loaded", "distance" (м), "follower"}; null — Gosling.esp не подключён.
 	json Status(RE::PlayerCharacter* a_player);
 
-	// Команда сервиса {"type": "say", "line": 0|1, "id": "..."} — выполняется в игровом потоке,
+	// Команда сервиса {"type": "say", "line": 0|1, "id": "...", "text": "фраза для субтитра"} — выполняется в игровом потоке,
 	// результат уходит событием say_result: ok — когда звук реплики реально пошёл (до 10 с после команды).
 	void HandleCommand(const json& a_command);
 }

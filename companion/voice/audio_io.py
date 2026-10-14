@@ -36,27 +36,43 @@ def parse_key(name: str) -> keyboard.Key | keyboard.KeyCode:
     raise ValueError(f"Неизвестная клавиша push-to-talk: {name!r}")
 
 
-def play(audio: np.ndarray, sample_rate: int, device: int | str | None = None) -> None:
-    """Блокирующее воспроизведение."""
+def play(audio: np.ndarray, sample_rate: int, device: int | str | None = None,
+         should_stop: Callable[[], bool] | None = None) -> None:
+    """Блокирующее воспроизведение; should_stop() -> True обрывает звук (игрок заговорил)."""
     sd.play(audio, sample_rate, device=resolve_device(device, "output"))
-    sd.wait()
+    if not should_stop:
+        sd.wait()
+        return
+    stream = sd.get_stream()
+    while stream.active:
+        if should_stop():
+            sd.stop()
+            break
+        time.sleep(0.05)
 
 
 def play_stream(chunks: Iterable[np.ndarray], sample_rate: int, device: int | str | None = None,
-                on_first: Callable[[], None] | None = None, prebuffer: float = 0.0) -> np.ndarray:
+                on_first: Callable[[], None] | None = None, prebuffer: float = 0.0,
+                should_stop: Callable[[], bool] | None = None) -> np.ndarray:
     """Играет куски по мере генерации (блокирует до конца), возвращает всё аудио целиком.
 
     Генерация идёт в отдельном потоке и уходит вперёд, пока звучит уже готовое; звук стартует,
     когда накоплено prebuffer секунд (или генерация закончилась). Запас сглаживает моменты,
-    когда синтез медленнее речи — например, пока игра нагружает видеокарту."""
+    когда синтез медленнее речи — например, пока игра нагружает видеокарту.
+    should_stop() -> True (игрок заговорил) — звук обрывается, генерация останавливается; возврат —
+    после того, как поток генерации вышел (модель не должна работать в двух потоках сразу)."""
     done = object()
     q: queue.Queue = queue.Queue()
     t0 = time.perf_counter()
     gen_time: list[float] = []
+    stop = threading.Event()
+    stopped = should_stop or (lambda: False)
 
     def produce() -> None:
         try:
             for chunk in chunks:
+                if stop.is_set():
+                    return
                 q.put(np.clip(np.asarray(chunk, np.float32).reshape(-1), -1, 1))
         except BaseException as e:  # noqa: BLE001 — передаём в поток воспроизведения
             q.put(e)
@@ -64,7 +80,8 @@ def play_stream(chunks: Iterable[np.ndarray], sample_rate: int, device: int | st
         gen_time.append(time.perf_counter() - t0)
         q.put(done)
 
-    threading.Thread(target=produce, daemon=True, name="tts-stream").start()
+    producer = threading.Thread(target=produce, daemon=True, name="tts-stream")
+    producer.start()
 
     played: list[np.ndarray] = []
     pending: list[np.ndarray] = []
@@ -83,6 +100,8 @@ def play_stream(chunks: Iterable[np.ndarray], sample_rate: int, device: int | st
         while (item := q.get()) is not done:
             if isinstance(item, BaseException):
                 raise item
+            if stopped():
+                break
             played.append(item)
             if started:
                 out.write(item.reshape(-1, 1))
@@ -91,6 +110,12 @@ def play_stream(chunks: Iterable[np.ndarray], sample_rate: int, device: int | st
                 if sum(len(c) for c in pending) >= target:
                     start()
                     started = True
+        if stopped():
+            stop.set()
+            out.abort()  # не доигрываем буфер
+            producer.join()
+            log.info("Озвучка прервана: игрок заговорил")
+            return np.concatenate(played) if played else np.zeros(0, np.float32)
         if not started:
             start()
     # выход из with ждёт, пока доиграет буфер
@@ -105,12 +130,17 @@ class PushToTalkRecorder:
     """Пока клавиша зажата — пишет микрофон; при отпускании отдаёт запись в on_utterance."""
 
     def __init__(self, ptt: PushToTalkConfig, audio: AudioConfig,
-                 on_utterance: Callable[[np.ndarray], None]):
+                 on_utterance: Callable[[np.ndarray], None],
+                 on_start: Callable[[], None] | None = None, on_skip: Callable[[], None] | None = None):
+        """on_start — клавиша нажата (игрок заговорил: Гослинг замолкает); on_skip — запись слишком
+        короткая, речи не будет."""
         self.key = parse_key(ptt.key)
         self.min_samples = int(ptt.min_duration * audio.sample_rate)
         self.sample_rate = audio.sample_rate
         self.device = resolve_device(audio.input_device, "input")
         self.on_utterance = on_utterance
+        self.on_start = on_start or (lambda: None)
+        self.on_skip = on_skip or (lambda: None)
 
         self._chunks: list[np.ndarray] = []
         self._recording = False
@@ -151,6 +181,7 @@ class PushToTalkRecorder:
                 self._chunks = []
             self._recording = True
             log.info("● запись...")
+            self.on_start()
 
     def _on_release(self, key) -> None:
         if not (self._matches(key) and self._recording):
@@ -162,6 +193,7 @@ class PushToTalkRecorder:
         log.info("■ стоп, %.1f с", len(audio) / self.sample_rate)
         if len(audio) < self.min_samples:
             log.info("слишком коротко, пропуск")
+            self.on_skip()
             return
         # Обработка в отдельном потоке, чтобы не блокировать перехват клавиатуры.
         threading.Thread(target=self.on_utterance, args=(audio,), daemon=True).start()

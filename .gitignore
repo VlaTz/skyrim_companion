@@ -10,3 +10,7 @@ models/
 config.local.yaml
 .idea/
 /build/
+
+# Память компаньона — твоё прохождение, не код
+/memory/
+/logs/

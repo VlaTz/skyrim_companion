@@ -35,9 +35,14 @@ def _load_audio(audiopath, sampling_rate):
     return torch.from_numpy(np.clip(audio, -1, 1)).unsqueeze(0)
 
 
-def split_text(text: str, limit: int) -> list[str]:
+FIRST_MIN = 15  # первую фразу по запятой режем, только если до запятой не меньше стольких знаков
+
+
+def split_text(text: str, limit: int, first_limit: int | None = None) -> list[str]:
     """Режет текст на куски не длиннее limit символов: по предложениям, длинное предложение —
-    по запятой или пробелу. Своя разбивка вместо встроенной в XTTS: та требует spacy."""
+    по запятой или пробелу. Своя разбивка вместо встроенной в XTTS: та требует spacy.
+    first_limit — первый кусок короче (синтез — примерно 0,3 с на 10 знаков, а звучать фраза начинает только
+    синтезированной целиком): к нему не подклеиваем соседние предложения, длинное режем по запятой или тире."""
     pieces: list[str] = []
     for sentence in re.split(r"(?<=[.!?…])\s+", text.strip()):
         while len(sentence) > limit:
@@ -48,9 +53,15 @@ def split_text(text: str, limit: int) -> list[str]:
             sentence = sentence[cut + 1:].strip()
         if sentence:
             pieces.append(sentence)
+    if first_limit and pieces and len(pieces[0]) > first_limit:
+        head = pieces[0]
+        cut = max(head.rfind(",", 0, first_limit), head.rfind(" —", 0, first_limit))
+        if cut >= FIRST_MIN:
+            pieces[0:1] = [head[:cut + 1].strip(), head[cut + 1:].strip()]
     merged: list[str] = []  # короткие соседние предложения — вместе, пока влезают
     for piece in pieces:
-        if merged and len(merged[-1]) + 1 + len(piece) <= limit:
+        room = first_limit if first_limit and len(merged) == 1 else limit
+        if merged and len(merged[-1]) + 1 + len(piece) <= room:
             merged[-1] += " " + piece
         else:
             merged.append(piece)

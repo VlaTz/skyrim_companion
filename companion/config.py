@@ -51,7 +51,12 @@ class TTSConfig(BaseModel):
 class LLMConfig(BaseModel):
     base_url: str = "http://localhost:1234/v1"
     model: str = "local-model"
-    api_key: str = ""                 # сам ключ — только в config.local.yaml (он не в git)
+    # Модель для фоновых запросов (летописец: дневник, факты, цели) — их никто не ждёт, а записанное
+    # потом долго возвращается в промпт: тут качество важнее скорости. Пусто — та же, что model.
+    background_model: str = ""
+    background_max_tokens: int = 4000   # с запасом: «размышления» модели тоже считаются в max_tokens
+    background_extra_body: dict | None = None  # свои поля запроса для фоновой модели; None — как extra_body
+    api_key: str = ""             # сам ключ — только в config.local.yaml (он не в git)
     api_key_env: str = "LLM_API_KEY"  # или имя переменной окружения с ключом
     temperature: float = 0.8
     max_tokens: int = 300
@@ -60,6 +65,7 @@ class LLMConfig(BaseModel):
     timeout: float = 60
     tools: bool = True           # агент может вызывать инструменты-справки (companion/tools.py)
     max_tool_rounds: int = 3     # сколько раз за ответ
+    tool_router: bool = True     # планировщик справок: параллельный запрос без истории решает, какие справки нужны
     extra_body: dict = {}  # дополнительные поля запроса, свои у каждого сервера (OpenRouter: reasoning)
 
 
@@ -83,6 +89,7 @@ class NpcVoiceConfig(BaseModel):
     mod_dir: Path = Path(r"D:\Games\Modding\MO2\mods\Gosling")  # мод в MO2 (tools/build_gosling_esp.py)
     max_distance: float = 30   # метров: дальше — говорим через колонки
     max_chars: int = 120       # длина фразы: короче — раньше звучит первая
+    first_chars: int = 50      # первая фраза короче: звук начинается, как только она синтезирована целиком
     gap: float = 0.3           # пауза между фразами, с
     result_timeout: float = 12  # сколько ждать подтверждения от плагина (он ждёт, пока звук пойдёт, до 10 с), с
     lip: bool = True           # губы: .lip к каждой фразе генератором CK (+~0,3 с к первой фразе)
@@ -101,24 +108,72 @@ class MapConfig(BaseModel):
 
 class BrainConfig(BaseModel):
     enabled: bool = True
-    min_gap: float = 60          # секунд между репликами по своей инициативе
-    urgent_gap: float = 20       # то же для срочного (игрок тяжело ранен)
-    settle: float = 3            # подождать, пока соберутся связанные события
-    repeat_after: float = 600    # одно и то же событие повторно комментировать не раньше
-    idle_after: float = 180      # столько тишины — и может заговорить сам
-    idle_chance: float = 0.5
-    chances: dict[str, float] = {  # шанс прокомментировать событие по его типу
-        "loaded": 1.0, "location": 1.0, "wilderness": 0.5, "interior": 0.6, "combat_ended": 0.7,
-        "low_health": 1.0, "item": 0.3, "discovered": 0.8, "overheard": 0.8,
-    }
+    # Говорить ли самому — решает модель: ставит поводу interest 0–10 (шкала в companion/brain.py) и видит, когда
+    # говорила сама; Гослинг говорит, если не ниже interest. Меньше — болтливее, больше — молчаливее.
+    interest: int = 7
+    # Ниже порога модель пишет короткую шутку к месту; с этим шансом она всё же звучит — не в бою и не чаще
+    # раза в quip_gap секунд после последней реплики Гослинга.
+    quip_chance: float = 0.2
+    quip_gap: float = 90
+    ask_gap: float = 2           # секунд между вопросами модели «заговорить ли» (не спрашивать на каждый чих)
+    settle: float = 1.5          # подождать, пока соберутся связанные события (вошли в город + помещение)
+    repeat_after: float = 600    # одно и то же событие повторно показывать модели не раньше
+    idle_after: float = 90       # столько тишины (никто ничего не сказал) — и спросить модель, не заговорить ли
+    # Пока Гослинг говорит или отвечает, поводы ждут; старше этого — уже не про то, что сейчас (не спрашиваем).
+    fresh_for: float = 15        # секунд — обычный повод (вошли в помещение, сундук)
+    fresh_important: float = 45  # секунд — важный (задание, знакомый, впервые увиденное, Крик, тяжело ранен)
+    # Какие события показывать модели (остальные — только в «Недавно»: убитые враги, «заговорил с NPC»).
+    events: list[str] = [
+        "loaded", "location", "wilderness", "interior", "combat_started", "combat_ended", "low_health", "item",
+        "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
+        "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought",
+    ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
-    # Встревать ли — решает модель (обычно молчит), chances.overheard — сколько разговоров ей вообще показывать.
-    overheard_quiet: float = 4   # секунд без новых реплик — разговор закончился
-    overheard_gap: float = 20    # секунд между такими решениями (в городе болтают без умолку)
+    overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
+
+
+class DiaristConfig(BaseModel):
+    """Летописец (companion/memory/diarist.py): когда глава кончилась и пора писать дневник, факты, цели."""
+    min_entries: int = 6         # записей журнала, чтобы глава вообще стоила записи (и при уходе из места)
+    big_dialogue: int = 20       # реплик игрока и Гослинга — пора записать, даже если никуда не ушли
+    big_total: int = 60          # записей всего (в городе подслушанное копится быстро)
+    chapter_seconds: float = 900  # секунд с первой неописанной записи — пора записать
+    check_every: float = 30      # секунд — как часто проверять
+    max_heard: int = 20          # подслушанного в запрос — не больше (последнее)
+    max_lines: int = 120         # всего строк журнала в запрос
+    known_facts: int = 40        # уже известных фактов в запрос (чтобы не повторялся)
+
+
+class ThinkerConfig(BaseModel):
+    """Мысли Гослинга (companion/memory/thinker.py): что держать в голове и предложить Владосу."""
+    enabled: bool = True
+    min_gap: float = 120         # секунд между раздумьями (вошли в город и сразу в лавку — одно раздумье)
+    quiet_every: float = 600     # секунд — подумать и без перемен
+    bag_change: int = 3          # вещей в сумке прибавилось или убыло — повод подумать
+    check_every: float = 3       # секунд — как часто смотреть, не поменялось ли что (проверка дешёвая)
+    max_ideas: int = 3           # мыслей за раз — не больше
+    dialogue_lines: int = 12     # последних реплик в запрос — что уже предлагал и что ответил Владос
+
+
+class OverlayConfig(BaseModel):
+    """Окно с логом поверх игры (companion/overlay.py). Видно в окне без рамки, не в эксклюзивном полном экране."""
+    enabled: bool = True
+    key: str = "f10"             # показать / спрятать (имя клавиши pynput, как push_to_talk.key)
+    visible: bool = False        # показано сразу при запуске
+    corner: str = "top-right"    # top-right | top-left | bottom-right | bottom-left
+    width: int = 760
+    height: int = 380
+    margin: int = 20             # отступ от края экрана, пикселей
+    alpha: float = 0.8           # непрозрачность 0..1
+    font_size: int = 10
+    lines: int = 300             # сколько последних строк держать
 
 
 class Config(BaseModel):
     models_dir: Path = Path("models")
+    memory_dir: Path = Path("memory")  # память компаньона (SQLite); в git не идёт — это твоё прохождение
+    logs_dir: Path = Path("logs")      # логи; трасса Гослинга — logs/trace/<дата>.log
+    trace: bool = True                 # писать трассу: вопросы, справки и ответы модели, озвучка, летописец
     character: str = "gosling"
     server: ServerConfig = ServerConfig()
     push_to_talk: PushToTalkConfig = PushToTalkConfig()
@@ -131,6 +186,9 @@ class Config(BaseModel):
     npc_voice: NpcVoiceConfig = NpcVoiceConfig()
     map: MapConfig = MapConfig()
     brain: BrainConfig = BrainConfig()
+    diarist: DiaristConfig = DiaristConfig()
+    thinker: ThinkerConfig = ThinkerConfig()
+    overlay: OverlayConfig = OverlayConfig()
 
     @property
     def models_path(self) -> Path:
@@ -139,6 +197,16 @@ class Config(BaseModel):
     @property
     def character_path(self) -> Path:
         return ROOT / "characters" / self.character
+
+    @property
+    def logs_path(self) -> Path:
+        return self.logs_dir if self.logs_dir.is_absolute() else ROOT / self.logs_dir
+
+    @property
+    def memory_path(self) -> Path:
+        """Память компаньона: файл на каждого персонажа игрока (companion/memory)."""
+        root = self.memory_dir if self.memory_dir.is_absolute() else ROOT / self.memory_dir
+        return root / self.character
 
 
 def _merge(base: dict, override: dict) -> dict:

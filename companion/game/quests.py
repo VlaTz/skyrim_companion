@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import re
 import threading
+import time
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -32,6 +33,9 @@ class QuestLogRef(BaseModel):
     files: list[str] = []  # где искать строку: файл последней правки квеста, затем исходный
 
 
+MISC_TYPES = (0, 6)  # «прочее», «разное»: поручения вроде «отнести письмо» — не важное событие
+
+
 class Quest(BaseModel):
     id: str
     name: str
@@ -40,6 +44,7 @@ class Quest(BaseModel):
     objectives: list[str] = []
     aliases: dict[str, str] = {}
     log: QuestLogRef | None = None
+    tracked: bool = False  # игрок отметил задание активным в журнале (маркер на компасе)
 
     @property
     def kind(self) -> str:
@@ -52,11 +57,79 @@ class QuestLog:
         self._lock = threading.Lock()
         self.quests: list[Quest] = []
         self._strings: dict[str, dict[int, str]] | None = None  # грузим при первом обращении
+        self._baseline = False  # был ли журнал после загрузки сейва (с чем сравнивать)
+        self._touched: dict[str, float] = {}  # id задания -> когда менялись его цели
+        self._gone: dict[str, Quest] = {}     # пропавшие из журнала (выполнены или на миг без целей)
 
-    def update(self, data: dict) -> None:
-        quests = [Quest.model_validate(q) for q in data.get("quests", [])]
+    def reset(self) -> None:
+        """Загрузили сейв: следующий журнал — точка отсчёта, без событий."""
         with self._lock:
+            self._baseline = False
+            self._gone.clear()
+
+    def update(self, data: dict) -> list[tuple[str, str, str, bool]]:
+        """Новый журнал -> что изменилось: [(вид, текст, о чём, важное)].
+        Новое задание, новая цель, цель выполнена (пропала из текущих), задание завершено (пропало из журнала)."""
+        quests = [Quest.model_validate(q) for q in data.get("quests", [])]
+        now = time.time()
+        with self._lock:
+            old = {q.id: q for q in self.quests}
             self.quests = quests
+            if not self._baseline:
+                self._baseline = True
+                return []
+        changes = []
+
+        def add(q: Quest, text: str) -> None:
+            misc = q.type in MISC_TYPES
+            changes.append(("quest_misc" if misc else "quest", text, f"задание: {q.name}", not misc))
+            self._touched[q.id] = now
+
+        new_ids = {q.id for q in quests}
+        for q in quests:
+            goals = [self._expand(o, q) for o in q.objectives]
+            # Пропало и вернулось (на смене этапа игра на миг снимает все цели) — не «новое», а новые цели.
+            was = old.get(q.id) or self._gone.pop(q.id, None)
+            if not was:
+                add(q, f"новое задание «{q.name}»" + (": " + "; ".join(goals) if goals else ""))
+                continue
+            before = [self._expand(o, was) for o in was.objectives]
+            for goal in before:
+                if goal not in goals:
+                    add(q, f"цель выполнена («{q.name}»): {goal}")
+            for goal in goals:
+                if goal not in before:
+                    add(q, f"новая цель («{q.name}»): {goal}")
+        # completed — id заданий журнала, которые игра считает выполненными (новый плагин); без него — по пропаже.
+        completed = data.get("completed")
+        for q in old.values():
+            if q.id not in new_ids:
+                self._gone[q.id] = q
+                if completed is not None and q.id not in completed:
+                    continue  # не выполнено — просто на миг без целей (или провалено) — молчим
+                goals = "; ".join(self._expand(o, q) for o in q.objectives)
+                add(q, f"задание «{q.name}» завершено" + (f" (последняя цель: {goals})" if goals else ""))
+        return changes
+
+    def context(self, limit: int, fresh: float) -> str:
+        """Текущие цели самых нужных заданий — для «Сейчас в игре»: отмеченное игроком, менявшееся недавно,
+        главный квест, потом остальные не-поручения."""
+        now = time.time()
+        with self._lock:
+            quests = list(self.quests)
+
+        def rank(q: Quest) -> tuple:
+            recent = now - self._touched.get(q.id, 0) < fresh
+            return (not q.tracked, not recent, q.type != 1, q.type in MISC_TYPES, -self._touched.get(q.id, 0))
+
+        picked = [q for q in sorted(quests, key=rank) if q.objectives][:limit]
+        if not picked:
+            return ""
+        lines = [f"- «{q.name}» ({q.kind}" + (", отмечено игроком" if q.tracked else "") + "): "
+                 + "; ".join(self._expand(o, q) for o in q.objectives) for q in picked]
+        more = len(quests) - len(picked)
+        return ("Задания — текущие цели из журнала игрока (запись журнала — quest_details"
+                + (f"; ещё заданий: {more} — quests" if more > 0 else "") + "):\n" + "\n".join(lines))
 
     def _expand(self, text: str, quest: Quest) -> str:
         text = ALIAS_RE.sub(lambda m: quest.aliases.get(m.group(1), "(?)"), text)

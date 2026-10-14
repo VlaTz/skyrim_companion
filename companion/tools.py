@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
+from companion.game.places import PlaceBook
 from companion.game.state import GameState
 
 
@@ -25,8 +26,19 @@ class Tool:
                 "function": {"name": self.name, "description": self.description, "parameters": self.parameters}}
 
 
-def build_tools(game: GameState) -> list[Tool]:
-    return [
+def place_info(places: PlaceBook, name: str) -> str:
+    """Инструмент: справка о любом месте Скайрима из данных игры."""
+    card = places.card(name or "")
+    if card:
+        return "Справка (что знает о месте любой местный; сам ты там мог и не бывать): " + card
+    similar = [p.name for p in places.search(name or "")]
+    if similar:
+        return f"Места «{name}» точно не знаю. Похожие названия: " + ", ".join(similar) + "."
+    return f"Места «{name}» не знаю."
+
+
+def build_tools(game: GameState, places: PlaceBook | None = None) -> list[Tool]:
+    tools = [
         Tool(
             name="find_places",
             description=(
@@ -49,16 +61,19 @@ def build_tools(game: GameState) -> list[Tool]:
         Tool(
             name="quests",
             description=(
-                "Активные квесты из журнала игрока: название, тип и текущие цели. Вызывай, если спрашивают, "
-                "что нам делать, куда идти, какие есть задания."),
+                "Все активные задания из журнала игрока: название, тип и текущие цели. Цели нескольких главных "
+                "заданий уже есть в «Сейчас в игре»; эта справка — когда нужен весь список: «какие у нас "
+                "задания?», «что ещё можно сделать?»."),
             parameters={"type": "object", "properties": {}},
             handler=game.quest_log.summary,
         ),
         Tool(
             name="quest_details",
             description=(
-                "Подробности одного активного квеста: текущие цели и последняя запись в журнале (что "
-                "произошло и что делать дальше). Вызывай, когда нужен конкретный квест."),
+                "Заглянуть в журнал Владоса по одному заданию: текущие цели и последняя запись журнала — что "
+                "произошло и что делать дальше. Ты спутник и можешь смотреть его журнал в любой момент. Вызывай "
+                "сразу, как только спрашивают, что дальше по заданию, куда идти, как его выполнить, или просят "
+                "«посмотри в журнале», «глянь сам» — не обещай посмотреть потом и не отсылай Владоса в журнал."),
             parameters={
                 "type": "object",
                 "properties": {"name": {"type": "string", "description": "Название квеста или его часть."}},
@@ -69,10 +84,28 @@ def build_tools(game: GameState) -> list[Tool]:
         Tool(
             name="player_details",
             description=(
-                "Подробности об игроке: золото, здоровье/магия/запас сил, что надето и в руках, что в сумке "
-                "(по категориям, самое ценное), активные эффекты и болезни. Вызывай, если спрашивают про "
-                "снаряжение, деньги, зелья, припасы, хватит ли на покупку, чем лечиться."),
+                "Заглянуть к Владосу в сумку и оглядеть его: золото, здоровье/магия/запас сил, что надето и в "
+                "руках, что в сумке (по категориям, самое ценное), активные эффекты и болезни. Ты спутник и "
+                "можешь это сделать в любой момент — это не кража. Вызывай сразу, как только речь о его вещах: "
+                "«глянь, что у меня есть», «посмотрел, что в сумке?», «что продать?», «хватит ли денег?», "
+                "«чем лечиться?», «что надеть?» — не отказывайся и не обещай посмотреть потом."),
             parameters={"type": "object", "properties": {}},
             handler=game.player_details,
         ),
     ]
+    if places:
+        tools.append(Tool(
+            name="place_info",
+            description=(
+                "Справка о месте Скайрима по названию: что это (город, деревня, пещера, форт...), в каком "
+                "владении, а для поселений — что в нём есть: лавки, таверна, кузница, храмы, гильдии, замок, "
+                "и кто там живёт или работает. Про текущее место справка уже есть в «Сейчас в игре» — "
+                "вызывай для других мест: «где в Рифтене купить зелья?», «что есть в Ривервуде?»."),
+            parameters={
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "Название места, как в игре."}},
+                "required": ["name"],
+            },
+            handler=lambda name="": place_info(places, name),
+        ))
+    return tools

@@ -1,5 +1,7 @@
 #include "Quests.h"
 
+#include <set>
+
 #include "Net.h"
 
 namespace quests
@@ -83,6 +85,7 @@ namespace quests
 				{ "stage", quest->GetCurrentStageID() },
 				{ "objectives", entry.objectives },
 				{ "aliases", Aliases(quest) },
+				{ "tracked", quest->IsActive() },  // отмечен активным в журнале (флаг квеста, только чтение)
 			};
 			if (entry.log) {
 				// Строку журнала ищем в таблице файла, где квест определён последним, затем — первым.
@@ -90,6 +93,24 @@ namespace quests
 					{ "files", { FileName(quest->GetFile(-1)), FileName(quest->GetFile(0)) } } };
 			}
 			out.push_back(std::move(q));
+		}
+		return out;
+	}
+
+	json Completed()
+	{
+		const auto player = RE::PlayerCharacter::GetSingleton();
+		std::set<RE::FormID> done;
+		if (player) {
+			for (const auto item : player->GetPlayerRuntimeData().questLog) {
+				if (item && item->owner && item->owner->IsCompleted()) {
+					done.insert(item->owner->GetFormID());
+				}
+			}
+		}
+		json out = json::array();
+		for (const auto id : done) {
+			out.push_back(std::format("{:08X}", id));
 		}
 		return out;
 	}

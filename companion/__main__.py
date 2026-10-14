@@ -6,6 +6,7 @@ from pathlib import Path
 
 import uvicorn
 
+from companion import trace
 from companion.config import load_config
 from companion.server import create_app
 
@@ -22,6 +23,11 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     cfg = load_config(args.config)
+    if cfg.overlay.enabled:  # окно с логом поверх игры — до сервиса, чтобы видеть и загрузку моделей
+        from companion.overlay import Overlay
+        Overlay(cfg.overlay).start()
+    if cfg.trace:
+        logging.getLogger(__name__).info("Трасса Гослинга: %s", trace.setup(cfg.logs_path / "trace"))
     uvicorn.run(create_app(cfg), host=cfg.server.host, port=cfg.server.port, log_level="warning")
 
 

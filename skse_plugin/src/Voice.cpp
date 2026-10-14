@@ -13,6 +13,7 @@ namespace voice
 		constexpr RE::FormID                kVoiceType = 0x814;
 		constexpr std::array<RE::FormID, 2> kTopics = { 0x810, 0x812 };
 		constexpr float                     kUnitsPerMeter = 70.0f;
+		constexpr double                    kStaleCommand = 2.0;  // с в очереди игрового потока — игра была на паузе
 
 		RE::Actor* Gosling()
 		{
@@ -51,11 +52,92 @@ namespace voice
 			return high ? high->voiceTimer : -1.0f;
 		}
 
+		// Субтитр нашей реплики — «...» (текст заглушки в Gosling.esp). Подменить текст в SubtitleManager мало:
+		// HUD берёт текст, когда субтитр появился, и дальше туда не смотрит (проверено в игре 2026-10-14).
+		// Поэтому, пока у Гослинга есть запись в SubtitleManager (он говорит), сами показываем текст в HUD —
+		// функцией ShowSubtitle из hudmenu.swf (Scaleform Invoke — виртуальный метод, не функция по адресу).
+		// Запись в менеджере тоже правим: если игра перечитает субтитр, возьмёт наш текст.
+		constexpr auto kSubtitlePoll = std::chrono::milliseconds(100);
+		constexpr auto kSubtitleTail = std::chrono::milliseconds(500);  // запас к длине фразы
+
+		struct Subtitle
+		{
+			std::string                           text;     // фраза
+			std::string                           shown;    // как в HUD: «Гослинг: фраза»
+			std::chrono::steady_clock::time_point until;
+			bool                                  seen = false;  // запись Гослинга в менеджере уже появлялась
+		};
+
+		std::string EscapeHtml(std::string_view a_text)
+		{
+			std::string out;
+			for (const char c : a_text) {
+				switch (c) {
+				case '&': out += "&amp;"; break;
+				case '<': out += "&lt;"; break;
+				case '>': out += "&gt;"; break;
+				default: out += c;
+				}
+			}
+			return out;
+		}
+
+		void ShowInHud(std::string a_text)
+		{
+			SKSE::GetTaskInterface()->AddUITask([text = std::move(a_text)] {
+				const auto ui = RE::UI::GetSingleton();
+				const auto hud = ui ? ui->GetMenu(RE::HUDMenu::MENU_NAME) : nullptr;
+				if (hud && hud->uiMovie) {
+					const RE::GFxValue arg(text.c_str());
+					hud->uiMovie->Invoke("_root.HUDMovieBaseInstance.ShowSubtitle", nullptr, &arg, 1);
+				}
+			});
+		}
+
+		// Игровой поток. Поле subtitle записей SubtitleManager — под его же блокировкой.
+		void PatchSubtitle(std::shared_ptr<Subtitle> a_subtitle)
+		{
+			const auto actor = Gosling();
+			const auto manager = RE::SubtitleManager::GetSingleton();
+			bool       speaking = false;
+			if (actor && manager) {
+				const auto          handle = actor->GetHandle();
+				RE::BSSpinLockGuard guard(manager->lock);
+				for (auto& info : manager->subtitles) {
+					if (info.speaker == handle) {
+						speaking = true;
+						if (std::string_view(info.subtitle) != a_subtitle->text) {
+							info.subtitle = a_subtitle->text.c_str();
+						}
+					}
+				}
+			}
+			if (speaking) {
+				if (!a_subtitle->seen) {
+					logs::info("Субтитр Гослинга: «{}»", a_subtitle->text);
+				}
+				a_subtitle->seen = true;
+				ShowInHud(a_subtitle->shown);
+			} else if (a_subtitle->seen) {
+				return;  // реплика кончилась — субтитр убирает сама игра; не воскрешаем его
+			}
+			if (std::chrono::steady_clock::now() < a_subtitle->until) {
+				std::thread([a_subtitle = std::move(a_subtitle)]() mutable {
+					std::this_thread::sleep_for(kSubtitlePoll);
+					SKSE::GetTaskInterface()->AddTask([a_subtitle = std::move(a_subtitle)] { PatchSubtitle(a_subtitle); });
+				}).detach();
+			} else if (!a_subtitle->seen) {
+				logs::info("Субтитр Гослинга не появился (субтитры выключены в настройках?)");
+			}
+		}
+
 		// Реплика, которую сказали, но ещё не знаем, зазвучала ли.
 		struct PendingLine
 		{
 			std::size_t                           line;
 			std::string                           id;
+			std::string                           subtitle;  // текст фразы для субтитра
+			double                                duration;  // длина фразы, с
 			SoundIds                              before;  // звуки голоса до Say()
 			std::chrono::steady_clock::time_point started;
 			std::chrono::steady_clock::time_point lastSay;
@@ -121,6 +203,14 @@ namespace voice
 					logs::info("Реплика {} зазвучала через {:.2f} с, с {}-й попытки (звук {:08X})", a_line->id,
 						std::chrono::duration<double>(waited).count(), a_line->attempts, now[i]);
 					Report(*a_line, {});
+					if (!a_line->subtitle.empty()) {
+						const auto name = actor ? net::ToUtf8(actor->GetDisplayFullName()) : std::string{};
+						const auto length = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+							std::chrono::duration<double>(a_line->duration));
+						PatchSubtitle(std::make_shared<Subtitle>(a_line->subtitle,
+							EscapeHtml(name.empty() ? a_line->subtitle : name + ": " + a_line->subtitle),
+							clock + length + kSubtitleTail));
+					}
 					return;
 				}
 			}
@@ -139,10 +229,10 @@ namespace voice
 			WatchStart(std::move(a_line));
 		}
 
-		void Say(std::size_t a_line, const std::string& a_id)
+		void Say(std::size_t a_line, const std::string& a_id, const std::string& a_subtitle, double a_duration)
 		{
 			const auto now = std::chrono::steady_clock::now();
-			auto       pending = std::make_shared<PendingLine>(a_line, a_id, SoundIds{}, now, now);
+			auto       pending = std::make_shared<PendingLine>(a_line, a_id, a_subtitle, a_duration, SoundIds{}, now, now);
 			if (const auto reason = DispatchSay(*pending); !reason.empty()) {
 				Report(*pending, reason);
 				return;
@@ -249,12 +339,21 @@ namespace voice
 		}
 		const auto line = a_command.value("line", 0);
 		auto       id = a_command.value("id", "");
+		auto       text = a_command.value("text", "");  // фраза — для субтитра
+		const auto duration = a_command.value("duration", 3.0);  // её длина, с — столько держим субтитр
 		logs::info("Команда say {} (тема {}) получена", id, line);
 		const auto received = std::chrono::steady_clock::now();
-		SKSE::GetTaskInterface()->AddTask([line, id = std::move(id), received] {
+		SKSE::GetTaskInterface()->AddTask([line, id = std::move(id), text = std::move(text), duration, received] {
 			const auto waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count();
 			logs::info("Команда say {}: выполняется в игровом потоке (ждала {:.2f} с)", id, waited);
-			Say(static_cast<std::size_t>(line), id);
+			// Игра стояла на паузе (меню, свёрнута): сервис эту фразу уже пустил или вот-вот пустит в колонки —
+			// не говорим её второй раз из Гослинга.
+			if (waited > kStaleCommand) {
+				net::Post({ { "type", "say_result" },
+					{ "data", { { "id", id }, { "ok", false }, { "reason", "игра стояла на паузе" } } } });
+				return;
+			}
+			Say(static_cast<std::size_t>(line), id, text, duration);
 		});
 	}
 }

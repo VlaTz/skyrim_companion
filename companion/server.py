@@ -29,7 +29,13 @@ from companion.brain import Brain
 from companion.config import Config
 from companion.emotions import EMOTIONS
 from companion.game.dialogue import DialogueTexts
+from companion.game.places import PlaceBook
+from companion.game.profile import PlayerProfile
 from companion.game.state import GameEvent, GameState
+from companion.memory.diarist import Diarist
+from companion.memory.keeper import MemoryKeeper
+from companion.memory.thinker import Thinker
+from companion.memory.store import MemoryStore
 from companion.tools import build_tools
 from companion.voice.npc_voice import NpcVoice
 from companion.voice.service import VoiceService
@@ -105,25 +111,46 @@ class CommandQueue:
 
 def create_app(cfg: Config) -> FastAPI:
     hub = EventHub()
-    game = GameState(cfg.map, cfg.game.interface_bsa, dialogue=DialogueTexts(cfg.game.data_dir))
+    game = GameState(cfg.map, cfg.game.interface_bsa, dialogue=DialogueTexts(cfg.game.data_dir),
+                     profile=PlayerProfile(cfg.game.data_dir))
     commands = CommandQueue()
+    places = PlaceBook(cfg.game.data_dir)
+    memory = MemoryKeeper(MemoryStore(cfg.memory_path), game, places)
+    game.meet = memory.meet  # встречи (раса врага, Крик) — «впервые» или «уже встречали»
     npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
                          lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
     state: dict = {}
+
+    def publish(event: dict) -> None:
+        """События голосового сервиса — в журнал WebSocket и в память (реплики игрока и Гослинга)."""
+        hub.publish(event)
+        memory.on_voice_event(event)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         hub.loop = asyncio.get_running_loop()
         commands.start(hub.loop)
         service = await run_in_threadpool(
-            lambda: VoiceService(cfg, hub.publish, game_context=game.describe, npc_voice=npc_voice))
+            lambda: VoiceService(cfg, publish, game_context=memory.game_context, npc_voice=npc_voice,
+                                 memory_context=memory.memory_context))
         service.start_push_to_talk()
         state["voice"] = service
         if service.llm:
-            service.llm.set_tools(build_tools(game))
+            service.llm.set_tools(build_tools(game, places))
+            llm = service.llm
+            llm.events_since = game.events_since
+            memory.on_open = lambda: llm.restore(memory.store.last_dialogue(cfg.llm.history_turns))
+            diarist = Diarist(memory.store, llm.complete_json, cfg.diarist,
+                              player_name=lambda: memory.store.player_name)
+            memory.on_place_changed = diarist.place_changed
+            diarist.start()
         if cfg.brain.enabled and service.llm:
             state["brain"] = Brain(cfg.brain, service, game)
             state["brain"].start()
+        if cfg.thinker.enabled and service.llm:  # мысли Гослинга: что держать в голове и предложить
+            Thinker(memory, game, service.llm.complete_json,
+                    on_thought=state["brain"].notify if "brain" in state else lambda changes: None,
+                    cfg=cfg.thinker).start()
         log.info("Сервис готов: http://%s:%d", cfg.server.host, cfg.server.port)
         yield
         if "brain" in state:
@@ -193,6 +220,7 @@ def create_app(cfg: Config) -> FastAPI:
             changes = game.apply(event)
         except ValidationError as e:
             raise HTTPException(422, f"Неверные поля {event.type}: {e}")
+        memory.on_game_event(event, changes)
         texts = [c.text for c in changes]
         if changes:  # служебные (карта, квесты, сведения об игроке, say_result) в журнал не пишем
             hub.publish({"type": "game_event", "event": event.type, "changes": texts})
@@ -202,7 +230,8 @@ def create_app(cfg: Config) -> FastAPI:
 
     @app.get("/game/state")
     def game_state():
-        return {**game.snapshot(), "context": game.describe()}
+        return {**game.snapshot(), "context": memory.game_context(), "memory": memory.memory_context(),
+                "player": game.player_details()}
 
     @app.get("/game/commands")
     async def game_commands(wait: float = 20):

@@ -58,6 +58,25 @@ SCENARIOS: dict[str, tuple[str, list[dict]]] = {
             "weather": "туман", "health": 1.0, "in_combat": False,
             "nearby": [{"name": "Бриньольф"}, {"name": "Мадези"}, {"name": "Стражник Рифтена"}]}},
     ]),
+    # Знакомый NPC стал врагом и убит, цель задания сменилась, выучено слово силы (статистика игры).
+    # Первый quests — точка отсчёта, второй — уже событие «новая цель». Потом спроси: «что сейчас было?».
+    "arvel": ("Ветреный пик: Арвел напал и убит, новая цель, слово силы", [
+        {"type": "quests", "data": {"quests": [{"id": "0002610C", "name": "Ветреный пик", "type": 1,
+                                                "objectives": ["Добыть золотой коготь"]}], "completed": []}},
+        {"type": "status", "data": {
+            "location": "Ветреный пик", "hold": "Фолкрит", "cell": "Ветреный пик - Храм", "interior": True,
+            "health": 1.0, "in_combat": False, "nearby": [{"name": "Арвел Быстрый", "unique": True}]}},
+        {"type": "status", "data": {"in_combat": True,
+                                    "nearby": [{"name": "Арвел Быстрый", "hostile": True, "unique": True}]}},
+        {"type": "combat_started", "data": {"enemies": ["Арвел Быстрый"]}},
+        {"type": "combat_ended"},
+        {"type": "actor_killed", "data": {"name": "Арвел Быстрый", "by_player": True, "unique": True}},
+        {"type": "status", "data": {"in_combat": False, "nearby": [
+            {"name": "Арвел Быстрый", "hostile": True, "dead": True, "unique": True}]}},
+        {"type": "quests", "data": {"quests": [{"id": "0002610C", "name": "Ветреный пик", "type": 1,
+                                                "objectives": ["Открыть дверь в Зале легенд"]}], "completed": []}},
+        {"type": "stat", "data": {"name": "Words Of Power Learned", "value": 1}},
+    ]),
     # Реплики NPC: сервис берёт текст из Skyrim.esm по номеру INFO. Встрянет ли Гослинг — решает модель
     # (через brain.overheard_quiet секунд тишины; обычно молчит, на шутку про колено — чаще отвечает).
     "overheard": ("Стражник рассказывает игроку про колено", [

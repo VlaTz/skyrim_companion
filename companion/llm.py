@@ -10,14 +10,19 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import threading
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Callable
 
 from companion.config import LLMConfig
+from companion import trace
 from companion.emotions import DEFAULT_EMOTION, EMOTIONS
 from companion.tools import Tool
 
@@ -26,9 +31,12 @@ log = logging.getLogger(__name__)
 RESPONSE_FORMAT = """
 ФОРМАТ ОТВЕТА
 Отвечай строго одним JSON-объектом, без пояснений и markdown:
-{{"emotion": "<эмоция>", "text": "<что ты говоришь вслух>"}}
+{{"emotion": "<эмоция>", "text": "<что ты говоришь вслух>", "remember": "<необязательно>"}}
 "emotion" — с какой интонацией ты это произносишь, одно из: {emotions}.
 Выбирай по ситуации и смыслу реплики; по умолчанию — neutral.
+"remember" — узнал что-то новое и важное (о месте, человеке, задании, о Владосе): что запомнить, одной фразой.
+Только действительно важное, не каждый раз; нечего запоминать — не пиши поле. Говоришь, что запомнишь, —
+заполни его.
 """
 
 # Пока нет команд в игру (кусок 6 плана) — честно говорим модели, что она умеет только говорить.
@@ -48,20 +56,44 @@ SELF_TALK = """
 Сообщения в квадратных скобках — не слова игрока, а то, что сейчас происходит. На них ты можешь
 сказать что-то от себя (коротко, к месту, не повторяя уже сказанное) или промолчать — тогда
 верни пустой text. Молчать — нормально: лучше промолчать, чем болтать без повода.
+Пометки в событиях — из твоей памяти: «впервые в жизни» — ты такого ещё не видел, это первая встреча;
+«уже встречали … последний — там-то» — ты это помнишь и можешь вспомнить тот раз.
 """
 TOOLS_NOTE = """
 СПРАВКИ
 У тебя есть инструменты-справки об игре. Вызывай их, только если для ответа нужно то, чего нет в
 «Сейчас в игре», — каждая справка задерживает ответ. Получив справку, отвечай как обычно, JSON-ом.
+Справка и есть «посмотреть», и она мгновенная: если ответ без неё был бы «сейчас гляну», «посмотрю» — вызови
+её в этом же ответе. Посмотреть «потом» ты не сможешь: следующего хода может и не быть.
 Не пересказывай справку целиком — скажи главное, как сказал бы спутнику вслух.
 """
 GAME_CONTEXT_NOTE ="Описана в начале последнего сообщения, в блоке «Сейчас в игре»."
+
+
+BETWEEN_MAX = 8  # событий между репликами в истории — последних
+
+# Планировщик справок: отдельный короткий запрос без истории разговора — нужны ли справки для ответа игроку.
+# С историей модель держится своих прошлых ответов без справок («сейчас гляну» — и не смотрит: 0 из 4 на ходе
+# из трассы), без истории — зовёт справку (4 из 4). Идёт параллельно с основным запросом, ответ не замедляет.
+ROUTER_SYSTEM = """Ты помогаешь спутнику игрока в Скайриме ответить на последнюю реплику игрока. Реши, какие
+справки (инструменты) для этого нужны, и вызови их — можно несколько сразу. Справка нужна, если ответ зависит
+от того, чего нет в «Сейчас в игре», или игрок просит что-то посмотреть, проверить, найти. Справки не нужны —
+ответь одним словом: нет."""
+ROUTER_HISTORY = 4  # последних сообщений (2 обмена) — чтобы понять «посмотри» и «а там что?»
+_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="llm")
+
+
+def between_note(events: list[str]) -> str:
+    """Что случилось между репликами — строкой в квадратных скобках (не слова игрока)."""
+    return "[С твоей прошлой реплики в игре: " + "; ".join(events[-BETWEEN_MAX:]) + "]"
 
 
 @dataclass
 class Reply:
     text: str
     emotion: str
+    interest: int | None = None  # насколько зацепило (0–10) — только если об этом спрашивали в запросе
+    remember: str | None = None  # что запомнить (модель решила, что узнала важное)
 
 
 def parse_reply(content: str) -> Reply:
@@ -73,7 +105,12 @@ def parse_reply(content: str) -> Reply:
             text = str(data.get("text", "")).strip()
             emotion = str(data.get("emotion", "")).strip().lower()
             if text or "text" in data:  # пустой text — модель решила промолчать
-                return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION)
+                try:
+                    interest = int(data["interest"]) if "interest" in data else None
+                except (TypeError, ValueError):
+                    interest = None
+                remember = str(data.get("remember") or "").strip() or None
+                return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION, interest, remember)
         except json.JSONDecodeError:
             pass
     log.warning("LLM ответила не чистым JSON: %r", content)
@@ -114,7 +151,14 @@ class CompanionLLM:
         self.history: deque[dict] = deque(maxlen=cfg.history_turns * 2)
         self._lock = threading.Lock()  # отвечают и на реплики игрока, и на события — по очереди
         self.tools: dict[str, Tool] = {}
-        log.info("LLM: %s @ %s", cfg.model, cfg.base_url)
+        # Что случилось в игре после момента t (сжато) — в историю перед следующей репликой, чтобы модель видела
+        # порядок: «я сказал “помоги ему” -> Арвел напал -> Владос его убил -> Владос спрашивает».
+        self.events_since: Callable[[float], list[str]] = lambda t: []
+        self._last_turn = 0.0  # когда последний раз дописали историю
+        self.last_reply_at = 0.0  # когда Гослинг последний раз что-то сказал (мозгу: не болтает ли подряд)
+        self.last_reply_text = ""
+        self.background_model = cfg.background_model or cfg.model
+        log.info("LLM: %s @ %s (фоновые запросы: %s)", cfg.model, cfg.base_url, self.background_model)
 
     def system_prompt(self, memory: str = "", with_tools: bool = False) -> str:
         # Обстановка — не здесь, а в последнем сообщении: так модель не тянется за старыми ответами.
@@ -135,16 +179,37 @@ class CompanionLLM:
             reply = self._ask(f"Игрок: {player_text}", game_context, memory, use_tools=True)
         return reply
 
-    def initiate(self, situation: str, game_context: str = "", memory: str = "") -> Reply:
+    def initiate(self, situation: str, game_context: str = "", memory: str = "",
+                 min_interest: int | None = None, quip_chance: float = 0.0) -> Reply:
         """Реплика по своей инициативе на событие или тишину; пустой text — решил промолчать.
+        min_interest — ответ ниже этой оценки interest (её просит situation) считается молчанием; но с шансом
+        quip_chance он всё же звучит — ниже порога модель пишет короткую шутку (так просит situation).
         Без инструментов: тут важнее быстро."""
-        return self._ask(f"[{situation}]", game_context, memory, use_tools=False)
+        return self._ask(f"[{situation}]", game_context, memory, use_tools=False, min_interest=min_interest,
+                         quip_chance=quip_chance)
 
-    def _ask(self, user_content: str, game_context: str, memory: str, use_tools: bool) -> Reply:
+    def _ask(self, user_content: str, game_context: str, memory: str, use_tools: bool,
+             min_interest: int | None = None, quip_chance: float = 0.0) -> Reply:
         """user_content уходит в историю как есть; обстановка «Сейчас в игре» и обмен
         с инструментами — только в этот запрос."""
         now = f"Сейчас в игре:\n{game_context or 'Нет данных из игры.'}\n\n{user_content}"
         tools = list(self.tools.values()) if use_tools and self.cfg.tools else []
+        first_line = user_content.splitlines()[0][:150] if user_content else ""
+        block = trace.Block(first_line if user_content.startswith("Игрок:") else f"Сам: {first_line}")
+        if not user_content.startswith("Игрок:"):
+            block.section("Повод", user_content)
+        block.section("Сейчас в игре", game_context or "нет данных")
+        block.section("Память", memory or "пусто")
+        try:
+            return self._ask_traced(user_content, now, memory, tools, min_interest, quip_chance, block)
+        except Exception as e:
+            block.line(f"ОШИБКА: {e!r}")
+            raise
+        finally:
+            block.write()
+
+    def _ask_traced(self, user_content: str, now: str, memory: str, tools: list[Tool],
+                    min_interest: int | None, quip_chance: float, block: trace.Block) -> Reply:
         with self._lock:
             messages = [{"role": "system", "content": self.system_prompt(memory, with_tools=bool(tools))},
                         *self.history,
@@ -154,24 +219,92 @@ class CompanionLLM:
             calls = 0
             # Цикл агента: модель может запросить справки (до max_tool_rounds раз), потом отвечает.
             for round_ in range(self.cfg.max_tool_rounds + 1):
-                msg = self._complete(messages, tools, final=round_ == self.cfg.max_tool_rounds)
+                if round_ == 0 and tools and self.cfg.tool_router:
+                    msg = self._first_round(messages, now, tools, block)
+                else:
+                    msg = self._complete(messages, tools, final=round_ == self.cfg.max_tool_rounds)
                 if not msg.tool_calls:
                     break
                 messages.append({"role": "assistant", "content": msg.content or "",
                                  "tool_calls": [tc.model_dump() for tc in msg.tool_calls]})
                 for tc in msg.tool_calls:
                     calls += 1
-                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": self._run_tool(tc)})
+                    started = time.perf_counter()
+                    result = self._run_tool(tc)
+                    block.line(f"→ {tc.function.name}({tc.function.arguments}) "
+                               f"{(time.perf_counter() - started) * 1000:.0f} мс")
+                    block.line(f"← {result}")
+                    messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
             reply = parse_reply(msg.content or "")
-            log.info("LLM %.2f с%s: [%s] %r", time.perf_counter() - t,
-                     f" (инструментов: {calls})" if calls else "", reply.emotion, reply.text)
+            block.line(f"Ответ модели {time.perf_counter() - t:.2f} с: [{reply.emotion}]"
+                       + (f" интерес {reply.interest}" if reply.interest is not None else "")
+                       + f" «{reply.text}»" + (f"\n  запомнить: {reply.remember}" if reply.remember else ""))
+            log.info("LLM %.2f с%s: [%s]%s %r", time.perf_counter() - t,
+                     f" (инструментов: {calls})" if calls else "", reply.emotion,
+                     f" интерес {reply.interest}" if reply.interest is not None else "", reply.text)
+            if min_interest is not None and (reply.interest or 0) < min_interest and reply.text:
+                if random.random() < quip_chance:  # не важно, но иногда — короткой шуткой
+                    log.info("Интерес %s ниже порога %d — но сказал шуткой (шанс %.0f%%)",
+                             reply.interest, min_interest, quip_chance * 100)
+                    block.line(f"→ ниже порога {min_interest}, но сказал шуткой (шанс {quip_chance:.0%})")
+                else:
+                    log.info("Интерес %s ниже порога %d — промолчал", reply.interest, min_interest)
+                    block.line(f"→ промолчал: интерес {reply.interest} ниже порога {min_interest}")
+                    reply.text = ""
 
             if reply.text:  # молчание на событие в историю не пишем
+                # События с прошлой реплики — в историю вместе с этой (в сам запрос они уже вошли «Недавно»).
+                between = [e for e in self.events_since(self._last_turn) if e not in user_content]
+                if self._last_turn and between:
+                    user_content = f"{between_note(between)}\n{user_content}"
+                self._last_turn = self.last_reply_at = time.time()
+                self.last_reply_text = reply.text
                 self.history.append({"role": "user", "content": user_content})
                 self.history.append({"role": "assistant",
                                      "content": json.dumps({"emotion": reply.emotion, "text": reply.text},
                                                            ensure_ascii=False)})
             return reply
+
+    def _first_round(self, messages: list[dict], now: str, tools: list[Tool], block: trace.Block):
+        """Первый шаг ответа игроку: основной запрос и планировщик справок — параллельно. Планировщик назвал
+        справки, а модель сама их не позвала — берём его план, как будто это её вызовы (её ответ без справок
+        отбрасываем); иначе — её ответ как есть."""
+        first = _pool.submit(self._complete, list(messages), tools, False)
+        planned = self._route(now, tools, block)
+        if planned:
+            try:
+                own = first.result() if first.done() else None
+            except Exception:  # noqa: BLE001 — основной запрос упал, а план есть: ответим по плану
+                own = None
+            if not (own and own.tool_calls):
+                return SimpleNamespace(content="", tool_calls=planned)
+        return first.result()
+
+    def _route(self, now: str, tools: list[Tool], block: trace.Block) -> list:
+        """Планировщик справок: какие инструменты вызвать (их tool_calls) или [] — не нужны."""
+        lines = []
+        for m in list(self.history)[-ROUTER_HISTORY:]:
+            if m["role"] == "assistant":
+                try:
+                    lines.append("Ты: " + str(json.loads(m["content"]).get("text", "")))
+                except json.JSONDecodeError:
+                    lines.append("Ты: " + m["content"])
+            else:
+                lines.append(m["content"].splitlines()[-1])  # без «[С твоей прошлой реплики …]»
+        user = ("Последние реплики:\n" + "\n".join(lines) + "\n\n" if lines else "") + now
+        t = time.perf_counter()
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.cfg.model, temperature=0, max_tokens=300,
+                messages=[{"role": "system", "content": ROUTER_SYSTEM}, {"role": "user", "content": user}],
+                tools=[tool.schema() for tool in tools], extra_body=self.cfg.extra_body or None)
+            planned = resp.choices[0].message.tool_calls or []
+        except Exception as e:  # noqa: BLE001 — без плана модель сама решит, звать ли справки
+            log.warning("Планировщик справок не ответил: %s", e)
+            planned = []
+        names = ", ".join(f"{c.function.name}({c.function.arguments})" for c in planned)
+        block.line(f"План справок {time.perf_counter() - t:.2f} с: {names or 'не нужны'}")
+        return planned
 
     def _complete(self, messages: list[dict], tools: list[Tool], final: bool):
         kwargs: dict = {}
@@ -205,3 +338,74 @@ class CompanionLLM:
 
     def reset(self) -> None:
         self.history.clear()
+
+    def complete_json(self, system: str, user: str, max_tokens: int | None = None,
+                      title: str = "Фоновый запрос") -> dict | None:
+        """Отдельный запрос без истории и инструментов (дневник и т.п.): ответ — JSON-объект или None.
+        Не берёт блокировку разговора — идёт в фоне, пока Гослинг болтает. Модель — llm.background_model."""
+        block = trace.Block(f"{title} [{self.background_model}]")
+        block.section("Запрос", user)
+        try:
+            return self._complete_json(system, user, max_tokens or self.cfg.background_max_tokens, block)
+        finally:
+            block.write()
+
+    def _complete_json(self, system: str, user: str, max_tokens: int, block: trace.Block) -> dict | None:
+        try:
+            resp = self.client.chat.completions.create(
+                model=self.background_model, temperature=0.3, max_tokens=max_tokens,
+                messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                extra_body=(self.cfg.extra_body if self.cfg.background_extra_body is None
+                            else self.cfg.background_extra_body) or None)
+        except Exception as e:  # noqa: BLE001 — сеть, лимиты: фоновая задача просто попробует позже
+            log.warning("Фоновый запрос к LLM не удался: %s", e)
+            block.line(f"ОШИБКА: {e!r}")
+            return None
+        content = resp.choices[0].message.content or ""
+        block.section("Ответ", content)
+        match = re.search(r"\{.*\}", content, re.S)
+        try:
+            return json.loads(match.group(0)) if match else None
+        except json.JSONDecodeError:
+            log.warning("Фоновый запрос: не JSON: %r", content[:300])
+            return None
+
+    def drop_last(self, reply: Reply) -> None:
+        """Ответ так и не прозвучал (игрок перебил) — убрать его вместе с вопросом из истории."""
+        with self._lock:
+            if len(self.history) < 2 or not reply.text:
+                return
+            try:
+                last = json.loads(self.history[-1]["content"]).get("text")
+            except (json.JSONDecodeError, AttributeError):
+                return
+            if last == reply.text:
+                self.history.pop()
+                self.history.pop()
+
+    def restore(self, dialogue: list[tuple[str, str, str | None, bool]]) -> None:
+        """История разговора из журнала памяти (после перезапуска сервиса или смены персонажа):
+        [(kind, text, emotion, initiative)], kind — player | gosling | event (что было между репликами)."""
+        with self._lock:
+            self.history.clear()
+            asked: str | None = None
+            events: list[list] = []  # [текст, сколько раз подряд] с прошлой реплики Гослинга
+            for kind, text, emotion, initiative in dialogue:
+                if kind == "event":
+                    if events and events[-1][0] == text:
+                        events[-1][1] += 1
+                    else:
+                        events.append([text, 1])
+                    continue
+                if kind == "player":
+                    asked = text  # без ответа (ошибка, перебили) — вопрос заменит следующий
+                    continue
+                user = f"Игрок: {asked}" if asked is not None and not initiative else "[Ты заговорил сам]"
+                if events and self.history:
+                    user = between_note([t if n == 1 else f"{t} ×{n}" for t, n in events]) + "\n" + user
+                self.history.append({"role": "user", "content": user})
+                self.history.append({"role": "assistant", "content": json.dumps(
+                    {"emotion": emotion or DEFAULT_EMOTION, "text": text}, ensure_ascii=False)})
+                asked, events = None, []
+            self._last_turn = time.time()
+        log.info("История разговора восстановлена из памяти: %d реплик", len(self.history) // 2)

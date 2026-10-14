@@ -2,6 +2,7 @@
 
 #include "Net.h"
 #include "Player.h"
+#include "Profile.h"
 #include "Quests.h"
 #include "Voice.h"
 
@@ -13,12 +14,23 @@ namespace events
 		using Clock = std::chrono::steady_clock;
 
 		constexpr auto        kTick = 1s;                // как часто проверяем состояние
-		constexpr auto        kStatusEvery = 5s;         // снимок status — не реже
+		constexpr auto        kStatusEvery = 2s;         // снимок status — не реже (здоровье, кто рядом, собеседник)
 		constexpr auto        kPlayerMinGap = 3s;        // подробности об игроке — не чаще (разграбление сундука)
 		constexpr auto        kPlayerEvery = 30s;        // и не реже (эффекты меняются без событий)
+		constexpr auto        kProfileEvery = 60s;       // профиль Владоса (фракции, розыск, квесты) — не реже
 		constexpr float       kNearbyRadius = 2500.0f;   // ~35 м
 		constexpr std::size_t kNearbyMax = 10;
+		constexpr float       kThreatRadius = 10000.0f;  // ~140 м: враги дальше «рядом» — дракон в небе, великан в поле
+		constexpr std::size_t kThreatMax = 3;
 		constexpr float       kHearRadius = 1750.0f;     // ~25 м: реплики NPC дальше Гослинг не слышит
+		constexpr float       kTouchRadius = 300.0f;     // ~4 м: замок открылся рядом с игроком — это он открыл
+		constexpr float       kUnitsPerMeter = 70.0f;
+		constexpr float       kFleeSpeed = 245.0f;       // ед./с (~3,5 м/с): собеседник бежит, а не идёт
+		constexpr int         kFleeTicks = 2;            // столько проверок подряд — убегает
+		constexpr auto        kFleeRepeat = 20s;         // «убегает» про одного и того же — не чаще
+		constexpr auto        kPartnerFor = 300s;        // за тем, с кем говорил игрок, следим 5 минут
+		constexpr auto        kActivateRepeat = 3s;      // повторная активация того же предмета — не событие
+		constexpr auto        kLockpickAfter = 2s;       // замок открылся так скоро после меню взлома — взломан
 		constexpr RE::FormID  kPlayerRef = 0x14;
 
 		// Всё ниже трогается только из игрового потока (обработчики событий и задачи AddTask).
@@ -35,11 +47,37 @@ namespace events
 		bool              inGame = false;  // загружена игра, а не главное меню
 		bool              inDialogue = false;  // игрок в меню разговора с NPC
 
+		std::string saveCharacter;  // ID персонажа из имени загружаемого сейва («Autosave1_02CCEDA2_…»)
+
 		const RE::TESWorldSpace* markersWorld = nullptr;  // для какого мира последний раз слали маркеры карты
 		bool                     markersDirty = true;     // открыто новое место — разослать заново
 		bool                     questsDirty = true;      // сменился этап или цель квеста — разослать журнал
 		bool                     playerDirty = true;      // сменились инвентарь или экипировка
 		Clock::time_point        lastPlayer{};
+		bool                     profileDirty = true;     // загрузка, сменился этап квеста — разослать профиль
+		Clock::time_point        lastProfile{};
+
+		// Собеседник: с кем игрок недавно заговорил (активировал живого NPC). Следим, жив ли, враждебен ли,
+		// не убегает ли (Арвел вырвался из паутины и побежал). По номеру формы — без функций игры по адресу.
+		struct Partner
+		{
+			RE::FormID        id = 0;
+			std::string       name;
+			Clock::time_point since{};
+			RE::NiPoint3      lastPos{};
+			Clock::time_point lastAt{};
+			int               runTicks = 0;
+			Clock::time_point fledAt{};
+		} partner;
+
+		RE::FormID        lastActivated = 0;
+		Clock::time_point lastActivatedAt{};
+		RE::FormID        pendingLock = 0;  // замок открылся, а активации ещё не было (порядок событий не гарантирован)
+		Clock::time_point pendingLockAt{};
+		std::string       lastShout;  // крик и когда — один крик игра может прислать несколькими заклинаниями
+		Clock::time_point lastShoutAt{};
+		bool              lockpicking = false;  // открыто меню взлома замка
+		Clock::time_point lockpickClosed{};
 
 		void Post(std::string_view a_type, json a_data = json::object())
 		{
@@ -64,6 +102,23 @@ namespace events
 				}
 			}
 			return nullptr;
+		}
+
+		// Чья это игра — память Гослинга своя у каждого персонажа. Надёжнее всего ID из имени сейва; поле
+		// BGSSaveLoadManager::currentCharacterID — запасной путь (на 1.7.x смещение не проверено, сверяем в логе).
+		std::string CharacterId()
+		{
+			if (!saveCharacter.empty()) {
+				return saveCharacter;
+			}
+			const auto manager = RE::BGSSaveLoadManager::GetSingleton();
+			return manager && manager->currentCharacterID ? std::format("{:08X}", manager->currentCharacterID) : std::string{};
+		}
+
+		float DaysPassed()
+		{
+			const auto calendar = RE::Calendar::GetSingleton();
+			return calendar ? calendar->GetDaysPassed() : 0.0f;
 		}
 
 		std::string Weather()
@@ -131,23 +186,113 @@ namespace events
 			RE::Actor*  actor;
 		};
 
-		std::vector<Near> NearbyActors(RE::PlayerCharacter* a_player)
+		// Единственный в игре (Арвел, Белетор), а не «Драугр» из шаблона: флаг записи NPC, только чтение поля.
+		bool IsUnique(RE::Actor* a_actor)
 		{
-			std::vector<Near> found;
+			const auto base = a_actor ? a_actor->GetActorBase() : nullptr;
+			return base && base->IsUnique();
+		}
+
+		// Враг: враждебен игроку. Существо (не людская раса) — ещё и агрессивно: олени, кролики, лисы игра тоже
+		// считает «враждебными», хотя они убегают («начался бой: Олень, Олень, Мирмулнир»). Агрессия — значение
+		// актёра (как здоровье игрока), раса — поле записи.
+		bool Hostile(RE::Actor* a_actor, RE::PlayerCharacter* a_player)
+		{
+			if (!a_actor->IsHostileToActor(a_player)) {
+				return false;
+			}
+			const auto race = a_actor->GetActorRuntimeData().race;
+			const bool creature = race && !race->data.flags.any(RE::RACE_DATA::Flag::kPlayable);
+			return !creature || a_actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kAggression) > 0.0f;
+		}
+
+		struct Around
+		{
+			std::vector<Near> nearby;   // ближе kNearbyRadius, kNearbyMax ближайших
+			std::vector<Near> threats;  // живые враги дальше — до kThreatRadius, kThreatMax ближайших
+		};
+
+		Around ActorsAround(RE::PlayerCharacter* a_player)
+		{
+			Around around;
 			RE::ProcessLists::GetSingleton()->ForEachHighActor([&](RE::Actor* a_actor) {
 				if (a_actor && a_actor != a_player) {
 					const float distance = a_player->GetDistance(a_actor);
 					if (distance < kNearbyRadius) {
-						found.push_back({ distance, a_actor });
+						around.nearby.push_back({ distance, a_actor });
+					} else if (distance < kThreatRadius && !a_actor->IsDead() && Hostile(a_actor, a_player)) {
+						around.threats.push_back({ distance, a_actor });
 					}
 				}
 				return RE::BSContainer::ForEachResult::kContinue;
 			});
-			std::ranges::sort(found, {}, &Near::distance);
-			if (found.size() > kNearbyMax) {
-				found.resize(kNearbyMax);
+			for (auto* list : { &around.nearby, &around.threats }) {
+				std::ranges::sort(*list, {}, &Near::distance);
 			}
-			return found;
+			if (around.nearby.size() > kNearbyMax) {
+				around.nearby.resize(kNearbyMax);
+			}
+			if (around.threats.size() > kThreatMax) {
+				around.threats.resize(kThreatMax);
+			}
+			return around;
+		}
+
+		// Раса, если она не людская («Дракон», «Драугр», «Великан»): по ней сервис помнит, кого вы уже встречали.
+		// У людей и эльфов (играбельные расы) — пусто: «впервые видишь норда» не бывает. Только чтение полей.
+		std::string RaceOf(RE::Actor* a_actor)
+		{
+			const auto race = a_actor ? a_actor->GetActorRuntimeData().race : nullptr;
+			if (!race || race->data.flags.any(RE::RACE_DATA::Flag::kPlayable)) {
+				return {};
+			}
+			return Name(race);
+		}
+
+		json ActorJson(RE::PlayerCharacter* a_player, const Near& a_near)
+		{
+			return { { "name", Name(a_near.actor) },
+				{ "hostile", Hostile(a_near.actor, a_player) },
+				{ "dead", a_near.actor->IsDead() },
+				{ "follower", a_near.actor->IsPlayerTeammate() },
+				{ "unique", IsUnique(a_near.actor) },
+				{ "race", RaceOf(a_near.actor) },
+				{ "distance", std::round(a_near.distance / kUnitsPerMeter) } };
+		}
+
+		// Собеседник для status: где он и что с ним; заодно — не убегает ли (событие npc_flees).
+		json PartnerStatus(RE::PlayerCharacter* a_player, Clock::time_point a_now)
+		{
+			if (!partner.id || a_now - partner.since > kPartnerFor) {
+				partner.id = 0;
+				return nullptr;
+			}
+			const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(a_now - partner.since).count();
+			// Выгружен или в другой ячейке (ушёл за дверь, остался в другом помещении) — «не видно».
+			const auto actor = RE::TESForm::LookupByID<RE::Actor>(partner.id);
+			if (!actor || !actor->GetParentCell() || actor->GetWorldspace() != a_player->GetWorldspace() ||
+				(actor->GetParentCell()->IsInteriorCell() && actor->GetParentCell() != a_player->GetParentCell())) {
+				partner.lastAt = {};
+				return { { "name", partner.name }, { "ago", seconds }, { "gone", true } };
+			}
+			const auto  pos = actor->GetPosition();
+			const float dt = std::chrono::duration<float>(a_now - partner.lastAt).count();
+			if (dt > 0.2f && partner.lastAt != Clock::time_point{}) {
+				const auto step = pos - partner.lastPos;
+				const bool away = step.Dot(pos - a_player->GetPosition()) > 0.0f;  // от игрока, а не на него
+				partner.runTicks = (!actor->IsDead() && away && step.Length() / dt > kFleeSpeed) ? partner.runTicks + 1 : 0;
+				if (partner.runTicks >= kFleeTicks && a_now - partner.fledAt > kFleeRepeat) {
+					partner.fledAt = a_now;
+					logs::info("Собеседник убегает: {}", partner.name);
+					Post("npc_flees", { { "name", partner.name } });
+				}
+			}
+			partner.lastPos = pos;
+			partner.lastAt = a_now;
+			return { { "name", partner.name }, { "ago", seconds },
+				{ "distance", std::round(a_player->GetDistance(actor) / kUnitsPerMeter) },
+				{ "hostile", Hostile(actor, a_player) }, { "dead", actor->IsDead() },
+				{ "unique", IsUnique(actor) } };
 		}
 
 		// Раз в kTick, в игровом потоке.
@@ -165,18 +310,23 @@ namespace events
 			const std::string location = (!loc || loc == hold) ? std::string{} : Name(loc);
 			const std::string cellName = Name(cell);
 			const bool        inCombat = player->IsInCombat();
-			const auto        nearby = NearbyActors(player);
+			const auto        around = ActorsAround(player);
+			const json        partnerNow = PartnerStatus(player, Clock::now());  // каждый тик — ловим бегство
 
 			if (net::TakeReconnected()) {  // сервис перезапущен — он ничего не знает, шлём всё заново
 				markersDirty = true;
 				questsDirty = true;
 				playerDirty = true;
+				profileDirty = true;
 				forceStatus = true;
 			}
 
 			if (questsDirty) {
 				questsDirty = false;
-				Post("quests", { { "quests", quests::Collect() } });
+				auto active = quests::Collect();
+				auto completed = quests::Completed();
+				logs::info("Журнал: активных квестов {}, выполненных {}", active.size(), completed.size());
+				Post("quests", { { "quests", std::move(active) }, { "completed", std::move(completed) } });
 			}
 
 			if (const auto now = Clock::now();
@@ -184,6 +334,12 @@ namespace events
 				playerDirty = false;
 				lastPlayer = now;
 				Post("player", player::Collect(player));
+			}
+
+			if (const auto now = Clock::now(); profileDirty || now - lastProfile >= kProfileEvery) {
+				profileDirty = false;
+				lastProfile = now;
+				Post("profile", profile::Collect(player));
 			}
 
 			// В помещении мира нет — маркеры остаются от последней улицы.
@@ -196,15 +352,22 @@ namespace events
 
 			if (last.valid && inCombat != last.inCombat) {
 				if (inCombat) {
+					// Враги рядом и вдали (дракон кружит дальше 35 м); races — кто они, если не люди.
 					json enemies = json::array();
-					for (const auto& [distance, actor] : nearby) {
-						if (actor->IsHostileToActor(player) && !actor->IsDead()) {
-							if (auto name = Name(actor); !name.empty()) {
-								enemies.push_back(std::move(name));
+					json races = json::object();
+					for (const auto* list : { &around.nearby, &around.threats }) {
+						for (const auto& [distance, actor] : *list) {
+							if (Hostile(actor, player) && !actor->IsDead()) {
+								if (auto name = Name(actor); !name.empty()) {
+									if (auto race = RaceOf(actor); !race.empty()) {
+										races[name] = std::move(race);
+									}
+									enemies.push_back(std::move(name));
+								}
 							}
 						}
 					}
-					Post("combat_started", { { "enemies", std::move(enemies) } });
+					Post("combat_started", { { "enemies", std::move(enemies) }, { "races", std::move(races) } });
 				} else {
 					Post("combat_ended");
 				}
@@ -228,6 +391,7 @@ namespace events
 				}
 				if (const auto calendar = RE::Calendar::GetSingleton()) {
 					data["hour"] = calendar->GetHour();
+					data["days_passed"] = calendar->GetDaysPassed();
 				}
 				const float maxHealth = player->GetActorValueMax(RE::ActorValue::kHealth);
 				if (maxHealth > 0.0f) {
@@ -236,18 +400,28 @@ namespace events
 				}
 				data["in_combat"] = inCombat;
 				data["sneaking"] = player->IsSneaking();
+				// Чья игра — и в status: после перезапуска сервиса game_loaded не повторяется.
+				data["character"] = CharacterId();
+				data["player_name"] = Name(player->GetActorBase());
 				data["level"] = player->GetLevel();
 
 				json people = json::array();
-				for (const auto& [distance, actor] : nearby) {
-					if (auto name = Name(actor); !name.empty()) {
-						people.push_back({ { "name", std::move(name) },
-							{ "hostile", actor->IsHostileToActor(player) },
-							{ "dead", actor->IsDead() },
-							{ "follower", actor->IsPlayerTeammate() } });
+				json threats = json::array();
+				for (const auto& entry : around.nearby) {
+					if (!Name(entry.actor).empty()) {
+						people.push_back(ActorJson(player, entry));
+					}
+				}
+				for (const auto& entry : around.threats) {
+					if (!Name(entry.actor).empty()) {
+						threats.push_back(ActorJson(player, entry));
 					}
 				}
 				data["nearby"] = std::move(people);
+				data["threats"] = std::move(threats);
+				if (!partnerNow.is_null()) {
+					data["partner"] = partnerNow;
+				}
 				if (auto gosling = voice::Status(player); !gosling.is_null()) {
 					data["gosling"] = std::move(gosling);
 				}
@@ -278,7 +452,11 @@ namespace events
 			public RE::BSTEventSink<RE::TESQuestStageEvent>,
 			public RE::BSTEventSink<RE::ObjectiveState::Event>,
 			public RE::BSTEventSink<RE::TESEquipEvent>,
-			public RE::BSTEventSink<RE::TESTopicInfoEvent>
+			public RE::BSTEventSink<RE::TESTopicInfoEvent>,
+			public RE::BSTEventSink<RE::TESTrackedStatsEvent>,
+			public RE::BSTEventSink<RE::TESActivateEvent>,
+			public RE::BSTEventSink<RE::TESLockChangedEvent>,
+			public RE::BSTEventSink<RE::TESSpellCastEvent>
 		{
 		public:
 			static Sinks* GetSingleton()
@@ -297,7 +475,9 @@ namespace events
 				const auto dying = a_event->actorDying.get();
 				const bool byPlayer = a_event->actorKiller && a_event->actorKiller.get() == player;
 				if (dying != player && (byPlayer || player->GetDistance(dying) < kNearbyRadius)) {
-					Post("actor_killed", { { "name", Name(dying) }, { "by_player", byPlayer } });
+					const auto actor = dying->As<RE::Actor>();
+					Post("actor_killed", { { "name", Name(dying) }, { "by_player", byPlayer }, { "unique", IsUnique(actor) },
+						{ "race", RaceOf(actor) } });
 				}
 				return RE::BSEventNotifyControl::kContinue;
 			}
@@ -334,10 +514,28 @@ namespace events
 				if (a_event && a_event->opening && a_event->menuName == RE::MainMenu::MENU_NAME) {
 					inGame = false;
 				}
+				// Меню взлома: замок, открывшийся при нём (или сразу после), взломан, а не открыт ключом.
+				if (a_event && a_event->menuName == RE::LockpickingMenu::MENU_NAME) {
+					lockpicking = a_event->opening;
+					if (!a_event->opening) {
+						lockpickClosed = Clock::now();
+					}
+				}
 				// Пока игрок говорит с NPC, Гослинг не встревает — сервис ждёт конца разговора.
 				if (a_event && a_event->menuName == RE::DialogueMenu::MENU_NAME && a_event->opening != inDialogue) {
 					inDialogue = a_event->opening;
 					Post("dialogue_menu", { { "open", inDialogue } });
+				}
+				return RE::BSEventNotifyControl::kContinue;
+			}
+
+			// Игровая статистика («Locks Picked», «Items Stolen», …): значение — накопленное за всю игру.
+			// Из неё сервис выводит привычки Владоса по делам.
+			RE::BSEventNotifyControl ProcessEvent(const RE::TESTrackedStatsEvent* a_event,
+				RE::BSTEventSource<RE::TESTrackedStatsEvent>*) override
+			{
+				if (inGame && a_event && !a_event->stat.empty()) {
+					Post("stat", { { "name", std::string(a_event->stat.c_str()) }, { "value", a_event->value } });
 				}
 				return RE::BSEventNotifyControl::kContinue;
 			}
@@ -365,12 +563,142 @@ namespace events
 				if (!topic || !file || topic->data.type == Type::kCombat || topic->data.type == Type::kDetection) {
 					return RE::BSEventNotifyControl::kContinue;
 				}
+				// Говорит с игроком (меню разговора открыто) — собеседник, даже если разговор начал сам NPC
+				// (сцена, подход к игроку): тогда активации NPC не было. 5 минут считаем от последней реплики.
+				if (const auto actor = speaker->As<RE::Actor>(); inDialogue && actor && !actor->IsPlayerTeammate()) {
+					if (partner.id != speaker->GetFormID()) {
+						partner = { speaker->GetFormID(), Name(speaker) };
+						logs::info("Собеседник: {}", partner.name);
+					}
+					partner.since = Clock::now();
+				}
 				Post("npc_line", { { "speaker", Name(speaker) },
 					{ "file", std::string(file->GetFilename()) },
 					{ "form", info->GetLocalFormID() },
 					{ "category", static_cast<int>(topic->data.type.get()) },
 					{ "subtype", static_cast<int>(topic->data.subtype.get()) },
 					{ "to_player", inDialogue } });
+				return RE::BSEventNotifyControl::kContinue;
+			}
+
+			// Игрок что-то активировал: рычаг, цепь, столб загадки (activator), сундук, книгу, верстак, тело
+			// (обыскал), живого NPC (заговорил — он становится собеседником). Двери не шлём: их и так видно
+			// по смене помещения, а запертую ключом — по TESLockChangedEvent. Подбор вещей — item_picked.
+			RE::BSEventNotifyControl ProcessEvent(const RE::TESActivateEvent* a_event,
+				RE::BSTEventSource<RE::TESActivateEvent>*) override
+			{
+				const auto player = RE::PlayerCharacter::GetSingleton();
+				const auto ref = a_event ? a_event->objectActivated.get() : nullptr;
+				if (!inGame || !ref || !player || a_event->actionRef.get() != player) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				const auto base = ref->GetBaseObject();
+				const auto now = Clock::now();
+				if (pendingLock == ref->GetFormID() && now - pendingLockAt < kActivateRepeat) {
+					pendingLock = 0;
+					PostUnlocked(ref);  // замок открылся чуть раньше, чем пришла активация
+				}
+				const bool repeat = ref->GetFormID() == lastActivated && now - lastActivatedAt < kActivateRepeat;
+				lastActivated = ref->GetFormID();
+				lastActivatedAt = now;
+				if (!base || repeat) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				std::string_view kind;
+				bool             unique = false;
+				if (const auto actor = ref->As<RE::Actor>()) {
+					if (voice::IsGosling(actor) || actor->IsPlayerTeammate()) {
+						return RE::BSEventNotifyControl::kContinue;
+					}
+					unique = IsUnique(actor);
+					if (actor->IsDead()) {
+						kind = "body";
+					} else {
+						kind = "npc";
+						partner = { ref->GetFormID(), Name(ref), now };
+						logs::info("Собеседник: {}", partner.name);
+					}
+				} else {
+					switch (base->GetFormType()) {
+					case RE::FormType::Activator:
+						kind = "activator";
+						break;
+					case RE::FormType::Container:
+						kind = "container";
+						break;
+					case RE::FormType::Book:
+						kind = "book";
+						break;
+					case RE::FormType::Furniture:
+						kind = "furniture";
+						break;
+					default:
+						return RE::BSEventNotifyControl::kContinue;
+					}
+				}
+				if (auto name = Name(ref); !name.empty()) {
+					Post("activated", { { "name", std::move(name) }, { "kind", kind }, { "unique", unique } });
+				}
+				return RE::BSEventNotifyControl::kContinue;
+			}
+
+			// Замок рядом с игроком открылся без взлома — ключом. Засчитываем, только если игрок сам активировал этот
+			// предмет (события приходят в любом порядке — ждём пару): иначе замок открыл скрипт. Двери-переходы
+			// (городские ворота) не берём: их игра отпирает сама. Сам замок не читаем: GetLock — функция по адресу.
+			RE::BSEventNotifyControl ProcessEvent(const RE::TESLockChangedEvent* a_event,
+				RE::BSTEventSource<RE::TESLockChangedEvent>*) override
+			{
+				const auto player = RE::PlayerCharacter::GetSingleton();
+				const auto ref = a_event ? a_event->lockedObject.get() : nullptr;
+				if (!inGame || !ref || !player || player->GetDistance(ref) > kTouchRadius) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				const auto now = Clock::now();
+				const bool picked = lockpicking || now - lockpickClosed < kLockpickAfter;
+				const bool loadDoor = ref->extraList.HasType(RE::ExtraDataType::kTeleport);
+				logs::info("Замок сменил состояние: {}{}{}", Name(ref), loadDoor ? " (дверь-переход)" : "",
+					picked ? ", взлом" : "");
+				if (picked || loadDoor) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				if (ref->GetFormID() == lastActivated && now - lastActivatedAt < kActivateRepeat) {
+					PostUnlocked(ref);
+				} else {
+					pendingLock = ref->GetFormID();  // активация придёт следом — тогда и засчитаем
+					pendingLockAt = now;
+				}
+				return RE::BSEventNotifyControl::kContinue;
+			}
+
+			static void PostUnlocked(RE::TESObjectREFR* a_ref)
+			{
+				const auto base = a_ref->GetBaseObject();
+				Post("unlocked", { { "name", Name(a_ref) }, { "door", base && base->GetFormType() == RE::FormType::Door } });
+			}
+
+			// Игрок применил Крик: заклинание типа «голос». Название — у выбранного крика (поле selectedPower),
+			// иначе у заклинания. Один крик — одно событие (слова крика могут прийти отдельными заклинаниями).
+			RE::BSEventNotifyControl ProcessEvent(const RE::TESSpellCastEvent* a_event,
+				RE::BSTEventSource<RE::TESSpellCastEvent>*) override
+			{
+				const auto player = RE::PlayerCharacter::GetSingleton();
+				if (!inGame || !a_event || !player || a_event->object.get() != player) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				const auto spell = RE::TESForm::LookupByID<RE::SpellItem>(a_event->spell);
+				if (!spell || spell->data.spellType != RE::MagicSystem::SpellType::kVoicePower) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				const auto power = player->GetActorRuntimeData().selectedPower;
+				auto       name = power && power->GetFormType() == RE::FormType::Shout ? Name(power) : Name(spell);
+				const auto now = Clock::now();
+				if (name.empty() || (name == lastShout && now - lastShoutAt < kActivateRepeat)) {
+					return RE::BSEventNotifyControl::kContinue;
+				}
+				lastShout = name;
+				lastShoutAt = now;
+				logs::info("Крик: {} (заклинание {})", name, Name(spell));
+				Post("shout", { { "name", std::move(name) } });
 				return RE::BSEventNotifyControl::kContinue;
 			}
 
@@ -385,6 +713,7 @@ namespace events
 				RE::BSTEventSource<RE::TESQuestStageEvent>*) override
 			{
 				questsDirty = true;
+				profileDirty = true;  // квест мог завершиться, а с ним — вступление в гильдию, новый ранг
 				return RE::BSEventNotifyControl::kContinue;
 			}
 
@@ -415,6 +744,10 @@ namespace events
 			holder->AddEventSink<RE::TESQuestStageEvent>(sinks);
 			holder->AddEventSink<RE::TESEquipEvent>(sinks);
 			holder->AddEventSink<RE::TESTopicInfoEvent>(sinks);
+			holder->AddEventSink<RE::TESTrackedStatsEvent>(sinks);
+			holder->AddEventSink<RE::TESActivateEvent>(sinks);
+			holder->AddEventSink<RE::TESLockChangedEvent>(sinks);
+			holder->AddEventSink<RE::TESSpellCastEvent>(sinks);
 			RE::ObjectiveState::GetEventSource()->AddEventSink(sinks);
 			RE::UI::GetSingleton()->AddEventSink<RE::MenuOpenCloseEvent>(sinks);
 			RE::LocationDiscovery::GetEventSource()->AddEventSink(sinks);
@@ -430,8 +763,32 @@ namespace events
 			markersDirty = true;
 			questsDirty = true;
 			playerDirty = true;
-			Post("game_loaded");
+			profileDirty = true;
+			const auto player = RE::PlayerCharacter::GetSingleton();
+			const auto manager = RE::BGSSaveLoadManager::GetSingleton();
+			logs::info("Персонаж: из сейва '{}', поле currentCharacterID {:08X}, дней прошло {:.2f}", saveCharacter,
+				manager ? manager->currentCharacterID : 0, DaysPassed());
+			Post("game_loaded", { { "character", CharacterId() },
+				{ "player_name", player ? Name(player->GetActorBase()) : std::string{} },
+				{ "days_passed", DaysPassed() } });
 			voice::LogQuestState();
+		}
+
+		// «Autosave1_02CCEDA2_1_…» -> «02CCEDA2»: второе поле имени сейва — ID персонажа.
+		std::string CharacterFromSave(std::string_view a_name)
+		{
+			if (const auto slash = a_name.find_last_of("\\/"); slash != std::string_view::npos) {
+				a_name.remove_prefix(slash + 1);  // на случай, если пришёл путь, а не имя
+			}
+			const auto first = a_name.find('_');
+			const auto second = first == std::string_view::npos ? first : a_name.find('_', first + 1);
+			if (second == std::string_view::npos || second - first != 9) {
+				return {};
+			}
+			const auto id = a_name.substr(first + 1, 8);
+			return std::ranges::all_of(id, [](char c) { return std::isxdigit(static_cast<unsigned char>(c)); }) ?
+			           std::string(id) :
+			           std::string{};
 		}
 	}
 
@@ -441,8 +798,16 @@ namespace events
 		case SKSE::MessagingInterface::kDataLoaded:
 			Register();
 			break;
-		case SKSE::MessagingInterface::kPostLoadGame:
+		case SKSE::MessagingInterface::kPreLoadGame:
+			saveCharacter = a_msg->data ?
+			                    CharacterFromSave({ static_cast<const char*>(a_msg->data), a_msg->dataLen }) :
+			                    std::string{};
+			break;
 		case SKSE::MessagingInterface::kNewGame:
+			saveCharacter.clear();  // новый персонаж: ID появится в поле игры
+			OnGameLoaded();
+			break;
+		case SKSE::MessagingInterface::kPostLoadGame:
 			OnGameLoaded();
 			break;
 		default:
