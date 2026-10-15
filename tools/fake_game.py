@@ -85,6 +85,21 @@ SCENARIOS: dict[str, tuple[str, list[dict]]] = {
                                       "category": 7, "subtype": 94, "to_player": True}},
         {"type": "dialogue_menu", "data": {"open": False}},
     ]),
+    # Гибель и загрузка: Гослинг должен сказать прямо, что Владос погиб, — и посоветовать, что сделать иначе.
+    "death": ("Западная башня: Мирмулнир убил Владоса, загрузка сейва в Вайтране", [
+        {"type": "status", "data": {
+            "location": "Западная сторожевая башня", "hold": "Вайтран", "cell": "", "interior": False,
+            "health": 0.6, "in_combat": True, "nearby": [{"name": "Стражник Вайтрана", "hostile": False}],
+            "threats": [{"name": "Мирмулнир", "race": "dragon race", "hostile": True, "distance": 60}]}},
+        {"type": "combat_started", "data": {"enemies": ["Мирмулнир"], "races": {"Мирмулнир": "dragon race"}}},
+        {"type": "actor_killed", "data": {"name": "Стражник Вайтрана", "by_player": False}},
+        {"type": "status", "data": {"health": 0.12}},
+        {"type": "player_died", "data": {"killer": "Мирмулнир", "race": "dragon race", "unique": True}},
+        {"type": "game_loaded"},
+        {"type": "status", "data": {
+            "location": "Вайтран", "hold": "Вайтран", "cell": "", "interior": False, "health": 1.0,
+            "in_combat": False, "nearby": []}},
+    ]),
 }
 
 

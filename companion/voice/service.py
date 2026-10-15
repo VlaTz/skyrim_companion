@@ -65,6 +65,7 @@ class VoiceService:
         # звук в колонках, ещё не сказанный ответ модели). Снимается, когда начинается ход игрока.
         self._player_speaking = threading.Event()
         self.last_activity = time.time()     # когда последний раз кто-то говорил
+        self.last_joke_at = 0.0              # когда Гослинг последний раз пошутил (мозгу: brain.quip_gap)
         self.recorder: PushToTalkRecorder | None = None
 
     # ------------------------------------------------------------ API
@@ -162,9 +163,11 @@ class VoiceService:
                 trace.event("Не сказано: пока думал, заговорил игрок")
                 return False
             self.on_event({"type": "companion_reply", "text": reply.text, "emotion": reply.emotion,
-                           "initiative": True, "remember": reply.remember})
+                           "initiative": True, "remember": reply.remember, "joke": reply.joke})
             self.speak(reply.text, reply.emotion)
             self.last_activity = time.time()  # только если сказал: промолчал — тишина продолжается
+            if reply.joke or reply.quip:
+                self.last_joke_at = self.last_activity
             return True
         except Exception:
             log.exception("Ошибка реплики по своей инициативе")

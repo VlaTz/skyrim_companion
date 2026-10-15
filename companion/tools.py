@@ -12,6 +12,7 @@ from typing import Callable
 
 from companion.game.places import PlaceBook
 from companion.game.state import GameState
+from companion.knowledge import Knowledge
 
 
 @dataclass
@@ -37,7 +38,7 @@ def place_info(places: PlaceBook, name: str) -> str:
     return f"Места «{name}» не знаю."
 
 
-def build_tools(game: GameState, places: PlaceBook | None = None) -> list[Tool]:
+def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Knowledge | None = None) -> list[Tool]:
     tools = [
         Tool(
             name="find_places",
@@ -107,5 +108,22 @@ def build_tools(game: GameState, places: PlaceBook | None = None) -> list[Tool]:
                 "required": ["name"],
             },
             handler=lambda name="": place_info(places, name),
+        ))
+    if knowledge:
+        tools.append(Tool(
+            name="world_info",
+            description=(
+                "Что ты знаешь о Скайриме как местный — верные знания о мире, а не догадки: кто такой человек (где "
+                "живёт, кем работает), что за место, боги и даэдра, народы, история, война, фракции, существа, "
+                "а ещё что написано в книгах и записках, которые вы прочитали (Владос или ты сам). "
+                "Вызывай, когда спрашивают о людях, местах или мире, а этого нет в «Сейчас в игре», — и отвечай по "
+                "справке, своими словами. Чего в справке нет — того ты не знаешь: так и скажи, не выдумывай."),
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": (
+                    "О чём вспомнить: имя, место или тема — «Лукан», «Седобородые», «двемеры», «Талмор».")}},
+                "required": ["query"],
+            },
+            handler=lambda query="": knowledge.answer(query),
         ))
     return tools

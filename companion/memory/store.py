@@ -289,6 +289,18 @@ class MemoryStore:
                           "WHERE archived = 0 AND category = ? AND key = ? ORDER BY id DESC",
                           (category, key.lower()))
 
+    def deaths(self) -> list[str]:
+        """Гибели Владоса в этой ветке сейва — тексты событий «Владос погиб (его убил …)» (события died пишутся уже
+        после загрузки, поэтому переживают архив «будущего»)."""
+        return [text for (text,) in self._rows(
+            "SELECT text FROM journal WHERE archived = 0 AND kind = 'event' AND text LIKE 'Владос погиб (%'")]
+
+    def last_by_key(self, category: str) -> dict[str, tuple[float, float | None]]:
+        """Последняя встреча каждого ключа категории: key -> (real_time, игровая дата). Для шуток: что когда сказано."""
+        return {key: (real, days) for key, real, days in self._rows(
+            "SELECT key, MAX(real_time), game_days FROM encounters WHERE archived = 0 AND category = ? GROUP BY key",
+            (category,))}
+
     def add_encounter(self, category: str, key: str, where: Where) -> None:
         self._write("INSERT INTO encounters (real_time, game_days, category, key, place) VALUES (?, ?, ?, ?, ?)",
                     (time.time(), where.game_days, category, key.lower(), where.place or None))

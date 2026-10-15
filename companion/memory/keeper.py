@@ -22,6 +22,7 @@ import logging
 import time
 from typing import Callable
 
+from companion.game.books import book_key
 from companion.game.places import PlaceBook
 from companion.game.state import HEARD_SECONDS, Change, GameEvent, GameState, Heard
 from companion.memory.store import MemoryStore, Where, memory_key
@@ -56,6 +57,7 @@ class MemoryKeeper:
         # Сколько раз память открывали заново (другой персонаж, загружен сейв постарше): что надумали раньше
         # (мыслитель) — уже про другое прошлое.
         self.opened = 0
+        self.knowledge = None  # companion.knowledge.Knowledge — прочитанные книги в поиск (ставит сервер)
 
     @property
     def area(self) -> str | None:
@@ -84,10 +86,18 @@ class MemoryKeeper:
                     self.opened += 1
                     self._restore_heard()
                     self._restore_stats()
+                    self._restore_read()
                     self.on_open()
         where = self.where()
         for change in changes:
             self.store.record("heard" if change.kind == "overheard" else "event", change.text, where)
+        # Прочитанное: Владос открыл книгу — «читал Владос»; отдал книгу Гослингу — тот прочитал сам.
+        if event.type == "book_read":
+            self._read(book_key(str(data.get("file", "")), int(data.get("form", 0))), "владос")
+        elif event.type == "gosling_items":
+            for item in data.get("given") or []:
+                if item.get("book"):
+                    self._read(book_key(str(item.get("file", "")), int(item.get("form", 0))), "гослинг")
         if event.type == "stat":  # статистика игры — в память персонажа, чтобы привычки пережили перезапуск
             self.store.set_meta("stats", json.dumps(self.game.profile.stats, ensure_ascii=False))
         if event.type == "status":
@@ -132,6 +142,21 @@ class MemoryKeeper:
             stats = {}
         for name, value in stats.items():
             self.game.profile.stat(name, value)
+
+    def _read(self, key: str, who: str) -> None:
+        """Книгу прочитали (who — владос | гослинг): в память персонажа и в поиск знаний."""
+        if self.store.is_open:
+            self.store.add_encounter(f"книга:{who}", key, self.where())
+        if self.knowledge:
+            self.knowledge.add_read(key, who)
+
+    def _restore_read(self) -> None:
+        """Память открыли заново (сейв постарше, другой персонаж): в поиске — книги, прочитанные в этой ветке."""
+        if not self.knowledge:
+            return
+        read = {key: "владос" for key in self.store.last_by_key("книга:владос")}
+        read |= {key: "гослинг" for key in self.store.last_by_key("книга:гослинг")}  # сам читал — главнее
+        self.knowledge.set_read(read)
 
     def _restore_heard(self) -> None:
         """Подслушанное за последние минуты — обратно в «Ты слышал рядом» (сервис мог быть перезапущен)."""

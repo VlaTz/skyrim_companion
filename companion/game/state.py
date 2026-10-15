@@ -40,6 +40,12 @@
     unlocked        — {"name", "door"}: замок рядом с игроком открылся без взлома — ключом
     npc_flees       — {"name"}: собеседник бежит прочь от игрока
     shout           — {"name"}: игрок применил Крик
+    book_read       — {"name", "file", "form"}: Владос открыл книгу (из сумки или с полки) — Гослинг знает её
+                      («читал Владос», companion/knowledge.py); повод мозгу reading
+    gosling_items   — {"given": [{"name", "count", "book", "file", "form"}], "taken": [...]}: Владос отдал Гослингу
+                      или забрал у него; отданную книгу Гослинг читает сам; повод мозгу gift (важный)
+    player_died     — {"killer", "race", "unique"}: Владос погиб (killer "" — упал, утонул, ловушка). Гослинг
+                      говорит об этом после загрузки сейва: событие died вместо loaded
 
 Встречи (раса врага, Крик) — через meet (память, companion/memory/keeper.py): впервые — событие novel
 (срочное), потом — пометка «уже встречали N раз, последний — там-то».
@@ -78,6 +84,7 @@ from typing import Any, Callable
 from pydantic import BaseModel
 
 from companion.config import MapConfig
+from companion.game.books import BookLibrary
 from companion.game.dialogue import DialogueTexts
 from companion.game.profile import PlayerProfile
 from companion.game.geo import Marker, describe_surroundings, find_places
@@ -99,6 +106,9 @@ FIGHT_TAIL = 10        # смерть врага приходит и после 
 JUST_NOW = 45          # секунд — «только что»
 QUEST_CONTEXT = 3      # заданий с текущими целями — в «Сейчас в игре»
 QUEST_FRESH = 1800     # задание, менявшееся за полчаса, — первым в «Сейчас в игре»
+DEATH_BEFORE = 300     # секунд «Недавно» перед гибелью — что пошло не так (бой, ранение)
+DEATH_LINES = 4        # строк из них — не больше
+BOOK_EXCERPT = 600     # знаков начала отданной книги — мозгу, чтобы было о чём сказать
 
 # Игровая статистика -> событие для «Недавно» и мозга: (вид, текст, важное). Событие статистики игра шлёт,
 # когда счётчик растёт, — то есть ровно в момент поступка.
@@ -134,7 +144,8 @@ MOMENT_MEETS = {"Dragon Souls Collected": [("раса", "dragon"), ("раса", 
 @dataclass(frozen=True)
 class Change:
     """Что изменилось в игре. kind — для мозга, text — для промпта и журнала."""
-    kind: str  # loaded, location, interior, low_health, combat_started, combat_ended, killed, item, overheard,
+    kind: str  # loaded, died (загрузка после гибели — вместо loaded), player_died (погиб, ещё до загрузки),
+    #            location, interior, low_health, combat_started, combat_ended, killed, item, overheard,
     #            profile (вступил в гильдию, завершил квест, розыск...), quest, quest_misc (задания журнала),
     #            person (знакомый NPC напал или убит), power (слово силы, душа дракона), cleared, crime, talk,
     #            deed (статистика игры), other
@@ -253,7 +264,8 @@ class GameState:
     """Последнее известное состояние игры + недавние события. Потокобезопасно."""
 
     def __init__(self, map_cfg: MapConfig | None = None, interface_bsa: Path | None = None, recent: int = 100,
-                 dialogue: DialogueTexts | None = None, profile: PlayerProfile | None = None):
+                 dialogue: DialogueTexts | None = None, profile: PlayerProfile | None = None,
+                 books: BookLibrary | None = None):
         self._lock = threading.Lock()
         self.map_cfg = map_cfg or MapConfig()
         self.quest_log = QuestLog(interface_bsa or Path("Skyrim - Interface.bsa"))
@@ -267,6 +279,7 @@ class GameState:
         self.player: dict = {}  # подробности об игроке (событие player)
         self.on_say_result: Callable[[dict], None] = lambda data: None  # голос из NPC ждёт подтверждения
         self.dialogue = dialogue  # тексты реплик игры; None — реплики NPC не слышим
+        self.books = books  # тексты книг игры: отданную книгу Гослинг читает — мозгу её начало
         self.heard: deque[Heard] = deque(maxlen=12)
         self.in_dialogue = False  # игрок в меню разговора с NPC
         self.profile = profile or PlayerProfile()  # кто игрок по данным игры: гильдии, розыск, квесты, привычки
@@ -274,6 +287,11 @@ class GameState:
         # Встреча (категория, ключ) -> (сколько раз встречали раньше, где и когда последний раз) | None (не считаем).
         # Ставит память (MemoryKeeper.meet); без неё встреч не помним.
         self.meet: Callable[[str, str], tuple[int, str] | None] = lambda category, key: None
+        # Гибель Владоса: до загрузки он мёртв (Гослинг молчит), после — повод died. Живёт вне «Недавно» и вне
+        # памяти по сейву: загрузка сейва постарше стёрла бы её. Сколько раз погибал от кого — за этот запуск.
+        self.dead = False
+        self._death: str | None = None
+        self._deaths: Counter[str] = Counter()
 
     def apply(self, event: GameEvent) -> list[Change]:
         """Учитывает событие; возвращает, что изменилось."""
@@ -307,11 +325,18 @@ class GameState:
                            if not ((m := re.search(r"завершил квест «(.+)»", text)) and f"задание: {m[1]}" in closed)]
             elif event.type == "stat":
                 changes = self._apply_stat(str(event.data.get("name", "")), int(event.data.get("value", 0)))
+            elif event.type == "player_died":
+                changes = self._apply_death(event.data)
             else:
                 if event.type == "game_loaded":
                     self.profile.reset()  # следующий профиль — точка отсчёта (сейв мог быть постарше)
                     self.quest_log.reset()  # и журнал заданий тоже
-                    self.status = Status()  # после загрузки сейва всё узнаём заново
+                    self.status = Status()  # после загрузки сейва всё узнаём заново (и собеседника, и угрозы)
+                    # «Недавно» и подслушанное — из другого прошлого: умер в бою с драконом, загрузил сейв до боя —
+                    # «погибли: Мирмулнир» остаться не должно. Подслушанное до сейва вернёт память (MemoryKeeper).
+                    self.recent.clear()
+                    self.heard.clear()
+                    self.dead = False
                     self.last_place = None
                     self._left = None
                     self.in_dialogue = False
@@ -332,6 +357,28 @@ class GameState:
         for meet in MOMENT_MEETS.get(name, []):
             self.meet(*meet)
         return [Change(kind, text, subject=f"{text} {value}", important=important)]
+
+    def _apply_death(self, d: dict) -> list[Change]:
+        """Владос погиб. Сейчас — только в «Недавно» (Гослинг молчит, пока он мёртв); что пошло не так —
+        запоминаем до загрузки: там «Недавно» очистится, а Гослинг скажет об этом прямо (событие died)."""
+        killer = Nearby(name=str(d["killer"]), race=str(d.get("race") or "")).title if d.get("killer") else ""
+        s = self.status
+        place = ", ".join(dict.fromkeys(x for x in (s.location, s.cell) if x))
+        before = [r for r in self._recent(since=self.updated - DEATH_BEFORE)
+                  if not r.startswith("Владос погиб")][-DEATH_LINES:]  # прошлая гибель — не «перед этим»
+        self._deaths[killer] += 1
+        times = self._deaths[killer]
+        how = (f"его убил {killer}" if killer else "без убийцы — упал, утонул или ловушка") + (
+            f", {place}" if place else "") + (
+            f"; {'от него' if killer else 'так'} гибнет уже {times}-й раз за вечер" if times > 1
+            else "; за вечер — впервые")
+        self.dead = True
+        self._death = (f"Владос погиб ({how})" + (f". Перед этим: {'; '.join(before)}" if before else "")
+                       + ". Он уже вернулся к последнему сохранению — вы снова там, где были тогда, а что было после, "
+                         "ещё не случилось. Ты это помнишь и знаешь, что он погиб: скажи прямо, с шуткой, что пошло "
+                         "не так и что в этот раз сделать иначе")
+        log.info("Игрок погиб: %s", how)
+        return [Change("player_died", f"Владос погиб ({how})", subject="Владос погиб", important=True)]
 
     def _known(self, name: str, unique: bool | None = None) -> bool:
         """Знакомый человек, а не «Драугр»: собеседник игрока, единственный в игре, говорил рядом,
@@ -451,6 +498,9 @@ class GameState:
         d = event.data
         match event.type:
             case "game_loaded":
+                if death := self._death:  # загрузился после гибели — это не «перерыв»
+                    self._death = None
+                    return [Change("died", death, subject="гибель Владоса", important=True)]
                 return [Change("loaded", "игрок вернулся после перерыва")]  # загрузка сейва; без слова «игра»
             case "combat_started":
                 races = d.get("races") or {}
@@ -487,10 +537,40 @@ class GameState:
                         else f" — этот Крик ты видел уже {seen[0]} раз")
                 return [Change("power", f"игрок применил Крик: {name}{note}", subject=f"крик: {name}",
                                important=True)]
+            case "book_read":
+                name = str(d.get("name") or "?")
+                return [Change("reading", f"Владос читает книгу «{name}» — ты её теперь тоже знаешь (читал через "
+                                          "плечо)", subject=f"книга: {name}")]
+            case "gosling_items":
+                return self._exchange(d)
             case "item_picked":
                 count = d.get("count", 1)
                 return [Change("item", f"игрок подобрал: {d.get('name', '?')}" + (f" ×{count}" if count > 1 else ""))]
         return [Change("other", f"{event.type}: {d}" if d else event.type)]
+
+    def _exchange(self, d: dict) -> list[Change]:
+        """Владос отдал Гослингу вещи или забрал. Отданную книгу Гослинг прочитал — мозгу её начало, чтобы было
+        о чём сказать (о прочитанном спросят — справка world_info)."""
+        def items(rows: list) -> str:
+            return ", ".join(f"{r.get('name')}" + (f" ×{r['count']}" if r.get("count", 1) > 1 else "") for r in rows)
+
+        given = [r for r in d.get("given") or [] if r.get("name")]
+        taken = [r for r in d.get("taken") or [] if r.get("name")]
+        parts = []
+        if given:
+            parts.append(f"Владос отдал тебе: {items(given)}")
+        if taken:
+            parts.append(f"Владос забрал у тебя: {items(taken)}")
+        if not parts:
+            return []
+        text = "; ".join(parts)
+        book = next((self.books.get(str(r.get("file", "")), int(r.get("form", 0)))
+                     for r in given if r.get("book") and self.books), None)
+        if book:
+            start = book.text[:BOOK_EXCERPT].rsplit(" ", 1)[0]
+            text += (f". Книгу «{book.title}» ты сразу прочитал — вот её начало: «{start}…». Можешь сказать, "
+                     "что думаешь о ней")
+        return [Change("gift", text, subject=text[:80], important=True)]
 
     def find_places(self, kind: str = "", name: str = "", max_km: float = 0, limit: int = 6) -> str:
         """Инструмент агента: места на карте игрока. В помещении — от точки, где вышли с улицы."""

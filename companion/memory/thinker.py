@@ -3,8 +3,9 @@
 Свои реплики Гослинг говорит без справок (быстро) и видит только «Сейчас в игре» — сам не догадается, что у
 Владоса полная сумка железа, а Белетор за углом. Мыслитель смотрит шире: обстановка с карточкой места, сумка
 целиком, задания, память (цели, договорённости, что знает о Владосе), последние реплики и прежние мысли — и
-возвращает 0–3 мысли. Они хранятся в памяти (goals, kind idea — по сейву, как всё) и видны модели в «Сейчас в игре»;
-новая мысль — повод мозгу: модель сама оценит, высказать ли её сейчас.
+возвращает 0–3 мысли. Они хранятся в памяти (goals, kind idea — по сейву, как всё) и видны модели в «Сейчас в игре».
+Когда сказать, решает сам мыслитель (when): now — новая мысль сразу идёт мозгу, и тот говорит её без переоценки;
+later — при случае: мозг высказывает её на долгую тишину (unsaid/said); never — заметка для себя.
 
 Думает, когда что-то поменялось: другое поселение, задания (цели), сумка (на SUM_CHANGE вещей) — не чаще
 thinker.min_gap; без перемен — раз в thinker.quiet_every, пока игра идёт. Настройки — секция thinker
@@ -34,11 +35,15 @@ SYSTEM = """Ты — внутренний голос Гослинга, спут�
 Каждая мысль — одна короткая фраза: что и почему именно сейчас (с именами и местами из данных). Только то, что
 следует из данных, — ничего не выдумывай о мире. Не повторяй то, что Гослинг уже предлагал в последних репликах,
 и не предлагай того, от чего Владос отказался или что ему не нравится. Мысль из прежних ещё к месту — оставь её.
+Текущую цель задания («Айрилет ждёт у башни») не пересказывай — Владос и так видит её в журнале; про задание —
+только то, чего в цели нет: где это, по пути ли, что взять с собой.
 Ничего толкового — пустой список.
 Отвечай строго одним JSON-объектом без пояснений и markdown:
-{"thoughts": [{"text": "...", "new": true, "say": true}, ...]} — от 0 до 3 мыслей; new — true, если этой мысли
-не было среди прежних (прежняя другими словами или с уточнением — false); say — true, если её стоит при случае
-сказать Владосу вслух, false — заметка для себя (что учесть, о чём пока молчать)."""
+{"thoughts": [{"text": "...", "new": true, "when": "now"}, ...]} — от 0 до 3 мыслей; new — true, если этой мысли
+не было среди прежних (прежняя другими словами или с уточнением — false); when — когда сказать её Владосу вслух:
+"now" — сейчас, потом будет поздно или не к месту (лавка прямо тут, а сумка полна; по пути к цели — то, что
+нельзя пропустить); "later" — при случае, когда долго идёте молча; "never" — заметка для себя (что учесть,
+о чём пока молчать) и то, что Гослинг уже сказал вслух."""
 
 
 class Thinker:
@@ -54,6 +59,21 @@ class Thinker:
         self._seen: tuple | None = None  # (поселение, цели заданий, сумка) при прошлом раздумье
         self._epoch = -1  # keeper.opened при прошлом раздумье: память открыли заново — думать заново
         self._busy = threading.Lock()
+        # Мысли последнего раздумья, которые стоит сказать вслух (when now/later), и где надуманы; что уже сказано.
+        self._speak: list[str] = []
+        self._speak_at: tuple[int, str | None] = (-1, None)  # (keeper.opened, keeper.area)
+        self._said: set[str] = set()
+
+    def unsaid(self) -> str | None:
+        """Мысль, которую Гослинг ещё не сказал вслух, — мозгу на долгую тишину. Только надуманная здесь же и в этой
+        ветке сейва: «Адрианна совсем рядом» после ухода из Вайтрана не к месту."""
+        if self._speak_at != (self.keeper.opened, self.keeper.area):
+            return None
+        return next((t for t in self._speak if t not in self._said), None)
+
+    def said(self, text: str) -> None:
+        """Мозг высказал мысль — больше её не предлагать (и мыслителю показать: «уже сказал вслух»)."""
+        self._said.add(text)
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="thinker").start()
@@ -98,7 +118,7 @@ class Thinker:
         try:
             state = self._state()
             if self.keeper.opened != self._epoch:  # загрузили сейв (или другой персонаж) — всё с начала
-                self._seen, self._last_run = None, 0.0
+                self._seen, self._last_run, self._said = None, 0.0, set()
             why = self._why(state) or ("давно не думал" if now - self._last_run >= self.cfg.quiet_every else "")
             if not force and (not why or now - self._last_run < self.cfg.min_gap):
                 return False
@@ -120,7 +140,8 @@ class Thinker:
                 + "\n\nВсе задания из журнала:\n" + self.game.quest_log.summary()
                 + "\n\nПамять Гослинга:\n" + (self.keeper.memory_context() or "пока ничего")
                 + "\n\nПоследние реплики:\n" + ("\n".join(dialogue) or "пока не разговаривали")
-                + "\n\nПрежние мысли:\n" + ("\n".join(f"- {i}" for i in old) or "нет"))
+                + "\n\nПрежние мысли:\n" + ("\n".join(f"- {i}" + (" (уже сказал вслух)" if i in self._said else "")
+                                                      for i in old) or "нет"))
         epoch, area = self.keeper.opened, self.keeper.area
         result = self.complete(SYSTEM, user, title=f"Мыслитель: {why}")
         if self.keeper.area != area:
@@ -138,13 +159,22 @@ class Thinker:
             return False
         thoughts = [t if isinstance(t, dict) else {"text": t} for t in result["thoughts"]]
         thoughts = [t for t in thoughts if str(t.get("text", "")).strip()][:self.cfg.max_ideas]
-        ideas = [str(t["text"]).strip() for t in thoughts]
+        for t in thoughts:
+            t["text"] = str(t["text"]).strip()
+            # Прежний формат (say) и мусор: say false — заметка для себя, непонятное «когда» — при случае.
+            t["when"] = "never" if t.get("say") is False else str(t.get("when") or "later")
+            if t["when"] not in ("now", "later", "never"):
+                t["when"] = "later"
+        ideas = [t["text"] for t in thoughts]
         self.store.replace_ideas(ideas, self.keeper.where(), area or "")
-        # Мозгу — только новые и те, что стоит сказать вслух: прежняя мысль другими словами или заметка для себя
-        # («про продажу пока не напоминать») — не повод заговорить.
-        new = [str(t["text"]).strip() for t in thoughts
-               if t.get("new") is not False and t.get("say") is not False and str(t["text"]).strip() not in old]
-        log.info("Мыслитель (%s): %s", why, "; ".join(ideas) or "ничего")
-        if new:
-            self.on_thought([Change("thought", f"тебе пришла мысль: {i}", subject=f"мысль: {i}") for i in new])
+        self._speak = [t["text"] for t in thoughts if t["when"] != "never"]
+        self._speak_at = (epoch, area)
+        log.info("Мыслитель (%s): %s", why, "; ".join(f"{t['text']} [{t['when']}]" for t in thoughts) or "ничего")
+        # Мозгу сразу — только новые и срочные; «при случае» он возьмёт сам на тишину (unsaid). Прежняя мысль
+        # другими словами или заметка для себя («про продажу пока не напоминать») — не повод заговорить.
+        now = [t["text"] for t in thoughts
+               if t["when"] == "now" and t.get("new") is not False and t["text"] not in old]
+        if now:
+            self.on_thought([Change("thought", f"тебе пришла мысль: {i}", subject=f"мысль: {i}", important=True)
+                             for i in now])
         return True

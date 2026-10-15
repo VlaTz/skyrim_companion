@@ -28,10 +28,13 @@ from pydantic import BaseModel, ValidationError
 from companion.brain import Brain
 from companion.config import Config
 from companion.emotions import EMOTIONS
+from companion.game.books import BookLibrary
 from companion.game.dialogue import DialogueTexts
 from companion.game.places import PlaceBook
 from companion.game.profile import PlayerProfile
 from companion.game.state import GameEvent, GameState
+from companion.jokes import JokeBook, Jokes, JokeWriter
+from companion.knowledge import Knowledge
 from companion.memory.diarist import Diarist
 from companion.memory.keeper import MemoryKeeper
 from companion.memory.thinker import Thinker
@@ -111,11 +114,14 @@ class CommandQueue:
 
 def create_app(cfg: Config) -> FastAPI:
     hub = EventHub()
+    books = BookLibrary(cfg.game.data_dir)  # тексты книг игры: прочитанное Владосом и Гослингом
     game = GameState(cfg.map, cfg.game.interface_bsa, dialogue=DialogueTexts(cfg.game.data_dir),
-                     profile=PlayerProfile(cfg.game.data_dir))
+                     profile=PlayerProfile(cfg.game.data_dir), books=books)
     commands = CommandQueue()
     places = PlaceBook(cfg.game.data_dir)
+    knowledge = Knowledge(cfg.game.data_dir, places, books)  # что Гослинг знает о мире — из файлов игры
     memory = MemoryKeeper(MemoryStore(cfg.memory_path), game, places)
+    memory.knowledge = knowledge
     game.meet = memory.meet  # встречи (раса врага, Крик) — «впервые» или «уже встречали»
     npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
                          lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
@@ -125,6 +131,8 @@ def create_app(cfg: Config) -> FastAPI:
         """События голосового сервиса — в журнал WebSocket и в память (реплики игрока и Гослинга)."""
         hub.publish(event)
         memory.on_voice_event(event)
+        if event.get("joke") and "brain" in state and state["brain"].jokes:  # обыграл заготовку — помним, что сказано
+            state["brain"].jokes.said(str(event["joke"]))
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -136,7 +144,8 @@ def create_app(cfg: Config) -> FastAPI:
         service.start_push_to_talk()
         state["voice"] = service
         if service.llm:
-            service.llm.set_tools(build_tools(game, places))
+            service.llm.set_tools(build_tools(game, places, knowledge))
+            asyncio.get_running_loop().run_in_executor(None, knowledge.search, "Скайрим")  # собрать заранее, ~1 с
             llm = service.llm
             llm.events_since = game.events_since
             memory.on_open = lambda: llm.restore(memory.store.last_dialogue(cfg.llm.history_turns))
@@ -146,11 +155,18 @@ def create_app(cfg: Config) -> FastAPI:
             diarist.start()
         if cfg.brain.enabled and service.llm:
             state["brain"] = Brain(cfg.brain, service, game)
+            if cfg.jokes.enabled and (jokes_file := cfg.character_path / "jokes.yaml").is_file():  # шутки к месту
+                book = JokeBook(jokes_file, cfg.character_path / "jokes_auto.yaml")
+                writer = JokeWriter(book, service.llm.complete_json, cfg.jokes.model) if cfg.jokes.refill else None
+                state["brain"].jokes = Jokes(book, game, places, memory, writer, cfg.jokes)
             state["brain"].start()
         if cfg.thinker.enabled and service.llm:  # мысли Гослинга: что держать в голове и предложить
-            Thinker(memory, game, service.llm.complete_json,
-                    on_thought=state["brain"].notify if "brain" in state else lambda changes: None,
-                    cfg=cfg.thinker).start()
+            thinker = Thinker(memory, game, service.llm.complete_json,
+                              on_thought=state["brain"].notify if "brain" in state else lambda changes: None,
+                              cfg=cfg.thinker)
+            if "brain" in state:  # мысли «при случае» — мозгу на долгую тишину
+                state["brain"].unsaid_thought, state["brain"].thought_said = thinker.unsaid, thinker.said
+            thinker.start()
         log.info("Сервис готов: http://%s:%d", cfg.server.host, cfg.server.port)
         yield
         if "brain" in state:

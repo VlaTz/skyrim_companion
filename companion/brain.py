@@ -17,6 +17,7 @@ import logging
 import queue
 import threading
 import time
+from typing import Callable
 
 from companion import trace
 from companion.config import BrainConfig
@@ -28,20 +29,21 @@ log = logging.getLogger(__name__)
 # Шкала — общая для событий, подслушанного и тишины; examples — что для этого повода значит «важно вам».
 SCALE = ("Оцени, стоит ли это твоей реплики прямо сейчас, — поле interest от 0 до 10 в том же JSON:\n"
          "{bands}"
-         "9–10 — нельзя промолчать: впервые увиденное, тяжёлое ранение Владоса, внезапная беда, которую он может "
-         "не заметить; обычный бой — не 9–10.\n"
+         "9–10 — нельзя промолчать: впервые увиденное, тяжёлое ранение или гибель Владоса, внезапная беда, которую "
+         "он может не заметить; обычный бой — не 9–10.\n"
          "Оценивай сам этот повод, а не обстановку в целом. {recency} Если ты только что говорил (меньше минуты "
          "назад) или идёт бой — ставь не выше 6, кроме 9–10: подряд болтать незачем, в бою — не до разговоров.\n"
          "В text — что бы ты сказал: 1–2 коротких предложения от себя, всего не больше 25 слов. А если ставишь "
          "ниже {threshold} — всё равно напиши в text, но не серьёзную реплику, а шутку или подколку к месту одной "
          "фразой, не больше 10 слов (скажешь её не всегда). "
-         'Формат: {{"interest": 0..10, "emotion": "...", "text": "..."}} — interest обязателен.')
+         'Формат: {{"interest": 0..10, "emotion": "...", "text": "..."{joke}}} — interest обязателен.')
+JOKE_FIELD = ', "joke": "<id заготовки или строки истории, если обыграл её>"'
 EVENT_BANDS = ("0–2 — обыденное: вошли в помещение, открыл сундук, подобрал мелочь, очередной бой с обычными "
                "врагами;\n"
                "3–4 — можно бы, но незачем;\n"
                "5–6 — есть что сказать к месту, но можно и промолчать;\n"
                "7–8 — важно или интересно вам: новое задание или цель, знакомый человек, новое место, находка, "
-               "враг вдали, поступок Владоса, о котором есть что сказать, мысль, которую стоит сказать сейчас;\n")
+               "враг вдали, поступок Владоса, о котором есть что сказать;\n")
 OVERHEARD_BANDS = ("0–2 — фон: работа, хозяйство, торг, приветствия, обычная болтовня горожан;\n"
                    "3–4 — любопытно, но не про вас;\n"
                    "5–6 — есть что сказать, но можно и промолчать: чья-то беда или ссора, спор о войне, "
@@ -57,11 +59,18 @@ OVERHEARD_PROMPT = ("Рядом только что говорили (ты сл�
                     "Оценивай именно эти реплики, а не обстановку в целом; не пересказывай услышанное — "
                     "игрок слышал то же самое.\n")
 IDLE_PROMPT = "Вы уже давно идёте молча ({silence}). Можешь заговорить сам.\n"
+# Мысль (companion/memory/thinker.py): говорить ли и когда, решил мыслитель — шкалы нет, модель только говорит.
+THOUGHT_PROMPT = ("Тебе пришла мысль, которую стоит сказать Владосу {when}: {thought}\n"
+                  "Скажи её своими словами, от себя и к месту: 1–2 коротких предложения, всего не больше 25 слов.")
+THOUGHT_NOW = "сейчас"
+THOUGHT_IDLE = "— самое время, раз вы давно идёте молча ({silence})"
 HEARD_MAX_AGE = 30    # подслушанное старше минуты (Гослинг всё это время был занят) — не комментируем
 DIALOGUE_STALE = 60  # меню разговора «открыто», а реплик нет 2 минуты — видимо, пропустили его закрытие
 GAME_STALE = 20       # секунд без событий из игры — игра не запущена или висит на загрузке
 # Срочное — держится до brain.fresh_important, даже если не помечено важным: тяжело ранен, Крик, впервые увиденное.
-URGENT = {"low_health", "power", "novel"}
+URGENT = {"low_health", "power", "novel", "died"}
+THOUGHT = "мысль: "  # Change.subject мысли — «мысль: <текст>»
+LOADED = {"loaded", "died"}  # загрузка сейва (died — после гибели Владоса): всё, что было до неё, — другое прошлое
 TICK = 0.25           # с — как часто мозг смотрит, не пора ли (раньше 1 с — до секунды лишней задержки)
 
 
@@ -79,6 +88,10 @@ class Brain:
         self._heard: list[Change] = []           # подслушанное с прошлого решения
         self._heard_at = 0.0                     # когда пришла последняя реплика NPC
         self._heard_lock = threading.Lock()
+        # Мысли «при случае» — от мыслителя (Thinker.unsaid / Thinker.said): высказать на долгую тишину.
+        self.unsaid_thought: Callable[[], str | None] = lambda: None
+        self.thought_said: Callable[[str], None] = lambda text: None
+        self.jokes = None  # companion.jokes.Jokes — заготовки шуток к обстановке (нет базы — без них)
 
     def start(self) -> None:
         self._thread.start()
@@ -90,6 +103,11 @@ class Brain:
 
     def notify(self, changes: list[Change]) -> None:
         """Вызывается из обработчика /game/event."""
+        if any(c.kind in LOADED for c in changes):
+            # Загрузили сейв: подслушанное и «об этом уже думал» — из другого прошлого.
+            with self._heard_lock:
+                self._heard = []
+            self._commented = {}
         for change in changes:
             if change.kind == "overheard":
                 with self._heard_lock:
@@ -128,12 +146,12 @@ class Brain:
             self._maybe_overheard(now)
 
     def _free(self, now: float) -> bool:
-        """Можно спросить модель: Гослинг не говорит и не отвечает, и с прошлого вопроса прошло ask_gap."""
-        return not self.voice.busy() and now - self.last_ask >= self.cfg.ask_gap
+        """Можно спросить модель: Владос жив, Гослинг не говорит и не отвечает, и с прошлого вопроса прошло ask_gap."""
+        return not self.game.dead and not self.voice.busy() and now - self.last_ask >= self.cfg.ask_gap
 
     def _on_changes(self, changes: list[Change], now: float) -> bool:
         """False — Гослинг занят, события стоит придержать."""
-        loaded = max((i for i, c in enumerate(changes) if c.kind == "loaded"), default=0)
+        loaded = max((i for i, c in enumerate(changes) if c.kind in LOADED), default=0)
         if loaded:  # загрузили сейв: что копилось до этого (и мысли), уже про другое прошлое
             del changes[:loaded]
         shown = [c for c in changes if c.kind in self.cfg.events]
@@ -143,13 +161,29 @@ class Brain:
             if shown:
                 self._silent(shown, "об этом уже думал недавно")
             return True
+        thoughts = [c for c in fresh if c.subject.startswith(THOUGHT)]
+        if thoughts and self.game.in_combat:  # в бою не до мыслей — подождут тишины (Thinker.unsaid)
+            self._silent(thoughts, "идёт бой — мысль подождёт тишины")
+            fresh, thoughts = [c for c in fresh if c not in thoughts], []
+            if not fresh:
+                return True
         if not self._free(now):
             return False
         for c in fresh:
             self._commented[c.subject or c.text] = now
-        what = "; ".join(c.text for c in fresh)
+        events = [c for c in fresh if c not in thoughts]
+        what = "; ".join(c.text for c in events)
+        if thoughts:
+            # Мысль «сейчас»: решил мыслитель — не переоцениваем (шкала ставила своей же мысли 3–4). Одна за раз,
+            # остальные — на тишину.
+            thought = thoughts[0].subject.removeprefix(THOUGHT)
+            log.info("Мозг: мысль -> %s", thought)
+            if self._ask((EVENT_PROMPT.format(what=what) if events else "Игрок ничего не говорил.\n")
+                         + THOUGHT_PROMPT.format(when=THOUGHT_NOW, thought=thought), now):
+                self.thought_said(thought)
+            return True
         log.info("Мозг: событие -> %s", what)
-        self._ask(EVENT_PROMPT.format(what=what), EVENT_BANDS, now)
+        self._ask(EVENT_PROMPT.format(what=what), now, EVENT_BANDS, changes=events)
         return True
 
     def _maybe_overheard(self, now: float) -> None:
@@ -165,7 +199,7 @@ class Brain:
                 return  # Гослинг говорит или только что спрашивали — решим чуть позже
             lines, self._heard = self._heard, []
         log.info("Мозг: подслушал %d реплик — встрять ли?", len(lines))
-        self._ask(OVERHEARD_PROMPT.format(lines="\n".join(c.text for c in lines)), OVERHEARD_BANDS, now)
+        self._ask(OVERHEARD_PROMPT.format(lines="\n".join(c.text for c in lines)), now, OVERHEARD_BANDS)
 
     def _maybe_idle(self, now: float) -> None:
         # Тишина — с последней реплики (его или игрока), а не с последнего вопроса «заговорить ли»: в городе мозг
@@ -176,26 +210,49 @@ class Brain:
         self._idle_checked = now
         if self.game.updated is None or now - self.game.updated > GAME_STALE:
             return
+        quiet = now - anchor
+        silence = f"{round(quiet)} с" if quiet < 90 else f"{round(quiet / 60)} мин"
+        # Есть мысль «при случае», ещё не сказанная, — тишина и есть случай: говорим её, а не «придумай что-нибудь».
+        if not self.game.in_combat and (thought := self.unsaid_thought()):
+            log.info("Мозг: долгая тишина — скажу мысль: %s", thought)
+            if self._ask("Игрок ничего не говорил.\n" + THOUGHT_PROMPT.format(
+                    when=THOUGHT_IDLE.format(silence=silence), thought=thought), now):
+                self.thought_said(thought)
+            return
         log.info("Мозг: долгая тишина")
-        self._ask(IDLE_PROMPT.format(silence=f"{max(1, round((now - anchor) / 60))} мин"), IDLE_BANDS, now)
+        self._ask(IDLE_PROMPT.format(silence=silence), now, IDLE_BANDS, extra_tags={"тишина"})
 
-    def _ask(self, situation: str, bands: str, now: float) -> None:
+    def _ask(self, situation: str, now: float, bands: str | None = None, changes: list[Change] | None = None,
+             extra_tags: set[str] | None = None) -> bool:
+        """Спросить модель, что сказать. bands — шкала интереса: говорит, только если оценка не ниже brain.interest;
+        None — без шкалы (мысль: говорить ли, уже решено). changes — повод: по нему и обстановке подбираются
+        заготовки шуток (companion/jokes.py). True — сказал."""
         self.last_ask = now
         scene = self._scene()
-        # Неважное (ниже порога) — иногда всё-таки короткой шуткой: не в бою и не сразу после своей реплики.
-        llm = self.voice.llm
-        quip = (0.0 if self.game.in_combat or (llm and now - llm.last_reply_at < self.cfg.quip_gap)
+        if bands is None:
+            return self.voice.initiate(situation, still_fresh=lambda: self._scene() == scene)
+        # Неважное (ниже порога) — иногда всё-таки короткой шуткой: не в бою и не раньше quip_gap после прошлой
+        # шутки (раньше считали от любой реплики — и в городе шутки не звучали вовсе).
+        quip = (0.0 if self.game.in_combat or now - self.voice.last_joke_at < self.cfg.quip_gap
                 else self.cfg.quip_chance)
-        self.voice.initiate(situation + SCALE.format(bands=bands, recency=self._recency(now),
-                                                     threshold=self.cfg.interest),
-                            min_interest=self.cfg.interest, still_fresh=lambda: self._scene() == scene,
-                            quip_chance=quip)
+        jokes = ""
+        if self.jokes is not None and not self.game.in_combat:
+            try:
+                jokes = self.jokes.block(changes, extra_tags)
+            except Exception:  # noqa: BLE001 — без шуток, но не без реплики
+                log.exception("Шутки: не подобрать")
+        return self.voice.initiate(situation + jokes + SCALE.format(bands=bands, recency=self._recency(now),
+                                                                    threshold=self.cfg.interest,
+                                                                    joke=JOKE_FIELD if jokes else ""),
+                                   min_interest=self.cfg.interest, still_fresh=lambda: self._scene() == scene,
+                                   quip_chance=quip)
 
     def _scene(self) -> tuple:
-        """Обстановка, при смене которой реплика по своей инициативе уже не к месту: место, помещение, бой.
-        Пока модель думала и синтезировался голос (~3–4 с), игрок мог выйти из лавки или влезть в драку."""
+        """Обстановка, при смене которой реплика по своей инициативе уже не к месту: место, помещение, бой, гибель.
+        Пока модель думала и синтезировался голос (~3–4 с), игрок мог выйти из лавки, влезть в драку или погибнуть
+        («12 процентов, выпей зелье» — уже мёртвому)."""
         s = self.game.status
-        return s.location, s.cell, bool(s.in_combat)
+        return s.location, s.cell, bool(s.in_combat), self.game.dead
 
     def _recency(self, now: float) -> str:
         """Что модели знать о себе, чтобы решить, не болтает ли она подряд."""

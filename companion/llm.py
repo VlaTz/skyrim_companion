@@ -72,6 +72,14 @@ GAME_CONTEXT_NOTE ="Описана в начале последнего сооб
 
 BETWEEN_MAX = 8  # событий между репликами в истории — последних
 
+# Обращение к игроку. «Не в каждой реплике» в промпте персонажа модель не держит (131 из 140 реплик в памяти —
+# с обращением, 79 с него начинаются): своим прошлым репликам в истории она подражает сильнее. Поэтому — по факту:
+# было обращение в последних ADDRESS_LOOKBACK репликах — в этой без него (пометка только в этот запрос).
+ADDRESS = re.compile(r"\b(Владос\w*|братан\w*|бро)\b", re.I)
+ADDRESS_LOOKBACK = 2
+ADDRESS_NOTE = ("(Ты уже обращался к нему в прошлых репликах — в этой говори без обращения: без «Владос», "
+                "«братан», «бро».)")
+
 # Планировщик справок: отдельный короткий запрос без истории разговора — нужны ли справки для ответа игроку.
 # С историей модель держится своих прошлых ответов без справок («сейчас гляну» — и не смотрит: 0 из 4 на ходе
 # из трассы), без истории — зовёт справку (4 из 4). Идёт параллельно с основным запросом, ответ не замедляет.
@@ -94,6 +102,8 @@ class Reply:
     emotion: str
     interest: int | None = None  # насколько зацепило (0–10) — только если об этом спрашивали в запросе
     remember: str | None = None  # что запомнить (модель решила, что узнала важное)
+    joke: str | None = None      # id заготовки шутки, которую обыграла (companion/jokes.py)
+    quip: bool = False           # прозвучала шуткой ниже порога интереса
 
 
 def parse_reply(content: str) -> Reply:
@@ -110,7 +120,8 @@ def parse_reply(content: str) -> Reply:
                 except (TypeError, ValueError):
                     interest = None
                 remember = str(data.get("remember") or "").strip() or None
-                return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION, interest, remember)
+                joke = str(data.get("joke") or "").strip() or None
+                return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION, interest, remember, joke)
         except json.JSONDecodeError:
             pass
     log.warning("LLM ответила не чистым JSON: %r", content)
@@ -211,6 +222,9 @@ class CompanionLLM:
     def _ask_traced(self, user_content: str, now: str, memory: str, tools: list[Tool],
                     min_interest: int | None, quip_chance: float, block: trace.Block) -> Reply:
         with self._lock:
+            if self._addressed_lately():  # история меняется только под блокировкой — смотрим здесь
+                now += f"\n{ADDRESS_NOTE}"
+                block.line("Пометка: без обращения (оно было в прошлых репликах)")
             messages = [{"role": "system", "content": self.system_prompt(memory, with_tools=bool(tools))},
                         *self.history,
                         {"role": "user", "content": now}]
@@ -238,7 +252,8 @@ class CompanionLLM:
             reply = parse_reply(msg.content or "")
             block.line(f"Ответ модели {time.perf_counter() - t:.2f} с: [{reply.emotion}]"
                        + (f" интерес {reply.interest}" if reply.interest is not None else "")
-                       + f" «{reply.text}»" + (f"\n  запомнить: {reply.remember}" if reply.remember else ""))
+                       + f" «{reply.text}»" + (f"\n  запомнить: {reply.remember}" if reply.remember else "")
+                       + (f"\n  обыграл заготовку: {reply.joke}" if reply.joke else ""))
             log.info("LLM %.2f с%s: [%s]%s %r", time.perf_counter() - t,
                      f" (инструментов: {calls})" if calls else "", reply.emotion,
                      f" интерес {reply.interest}" if reply.interest is not None else "", reply.text)
@@ -247,6 +262,7 @@ class CompanionLLM:
                     log.info("Интерес %s ниже порога %d — но сказал шуткой (шанс %.0f%%)",
                              reply.interest, min_interest, quip_chance * 100)
                     block.line(f"→ ниже порога {min_interest}, но сказал шуткой (шанс {quip_chance:.0%})")
+                    reply.quip = True
                 else:
                     log.info("Интерес %s ниже порога %d — промолчал", reply.interest, min_interest)
                     block.line(f"→ промолчал: интерес {reply.interest} ниже порога {min_interest}")
@@ -339,21 +355,29 @@ class CompanionLLM:
     def reset(self) -> None:
         self.history.clear()
 
+    def _addressed_lately(self) -> bool:
+        """В последних ADDRESS_LOOKBACK репликах Гослинга было обращение к игроку."""
+        replies = [m["content"] for m in self.history if m["role"] == "assistant"][-ADDRESS_LOOKBACK:]
+        return any(ADDRESS.search(r) for r in replies)
+
     def complete_json(self, system: str, user: str, max_tokens: int | None = None,
-                      title: str = "Фоновый запрос") -> dict | None:
+                      title: str = "Фоновый запрос", model: str | None = None) -> dict | None:
         """Отдельный запрос без истории и инструментов (дневник и т.п.): ответ — JSON-объект или None.
-        Не берёт блокировку разговора — идёт в фоне, пока Гослинг болтает. Модель — llm.background_model."""
-        block = trace.Block(f"{title} [{self.background_model}]")
+        Не берёт блокировку разговора — идёт в фоне, пока Гослинг болтает. Модель — llm.background_model
+        (или model: шутки пишет jokes.model)."""
+        model = model or self.background_model
+        block = trace.Block(f"{title} [{model}]")
         block.section("Запрос", user)
         try:
-            return self._complete_json(system, user, max_tokens or self.cfg.background_max_tokens, block)
+            return self._complete_json(system, user, max_tokens or self.cfg.background_max_tokens, block, model)
         finally:
             block.write()
 
-    def _complete_json(self, system: str, user: str, max_tokens: int, block: trace.Block) -> dict | None:
+    def _complete_json(self, system: str, user: str, max_tokens: int, block: trace.Block,
+                       model: str) -> dict | None:
         try:
             resp = self.client.chat.completions.create(
-                model=self.background_model, temperature=0.3, max_tokens=max_tokens,
+                model=model, temperature=0.3, max_tokens=max_tokens,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
                 extra_body=(self.cfg.extra_body if self.cfg.background_extra_body is None
                             else self.cfg.background_extra_body) or None)
@@ -407,5 +431,9 @@ class CompanionLLM:
                 self.history.append({"role": "assistant", "content": json.dumps(
                     {"emotion": emotion or DEFAULT_EMOTION, "text": text}, ensure_ascii=False)})
                 asked, events = None, []
+            # Последней реплики больше нет в памяти (ушла в архив с загрузкой сейва постарше) — мозгу её не
+            # показываем: «Ты сам говорил 10 с назад: «Мирмулнир мёртв»», а бой ещё впереди.
+            if not any(kind == "gosling" and text == self.last_reply_text for kind, text, _e, _i in dialogue):
+                self.last_reply_at, self.last_reply_text = 0.0, ""
             self._last_turn = time.time()
         log.info("История разговора восстановлена из памяти: %d реплик", len(self.history) // 2)

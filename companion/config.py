@@ -112,7 +112,7 @@ class BrainConfig(BaseModel):
     # говорила сама; Гослинг говорит, если не ниже interest. Меньше — болтливее, больше — молчаливее.
     interest: int = 7
     # Ниже порога модель пишет короткую шутку к месту; с этим шансом она всё же звучит — не в бою и не чаще
-    # раза в quip_gap секунд после последней реплики Гослинга.
+    # раза в quip_gap секунд после прошлой шутки Гослинга (до 2026-10-15 — после любой реплики: шутки не звучали).
     quip_chance: float = 0.2
     quip_gap: float = 90
     ask_gap: float = 2           # секунд между вопросами модели «заговорить ли» (не спрашивать на каждый чих)
@@ -126,7 +126,7 @@ class BrainConfig(BaseModel):
     events: list[str] = [
         "loaded", "location", "wilderness", "interior", "combat_started", "combat_ended", "low_health", "item",
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
-        "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought",
+        "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
@@ -153,6 +153,16 @@ class ThinkerConfig(BaseModel):
     check_every: float = 3       # секунд — как часто смотреть, не поменялось ли что (проверка дешёвая)
     max_ideas: int = 3           # мыслей за раз — не больше
     dialogue_lines: int = 12     # последних реплик в запрос — что уже предлагал и что ответил Владос
+
+
+class JokesConfig(BaseModel):
+    """Шутки Гослинга (companion/jokes.py): заготовки из characters/<персонаж>/jokes.yaml к обстановке."""
+    enabled: bool = True
+    refill: bool = True          # дописывать новые в фоне (jokes_auto.yaml), когда к обстановке мало несказанных
+    refill_below: int = 2        # несказанных заготовок к обстановке меньше — дописать
+    refill_count: int = 6        # сколько дописать за раз
+    refill_gap: float = 900      # секунд между дописываниями — не чаще (каждое — запрос к сильной модели)
+    model: str = "anthropic/claude-sonnet-5.5"  # кто пишет: почти как Opus, вдвое дешевле
 
 
 class OverlayConfig(BaseModel):
@@ -188,6 +198,7 @@ class Config(BaseModel):
     brain: BrainConfig = BrainConfig()
     diarist: DiaristConfig = DiaristConfig()
     thinker: ThinkerConfig = ThinkerConfig()
+    jokes: JokesConfig = JokesConfig()
     overlay: OverlayConfig = OverlayConfig()
 
     @property

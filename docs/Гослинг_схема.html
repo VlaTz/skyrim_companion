@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Схема Гослинга</title>
+<style>
+:root {
+  --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1d1f; --muted: #6b6b70; --line: #c9c6bd; --grid: #e7e4dc;
+  --chip: #ffffff; --chip-ink: #2a2a2e; --shadow: 0 1px 2px rgba(0,0,0,.06), 0 4px 16px rgba(0,0,0,.06);
+  --ok: #2f9e44; --new: #e8a317; --plan: #9a9aa0; --sel: #2563eb;
+  /* Цвет блока — свой у каждого (оттенки по кругу), серые — служебные. Статусы — только точки (--ok, --new, --plan). */
+  --c-player: #dc2626; --c-persona: #ea580c; --c-game: #d97706; --c-mod: #a16207; --c-diar: #65a30d;
+  --c-mem: #16a34a; --c-know: #059669; --c-perc: #0d9488; --c-tools: #0891b2; --c-voice: #2563eb;
+  --c-talk: #4f46e5; --c-brain: #7c3aed; --c-think: #a21caf; --c-jokes: #db2777; --c-dev: #57534e; --c-plan: #71717a;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #17171a; --panel: #212125; --ink: #ececf0; --muted: #a0a0a8; --line: #4a4a52; --grid: #222226;
+    --chip: #2a2a2f; --chip-ink: #e6e6ea; --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.35);
+    --sel: #60a5fa;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #17171a; --panel: #212125; --ink: #ececf0; --muted: #a0a0a8; --line: #4a4a52; --grid: #222226;
+  --chip: #2a2a2f; --chip-ink: #e6e6ea; --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 16px rgba(0,0,0,.35);
+  --sel: #60a5fa;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
+header { position: fixed; inset: 0 0 auto 0; z-index: 3; display: flex; flex-wrap: wrap; gap: 8px 14px;
+  align-items: center; padding: 10px 16px; background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(6px); border-bottom: 1px solid var(--line); }
+header h1 { font-size: 16px; margin: 0; font-weight: 650; }
+header .sub { color: var(--muted); font-size: 12.5px; }
+.tools { display: flex; gap: 6px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+button, input { font: inherit; color: var(--ink); background: var(--panel); border: 1px solid var(--line);
+  border-radius: 8px; padding: 5px 10px; }
+button { cursor: pointer; } button:hover { border-color: var(--sel); }
+input { width: 190px; }
+.legend { display: flex; gap: 10px; font-size: 12px; color: var(--muted); align-items: center; }
+.dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+#canvas { position: fixed; inset: 0; width: 100%; height: 100%; cursor: grab; touch-action: none;
+  user-select: none; -webkit-user-select: none; }  /* тащим карту — текст не выделяется */
+body.dragging-map { user-select: none; -webkit-user-select: none; }
+#canvas.dragging { cursor: grabbing; }
+.grp-rect { fill: color-mix(in srgb, var(--block) 7%, var(--panel)); stroke: var(--block); stroke-width: 2.5; filter: drop-shadow(0 2px 6px rgba(0,0,0,.07)); cursor: pointer; }
+.grp-title { font-size: 22px; font-weight: 700; fill: var(--ink); pointer-events: none; }
+.grp-sub { font-size: 13px; fill: var(--muted); pointer-events: none; font-family: ui-monospace, Consolas, monospace; }
+.chip { cursor: pointer; }
+.chip rect { fill: color-mix(in srgb, var(--block) 12%, var(--chip)); stroke: color-mix(in srgb, var(--block) 45%, var(--line)); stroke-width: 1; }
+.chip:hover rect { stroke: var(--sel); }
+.chip text { font-size: 15px; fill: var(--chip-ink); pointer-events: none; }
+.chip.plan rect { stroke-dasharray: 5 4; }
+.edge { fill: none; stroke: var(--line); stroke-width: 2.2; }
+.edge-label { font-size: 13px; fill: var(--muted); }
+.edge-label-bg { fill: var(--bg); }
+.center { cursor: pointer; }
+.center-ring { fill: none; stroke: var(--ink); stroke-width: 7; }
+.center-halo { fill: var(--panel); filter: drop-shadow(0 6px 24px rgba(0,0,0,.18)); }
+.center-title { font-size: 58px; font-weight: 800; fill: var(--ink); letter-spacing: .5px; }
+.center-sub { font-size: 24px; fill: var(--muted); }
+.center:hover .center-ring { stroke: var(--sel); }
+.dim { opacity: .18; }
+.selected > rect, rect.selected { stroke: var(--sel) !important; stroke-width: 3 !important; }
+.hl { stroke: var(--sel) !important; stroke-width: 3.4; }
+.hl-label { fill: var(--sel) !important; font-weight: 600; }
+.match rect { stroke: var(--sel); stroke-width: 2.5; }
+aside { position: fixed; z-index: 4; top: 62px; right: 12px; bottom: 12px; width: min(440px, calc(100vw - 24px));
+  background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: var(--shadow);
+  padding: 18px 20px; overflow: auto; transform: translateX(110%); transition: transform .2s ease; }
+aside.open { transform: none; }
+aside h2 { margin: 0 34px 2px 0; font-size: 19px; }
+aside .path { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
+aside .status { display: inline-block; font-size: 12px; padding: 2px 8px; border-radius: 99px; margin-bottom: 10px;
+  border: 1px solid var(--line); }
+aside code { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; background: color-mix(in srgb, var(--line) 30%, transparent);
+  padding: 1px 4px; border-radius: 4px; }
+aside ul { padding-left: 18px; margin: 6px 0; } aside li { margin: 3px 0; }
+aside p { margin: 6px 0; }
+aside h3 { font-size: 15px; margin: 16px 0 4px; }
+aside ol { padding-left: 20px; margin: 6px 0; }
+aside a[data-go] { color: var(--sel); cursor: pointer; text-decoration: none; }
+aside table { width: 100%; border-collapse: collapse; font-size: 13px; margin: 6px 0; }
+aside th, aside td { text-align: left; vertical-align: top; padding: 5px 6px; border-bottom: 1px solid var(--line); }
+aside th { color: var(--muted); font-weight: 600; }
+aside .files { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 12.5px; color: var(--muted); }
+aside .kids { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+aside .kids button { margin: 3px 4px 3px 0; font-size: 12.5px; padding: 3px 8px; }
+aside .close { position: absolute; top: 12px; right: 12px; padding: 2px 9px; }
+aside .links { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); font-size: 13px; }
+aside .links a { color: var(--sel); cursor: pointer; text-decoration: none; }
+.hint { position: fixed; z-index: 2; left: 16px; bottom: 12px; color: var(--muted); font-size: 12px;
+  background: color-mix(in srgb, var(--bg) 85%, transparent); padding: 4px 8px; border-radius: 8px; }
+@media (max-width: 700px) {
+  header { padding: 8px 16px; } .legend { display: none; } input { width: 130px; }
+  aside { top: auto; left: 12px; right: 12px; width: auto; height: 55vh; transform: translateY(110%); }
+}
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Гослинг — из чего он состоит</h1>
+    <div class="sub">Тащи мышью, крути колесо, кликни на Гослинга, блок или его часть — справа подробности</div>
+  </div>
+  <div class="tools">
+    <div class="legend">
+      <span><span class="dot" style="background:var(--ok)"></span>работает в игре</span>
+      <span><span class="dot" style="background:var(--new)"></span>сделано, не проверено</span>
+      <span><span class="dot" style="background:transparent;border:1.5px dashed var(--plan)"></span>в планах</span>
+      <span>· цвет карточки — свой у каждого блока</span>
+    </div>
+    <input id="search" type="search" placeholder="Найти: мысли, книги, F8…" aria-label="Поиск по схеме">
+    <button id="about" title="Как устроен Гослинг: агент, инструменты, модели">Как устроен</button>
+    <button id="zoomOut" title="Отдалить">−</button>
+    <button id="zoomIn" title="Приблизить">+</button>
+    <button id="fit" title="Показать всё (Esc)">Общий вид</button>
+    <button id="theme" title="Светлая / тёмная">◐</button>
+  </div>
+</header>
+<svg id="canvas" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Схема устройства Гослинга">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--line)"></path>
+    </marker>
+    <marker id="arrow-hl" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="var(--sel)"></path>
+    </marker>
+    <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+      <path d="M40 0H0V40" fill="none" stroke="var(--grid)" stroke-width="1"></path>
+    </pattern>
+  </defs>
+  <g id="world">
+    <rect x="-4000" y="-4000" width="12000" height="12000" fill="url(#grid)"></rect>
+    <g id="edges"></g>
+    <g id="groups"></g>
+    <g id="center"></g>
+  </g>
+</svg>
+<aside id="panel" aria-live="polite">
+  <button class="close" id="close" title="Закрыть">✕</button>
+  <div id="panelBody"></div>
+</aside>
+<div class="hint">Двойной клик — приблизить блок · Esc — общий вид</div>
+
+<script>
+// ------------------------------------------------------------------ данные: блоки, их части и связи
+// s: ok — работает в игре, new — сделано, не проверено в игре, plan — в планах.
+const GROUPS = [
+ { id: "game", col: 0, color: "--c-game", title: "Игра: SKSE-плагин", sub: "skse_plugin/src  (C++, CommonLibSSE-NG)",
+   d: `<p>Плагин внутри Skyrim SE 1.7.104: смотрит, что происходит в игре, и шлёт это сервису по HTTP
+   (<code>POST /game/event</code>); забирает команды «скажи» долгим опросом (<code>GET /game/commands</code>).</p>
+   <p>Принцип: функции игры «по адресу» на 1.7.104 не вызываем — читаем поля, события, Papyrus, Scaleform.</p>
+   <p>Сборка: <code>cd skse_plugin &amp;&amp; xmake build -y</code> → DLL в мод MO2 «Skyrim Companion» (только при закрытой игре).
+   Лог: <code>Documents\\My Games\\Skyrim Special Edition\\SKSE\\SkyrimCompanion.log</code>.</p>`,
+   files: "Events.cpp, Voice.cpp, Quests.cpp, Player.cpp, Profile.cpp, Net.cpp",
+   kids: [
+    { id: "g-status", t: "Снимок обстановки (status)", s: "ok", d: `<p>Каждые 2 с: место, владение, ячейка, помещение или улица, время, погода,
+      здоровье, бой, кто рядом (~35 м: враждебен, мёртв, спутник, «уникальный», раса), враги вдали (~140 м — дракон в небе),
+      собеседник игрока (5 минут: расстояние, враждебен, бежит), где NPC Гослинг. ID персонажа — из имени сейва.</p>` },
+    { id: "g-events", t: "События игры", s: "ok", d: `<ul><li>бой начался / закончился (с кем), убит кто-то рядом;</li>
+      <li>смена локации, подобрал с земли;</li><li>задействовал: рычаг, сундук, обыскал тело, мебель;</li>
+      <li>отпер ключом (замок сменился рядом + игрок его активировал);</li><li>применил Крик (заклинание типа «голос»);</li>
+      <li>собеседник убегает (быстрее 3,5 м/с два тика подряд).</li></ul>` },
+    { id: "g-npc", t: "Реплики NPC рядом", s: "ok", d: `<p><code>TESTopicInfoEvent</code> в ~25 м: кто и какая реплика (файл + номер INFO).
+      Текст сервис берёт сам из файлов игры — ни субтитров, ни функций по адресу. Меню разговора открыто/закрыто — отдельным событием.</p>
+      <p>Ограничение: звуки сцен (крик Седобородых «До-ва-кин») — не реплики, их не слышно.</p>` },
+    { id: "g-quests", t: "Журнал, профиль, статистика", s: "ok", d: `<ul><li><b>quests</b> — активные задания: цели, отмеченное, выполненные;</li>
+      <li><b>profile</b> — раса, уровень, 5 лучших навыков, фракции с рангом, награды за голову, пройденные крупные квесты;</li>
+      <li><b>stat</b> — игровая статистика (украдено, взломано, слово силы…), накопленным значением.</li></ul>` },
+    { id: "g-death", t: "Гибель игрока", s: "new", d: `<p><code>player_died</code> {killer, race}: кто убил (нет убийцы — упал, утонул, ловушка).
+      Гослинг скажет об этом после загрузки сейва. В лог плагина — «Игрок погиб: …».</p>` },
+    { id: "g-books", t: "Книги, которые читает Владос", s: "new", d: `<p><code>book_read</code>: открылось меню книги (из сумки или с полки) —
+      какая книга, читаем из переменной меню (<code>BookMenu::GetTargetForm</code>, чтение по Address Library). Текст сервис берёт из файлов игры.
+      В лог — «Книга открыта: …».</p>` },
+    { id: "g-exchange", t: "Обмен вещами с Гослингом", s: "new", d: `<p><code>gosling_items</code> {given, taken}: игрок отдал Гослингу или забрал у него.
+      Перекладывают пачкой — копим и шлём через 2 с тишины. В лог — «Обмен с Гослингом: отдал N, забрал M».</p>` },
+    { id: "g-say", t: "Команда «скажи»", s: "ok", d: `<p>Сервис кладёт .wav + .lip в мод и шлёт команду → Papyrus <code>GoslingVoice.SayLine</code> →
+      <code>Actor.Say()</code>. Сразу после прошлой фразы Say() отбрасывается — повторяем до 10 с, пока звук не пошёл.
+      Субтитр — через HUD <code>ShowSubtitle</code>. Команда, простоявшая &gt; 2 с, не выполняется.</p>` },
+   ] },
+ { id: "mod", col: 0, color: "--c-mod", title: "Мод Gosling.esp", sub: "tools/build_gosling_esp.py",
+   d: `<p>Гослинг как NPC в игре — чтобы говорил из своих уст. Собирается без Creation Kit:
+   <code>python tools/build_gosling_esp.py --install</code> → <code>D:\\Games\\Modding\\MO2\\mods\\Gosling</code>.</p>`,
+   files: "Gosling.esp, Seq\\Gosling.seq, Scripts\\GoslingVoice.pex (mod/Scripts/Source)",
+   kids: [
+    { id: "m-npc", t: "NPC Гослинг", s: "ok", d: `<p>По образцу Эрика Грозного Убийцы, свой тип голоса <code>GoslingVoice</code>, лицо.</p>` },
+    { id: "m-quest", t: "Квест GoslingVQ и темы-заглушки", s: "ok", d: `<p>Две темы-заглушки, через которые звучат реплики.
+      Квест «стартует с игрой» с диалогами требует <code>Seq\\Gosling.seq</code> — без него Say() молча не звучит (главные грабли).</p>` },
+    { id: "m-files", t: "Перезаписываемые .wav и .lip", s: "ok", d: `<p>MO2 строит виртуальную Data при запуске, поэтому файлы-заглушки должны существовать заранее;
+      сервис перезаписывает их перед каждой фразой.</p>` },
+   ] },
+ { id: "player", col: 0, color: "--c-player", title: "Владос (игрок)", sub: "",
+   d: `<p>Игрок. Обращения: «Владос», «братан», «бро» (не «друг») — и не в каждой реплике.</p>`,
+   kids: [
+    { id: "p-talk", t: "Говорит голосом (F8)", s: "ok", d: `<p>Держит F8 и говорит — речь распознаёт Whisper, Гослинг отвечает. Речь игрока главнее: перебивает Гослинга.</p>` },
+    { id: "p-read", t: "Читает книги и записки", s: "new", d: `<p>Гослинг знает прочитанное («читал через плечо»): основной способ узнавать из книг.</p>` },
+    { id: "p-give", t: "Отдаёт и забирает вещи", s: "new", d: `<p>Обмен со спутником — Гослинг реагирует; отданную книгу читает сам.</p>` },
+   ] },
+
+ { id: "perc", col: 1, color: "--c-perc", title: "Восприятие: что Гослинг видит", sub: "companion/game/",
+   d: `<p>Из событий плагина сервис держит состояние игры и собирает текст «Сейчас в игре» — на каждый запрос к модели заново.
+   Частое и короткое — сразу в обстановке, редкое — справками по запросу (гибрид).</p>`,
+   files: "state.py, places.py, profile.py, quests.py, geo.py, dialogue.py, books.py",
+   kids: [
+    { id: "pe-now", t: "«Сейчас в игре»", s: "ok", d: `<p>Место, время и погода, игрок (здоровье, уровень), бой, враги рядом и вдали, кто рядом,
+      собеседник, сумка одной строкой, цели 3 заданий, «Недавно», «Ты слышал рядом», карточка текущего места, мысли, факты о месте.</p>` },
+    { id: "pe-recent", t: "«Недавно» по важности", s: "ok", d: `<p>События с давностью («3 мин назад»); бой и стычки подряд — одной строкой
+      («был бой с: Драугр — игрок убил: Драугр ×8»); важное (слово силы, задание, знакомый напал или убит) держится 30 мин.
+      При загрузке сейва очищается — иначе «помнил» будущее (2026-10-15).</p>` },
+    { id: "pe-heard", t: "«Ты слышал рядом»", s: "ok", d: `<p>Реплики NPC и то, что Владос выбирал в разговоре («Владос: «Кого вы ищете?»
+      (выбрал в разговоре с …)») — выбор игрока берётся из файлов игры. 8 последних, за 5 минут.</p>` },
+    { id: "pe-meet", t: "Встречи: «впервые» / «уже встречали»", s: "ok", d: `<p>Раса врага (у нелюдей) и применённый Крик: впервые — срочный повод
+      («дракон: таких ты видишь впервые в жизни»), дальше — пометка «уже встречали 3 раза, последний — там-то».</p>` },
+    { id: "pe-quests", t: "Задания", s: "ok", d: `<p>Новое задание, «цель выполнена», «новая цель», «задание завершено» — события.
+      Текущие цели 3 заданий — в обстановке; весь журнал — справками.</p>` },
+    { id: "pe-place", t: "Справка о месте", s: "ok", d: `<p>Из Skyrim.esm и DLC: тип места, владение, лавки, таверны, храмы, гильдии, замок и кто там
+      живёт/работает (профессии — по фракциям). Карточка текущего поселения — в обстановке.</p>` },
+    { id: "pe-profile", t: "Профиль Владоса", s: "new", d: `<p>Раса, уровень, лучшие навыки, гильдии с русскими званиями, розыск по владениям,
+      пройденные крупные квесты, привычки по статистике («украдено 47»). Изменения — события («вступил в Соратники»).</p>` },
+    { id: "pe-death", t: "Гибель и загрузка", s: "new", d: `<p>Погиб — Гослинг молчит, пока Владос мёртв; что пошло не так (кто убил, где, что было
+      перед этим) запоминается вне памяти по сейву; после загрузки — срочный повод: говорит прямо, с шуткой и советом.</p>` },
+   ] },
+ { id: "voice", col: 1, color: "--c-voice", title: "Голос и слух", sub: "companion/voice/",
+   d: `<p>Как Гослинг слышит игрока и как говорит. Всё локально, на видеокарте.</p>`,
+   files: "service.py, stt.py, xtts.py, npc_voice.py, audio_io.py",
+   kids: [
+    { id: "v-stt", t: "Слух: Whisper large-v3-turbo", s: "ok", d: `<p>F8 → запись → распознавание (русский, подсказка с названиями Скайрима).
+      VAD отсекает тишину и «галлюцинации» на шуме.</p>` },
+    { id: "v-tts", t: "Голос: XTTS-v2", s: "ok", d: `<p>Голос Эрика Грозного Убийцы без дообучения; эмоции — по референсам из меток диалогов Скайрима
+      (puzzled выключен — плохо звучит); темп 1.2.</p>` },
+    { id: "v-npc", t: "Из уст NPC", s: "ok", d: `<p>Фразы до 120 знаков (первая — до 50, чтобы раньше зазвучала), .wav 44,1 кГц + .lip
+      (LipGenerator из CK), команда «скажи». Следующая фраза синтезируется, пока звучит предыдущая. Дальше 30 м — в колонки.</p>` },
+    { id: "v-prio", t: "Приоритет речи игрока", s: "ok", d: `<p>Нажал F8 — Гослинг замолкает и слушает; его недосказанная реплика убирается из истории.</p>` },
+   ] },
+
+ { id: "brain", col: 2, color: "--c-brain", title: "Мозг: заговорить ли самому", sub: "companion/brain.py",
+   d: `<p>Говорить ли — решает модель: на любой повод пишет, что сказала бы, и ставит interest 0–10. Код только не даёт перебивать себя
+   и следит, чтобы реплика не опоздала.</p>`,
+   files: "brain.py; config.yaml → brain",
+   kids: [
+    { id: "b-reasons", t: "Поводы: событие, подслушанное, тишина", s: "ok", d: `<p>Изменения в игре (пачкой за 1,5 с), реплики NPC (когда стихли и игрок
+      вышел из меню разговора), долгая тишина (30 с с последней реплики).</p>` },
+    { id: "b-scale", t: "Шкала интереса 0–10, порог 6", s: "ok", d: `<p>0–2 обыденное, 3–4 незачем, 5–6 можно промолчать, 7–8 важно вам, 9–10 нельзя
+      промолчать (впервые увиденное, ранение, гибель). Модель видит, когда и что говорила сама и идёт ли бой. Разговорчивость — одной цифрой <code>brain.interest</code>.</p>` },
+    { id: "b-fresh", t: "Не перебивает и не опаздывает", s: "ok", d: `<p>Пока говорит — поводы ждут; обычный устаревает за 15 с, важный — за 45 с.
+      Перед озвучкой сверяет место, помещение и бой: сменились — не говорит. Пока Владос мёртв — молчит.</p>` },
+    { id: "b-thoughts", t: "Мысли вслух", s: "new", d: `<p>Мысль «сейчас» от мыслителя — говорит без шкалы (своя мысль по шкале получала 3–4).
+      На долгую тишину — несказанная мысль «при случае», а не «придумай что-нибудь». В бою — ждёт.</p>` },
+    { id: "b-quips", t: "Шутки ниже порога", s: "new", d: `<p>Неважное модель пишет шуткой (с заготовками к обстановке); звучит с шансом 0.2,
+      не в бою и не раньше <code>quip_gap</code> после прошлой шутки.</p>` },
+   ] },
+ { id: "think", col: 2, color: "--c-think", title: "Мыслитель", sub: "companion/memory/thinker.py",
+   d: `<p>Фоновая модель (Sonnet) смотрит шире, чем мозг: сумка целиком, все задания, память — и решает, что держать в голове
+   и предложить Владосу (продать хлам, к ярлу, Лукану коготь).</p>`,
+   files: "thinker.py; config.yaml → thinker",
+   kids: [
+    { id: "t-when", t: "Когда думает", s: "ok", d: `<p>Сменилось поселение, задания или сумка; не чаще раза в 30 с; без перемен — раз в 10 минут.
+      Ушли, пока думал, или загрузили сейв — мысли выбрасывает.</p>` },
+    { id: "t-out", t: "0–3 мысли: сейчас / при случае / для себя", s: "new", d: `<p><code>now</code> — сразу мозгу; <code>later</code> — на тишину;
+      <code>never</code> — заметка для себя и уже сказанное. Мысли — в памяти, видны и в разговоре.</p>` },
+    { id: "t-rules", t: "Не пересказывать цель задания", s: "new", d: `<p>Цель Владос видит в журнале; про задание — только то, чего там нет: где это, по пути ли, что взять.</p>` },
+   ] },
+ { id: "jokes", col: 2, color: "--c-jokes", title: "Шутки", sub: "companion/jokes.py",
+   d: `<p>Заготовки к обстановке: модель обыгрывает одну своими словами или не берёт. Разные под место, не повторяются, база растёт.</p>`,
+   files: "jokes.py; characters/gosling/jokes.yaml, jokes_auto.yaml; tools/extract_quotes.py, generate_jokes.py",
+   kids: [
+    { id: "j-base", t: "База: цитаты из игры + свои", s: "new", d: `<p><code>jokes.yaml</code>: 75 цитат из реплик игры и мемов («А говорили, ты труп» — Ралоф)
+      и 178 своих от Opus (ждут просмотра). Файл перечитывается на лету.</p>` },
+    { id: "j-tags", t: "Метки обстановки и условия", s: "new", d: `<p>Город, тип места, погода, ночь, кто рядом, гильдии и привычки Владоса, само событие.
+      Редкие метки весят больше; метки-условия (город, «вор», гибель…) должны совпасть.</p>` },
+    { id: "j-said", t: "Память о сказанном", s: "new", d: `<p>Сказанная не предлагается 3 игровых дня и 2 часа; несказанные — выше. По сейву.</p>` },
+    { id: "j-refill", t: "Пополнение в фоне (Sonnet)", s: "new", d: `<p>Несказанных к обстановке меньше двух — Sonnet дописывает 6 новых в <code>jokes_auto.yaml</code>
+      (с карточкой места из данных игры), не чаще раза в 15 минут.</p>` },
+    { id: "j-history", t: "Шутки из общей истории", s: "new", d: `<p>Из памяти: сколько раз и от кого Владос погибал, привычки («взломано замков: 23»).</p>` },
+   ] },
+
+ { id: "talk", col: 3, color: "--c-talk", title: "Разговор: модель", sub: "companion/llm.py",
+   d: `<p>OpenAI-совместимый клиент (OpenRouter). Отвечает и игроку, и на поводы мозга. Быстро: ~2 с.</p>`,
+   files: "llm.py; config.yaml → llm",
+   kids: [
+    { id: "l-model", t: "Claude Haiku 5.5", s: "ok", d: `<p>В разговоре важна скорость. Фоновые задачи (летописец, мыслитель) — Sonnet 5.5, шутки — Sonnet 5.5.</p>` },
+    { id: "l-format", t: "Ответ JSON", s: "ok", d: `<p><code>{emotion, text, remember?, joke?, interest?}</code>: эмоция — интонация голоса;
+      remember — «запомню» (сразу в факты); joke — какую заготовку обыграл; interest — для мозга.</p>` },
+    { id: "l-history", t: "История: 10 обменов", s: "ok", d: `<p>Восстанавливается из памяти при запуске и загрузке сейва; между репликами — что случилось в игре
+      («[С твоей прошлой реплики: Арвел напал…]»).</p>` },
+    { id: "l-router", t: "Планировщик справок", s: "ok", d: `<p>Параллельно с ответом короткий запрос без истории решает, какие справки нужны
+      (с историей модель «обещала посмотреть» и не смотрела). Не замедляет.</p>` },
+    { id: "l-address", t: "Реже «Владос»", s: "new", d: `<p>Было обращение в 2 прошлых репликах — пометка «в этой без обращения». 16 из 16 → 4 из 16.</p>` },
+   ] },
+ { id: "persona", col: 3, color: "--c-persona", title: "Личность", sub: "characters/gosling/prompt.md",
+   d: `<p>Весёлый молодой норд, бывший картограф из Солитьюда. Правим описания инструментов и формат, а не промпт персонажа.</p>`,
+   files: "prompt.md; docs/Описание персонажа.md",
+   kids: [
+    { id: "pr-char", t: "Характер", s: "ok", d: `<p>Весёлый, любопытный исследователь, надёжный помощник, немного самоуверен, честен, со своим мнением.</p>` },
+    { id: "pr-memes", t: "Мемы Скайрима", s: "ok", d: `<p>Как местные поговорки, редко и к месту, не в бою.</p>` },
+    { id: "pr-style", t: "Стиль речи", s: "ok", d: `<p>По-русски, 1–3 коротких предложения, без эмодзи; не выдумывает имён; живёт в мире игры.</p>` },
+    { id: "pr-slots", t: "Подстановки {memory} и {game_context}", s: "ok", d: `<p>Сюда сервис кладёт память и обстановку на каждый запрос.</p>` },
+   ] },
+ { id: "tools", col: 3, color: "--c-tools", title: "Справки для модели", sub: "companion/tools.py",
+   d: `<p>Инструменты, которые модель вызывает сама, когда чего-то нет в «Сейчас в игре». Описание инструмента — главный рычаг: правим его, а не промпт.</p>`,
+   files: "tools.py",
+   kids: [
+    { id: "tl-places", t: "find_places — места на карте", s: "ok", d: `<p>По типу, названию, расстоянию; только открытые игроком.</p>` },
+    { id: "tl-quests", t: "quests, quest_details — журнал", s: "ok", d: `<p>Весь список заданий и одно подробно — «смотри сразу, не обещай потом».</p>` },
+    { id: "tl-player", t: "player_details — сумка Владоса", s: "ok", d: `<p>Золото, что надето, сумка по категориям, эффекты.</p>` },
+    { id: "tl-place", t: "place_info — любое место", s: "ok", d: `<p>Карточка места из данных игры.</p>` },
+    { id: "tl-world", t: "world_info — знания о мире", s: "new", d: `<p>Люди, места, боги, история, прочитанные книги — «чего нет в справке, того не знаешь».</p>` },
+   ] },
+
+ { id: "mem", col: 4, color: "--c-mem", title: "Память", sub: "companion/memory/",
+   d: `<p>SQLite на персонажа игрока: <code>memory/gosling/&lt;ID&gt;.db</code> (в git не идёт). Строго по сейву: загрузил сейв постарше —
+   всё после него уходит в архив (не стирается).</p>`,
+   files: "store.py, keeper.py",
+   kids: [
+    { id: "me-journal", t: "Журнал: всё как было", s: "ok", d: `<p>Реплики Владоса и Гослинга, события, подслушанное — с игровой датой и местом. Навсегда.</p>` },
+    { id: "me-diary", t: "Дневник, факты, цели", s: "ok", d: `<p>От летописца: записи от лица Гослинга, факты с источником («слышал от Лукана»),
+      цели и договорённости, что знает о Владосе.</p>` },
+    { id: "me-ideas", t: "Мысли", s: "ok", d: `<p>От мыслителя, привязаны к поселению, где надуманы.</p>` },
+    { id: "me-meet", t: "Встречи, сказанные шутки, прочитанные книги", s: "new", d: `<p>Одна таблица встреч: раса врага, Крик, «шутка», «книга:владос», «книга:гослинг».</p>` },
+    { id: "me-block", t: "Блок {memory} в промпте", s: "ok", d: `<p>Профиль Владоса, цели, договорённости, 3 записи дневника, где бывали вместе,
+      «чего нет в памяти — не помнишь, не выдумывай».</p>` },
+   ] },
+ { id: "diar", col: 4, color: "--c-diar", title: "Летописец", sub: "companion/memory/diarist.py",
+   d: `<p>Фоновая модель (Sonnet) по главам журнала пишет дневник, факты и цели. Никто не ждёт — поэтому модель посильнее.</p>`,
+   files: "diarist.py; config.yaml → diarist",
+   kids: [
+    { id: "d-when", t: "Когда глава кончилась", s: "ok", d: `<p>Ушли из места и записей ≥ 6; или много реплик/записей; или 15 мин с первой неописанной.</p>` },
+    { id: "d-rules", t: "Правила фактов", s: "ok", d: `<p>Свои реплики Гослинга — не источник фактов; «пришли куда-то» — не факт; предложение Гослинга без «да»
+      Владоса — не цель.</p>` },
+   ] },
+ { id: "know", col: 4, color: "--c-know", title: "Знания о мире", sub: "companion/knowledge.py",
+   d: `<p>Что Гослинг знает как местный — из файлов игры, а не из памяти модели (модели путают лор, летописец закрепляет выдумки).
+   Поиск — SQLite FTS5 с триграммами и переранжированием.</p>`,
+   files: "knowledge.py, game/books.py, game/places.py",
+   kids: [
+    { id: "k-lore", t: "Общеизвестное: экраны загрузки", s: "new", d: `<p>~230 «что знает каждый»: «Мара — богиня любви и сострадания…». Подсказки по игре отсеяны.</p>` },
+    { id: "k-people", t: "Люди: кто где живёт и кем работает", s: "new", d: `<p>~870: «Лукан Валерий — торговец; Галантерея Лукана, Ривервуд».</p>` },
+    { id: "k-places", t: "Места", s: "new", d: `<p>~570: «Ветреный пик — склеп драугров, нордские руины; владение Фолкрит».</p>` },
+    { id: "k-books", t: "Прочитанные книги", s: "new", d: `<p>Из 1045 книг игры — только прочитанные в этой ветке сейва (Владосом или Гослингом), кусками по ~700 знаков.</p>` },
+   ] },
+
+ { id: "dev", col: 5, color: "--c-dev", title: "Инструменты разработки", sub: "tools/, logs/",
+   d: `<p>Чтобы видеть, что «в мозгу», и проверять без игры.</p>`,
+   files: "trace.py, overlay.py, tools/*.py",
+   kids: [
+    { id: "dv-trace", t: "Трасса logs/trace/<дата>.log", s: "ok", d: `<p>На каждый ход: повод, обстановка, память, справки, ответ, «Мозг промолчал — почему», озвучка.</p>` },
+    { id: "dv-overlay", t: "Окно с логом поверх игры (F10)", s: "new", d: `<p>Лог сервиса поверх Скайрима, клики сквозь; только в окне без рамки.</p>` },
+    { id: "dv-fake", t: "fake_game.py — игра без игры", s: "ok", d: `<p>Сценарии событий: Вайтран, бой, Арвел, подслушанное, гибель.</p>` },
+    { id: "dv-state", t: "/game/state — что знает сервис", s: "ok", d: `<p><code>http://127.0.0.1:8765/game/state</code>: обстановка, память, игрок.</p>` },
+    { id: "dv-data", t: "Выгрузки из файлов игры", s: "ok", d: `<p>extract_voices, extract_dialogue (датасет голоса), extract_quotes (цитаты для шуток), generate_jokes.</p>` },
+   ] },
+ { id: "plan", col: 5, color: "--c-plan", title: "Дальше по плану", sub: "production_logs/2026-10-15_план_памяти.md",
+   d: `<p>Порядок — из плана памяти от 2026-10-15. Новое Гослинг узнаёт общими путями: слышит, видит, читает — без частных подпорок.</p>`,
+   kids: [
+    { id: "pl-update", t: "Обновление по ходу игры и правка ошибок", s: "plan", d: `<p>Что делали — к базе знаний («Ветреный пик: были, зачистили»);
+      журнал заданий — в память; факты летописца сверять с данными игры.</p>` },
+    { id: "pl-recall", t: "Вспоминание и характер", s: "plan", d: `<p>«Помнишь, где мы нашли меч?», память о месте при входе, любопытство как черта, «что я уже предлагал».</p>` },
+    { id: "pl-hear", t: "Слух: моменты сюжета", s: "plan", d: `<p>То, что не реплики NPC (крик Седобородых), и радиус слышимости.</p>` },
+    { id: "pl-actions", t: "Действия голосом", s: "plan", d: `<p>Жди, следуй, подбери, веди.</p>` },
+    { id: "pl-explore", t: "Самостоятельные исследования", s: "plan", d: `<p>«Отпусти исследовать».</p>` },
+    { id: "pl-polish", t: "Полировка", s: "plan", d: `<p>Потоковый ответ модели — начинать синтез с первого предложения (−0,5–1 с).</p>` },
+   ] },
+];
+
+const PHOTO = "data:image/jpeg;base64,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";
+
+const EDGES = [
+  ["game", "perc", "события, обстановка"],
+  ["player", "voice", "F8: речь"],
+  ["player", "game", "играет"],
+  ["perc", "brain", "поводы"],
+  ["perc", "think", "сменилось место, задания, сумка"],
+  ["perc", "mem", "журнал событий"],
+  ["think", "brain", "мысли: сейчас / при случае"],
+  ["jokes", "brain", "заготовки к месту"],
+  ["brain", "talk", "заговорить ли?"],
+  ["voice", "talk", "распознанная речь"],
+  ["talk", "voice", "эмоция + текст"],
+  ["voice", "game", ".wav + .lip → «скажи»"],
+  ["game", "mod", "Say() через Papyrus"],
+  ["persona", "talk", "кто он"],
+  ["tools", "talk", "справки по запросу"],
+  ["perc", "tools", "карта, журнал, сумка"],
+  ["know", "tools", "world_info"],
+  ["mem", "talk", "{memory}, история"],
+  ["talk", "mem", "реплики, «запомню»"],
+  ["mem", "diar", "главы журнала"],
+  ["diar", "mem", "дневник, факты, цели"],
+  ["mem", "jokes", "сказанное, гибели"],
+  ["mem", "know", "прочитанные книги"],
+  ["mem", "think", "цели, дневник"],
+];
+
+// ------------------------------------------------------------------ раскладка: Гослинг в центре, блоки — кольцом
+// Порядок по кольцу (по часовой, с верха) — так, чтобы связанные блоки стояли рядом: меньше стрелок через центр.
+const RING = ["perc", "brain", "think", "jokes", "mem", "diar", "know", "tools",
+              "talk", "persona", "voice", "player", "mod", "game", "dev", "plan"];
+const RX = 1700, RY = 1200, BOX_W = 440, HEAD = 78, ROW = 44, PAD = 16, PHOTO_R = 320;
+const byId = {}, kidById = {};
+for (const g of GROUPS) {
+  g.w = BOX_W;
+  g.h = HEAD + g.kids.length * ROW + PAD;
+  byId[g.id] = g;
+  g.kids.forEach((k, i) => { k.parent = g; k.i = i; kidById[k.id] = k; });
+}
+RING.forEach((id, i) => {
+  const g = byId[id], a = -Math.PI / 2 + i * 2 * Math.PI / RING.length;
+  g.x = RX * Math.cos(a) - g.w / 2;
+  g.y = RY * Math.sin(a) - g.h / 2;
+});
+const CENTER = { id: "center", title: "Как устроен Гослинг", sub: "ИИ-компаньон в Skyrim SE 1.7.104",
+  d: `<p><b>Гослинг</b> — спутник Владоса: NPC в игре, говорит голосом Эрика Грозного Убийцы из своих уст, слышит Владоса
+  и NPC вокруг, сам заговаривает, думает, шутит, помнит прохождение и знает мир из файлов игры. Характер — весёлый молодой
+  норд, бывший картограф из Солитьюда.</p>
+
+  <h3>Гослинг — агент, а не чат-бот</h3>
+  <p>Он не ждёт вопроса: сам наблюдает за игрой, сам решает, заговорить ли, и сам вызывает инструменты, когда ему
+  чего-то не хватает. Цикл:</p>
+  <ol>
+   <li><b>Видит</b> — плагин шлёт события игры; <a data-go="perc">восприятие</a> собирает «Сейчас в игре».</li>
+   <li><b>Решает</b> — <a data-go="brain">мозг</a> на каждый повод спрашивает модель «стоит ли сказать» (interest 0–10);
+     <a data-go="think">мыслитель</a> в фоне думает, что предложить Владосу.</li>
+   <li><b>Отвечает</b> — <a data-go="talk">модель</a> получает <a data-go="persona">личность</a>, <a data-go="mem">память</a>,
+     обстановку и историю; не хватает — вызывает <a data-go="tools">справки</a> (до 3 раз за ответ).</li>
+   <li><b>Говорит</b> — <a data-go="voice">голос</a> XTTS с эмоцией, плагин произносит из уст NPC.</li>
+   <li><b>Запоминает</b> — журнал, дневник <a data-go="diar">летописца</a>, факты, мысли, прочитанные книги.</li>
+  </ol>
+
+  <h3>Два пути реплики</h3>
+  <p><b>Владос спросил (F8):</b> Whisper → модель (параллельно — планировщик справок) → справки → ответ JSON (эмоция и
+  текст) → голос. Модель ~2 с, первая фраза голоса ~1 с.</p>
+  <p><b>Гослинг заговорил сам:</b> повод (событие, реплики NPC, тишина, мысль) → мозг собирает пачку (1,5 с) → модель
+  пишет реплику и ставит interest → не ниже порога 6 — говорит (ниже — иногда шуткой) → сверка, не сменилась ли
+  обстановка → голос. От повода до голоса ~5 с.</p>
+
+  <h3>Инструменты (справки)</h3>
+  <p>Модель вызывает их сама, по описанию инструмента: <code>find_places</code> (карта), <code>quests</code> и
+  <code>quest_details</code> (журнал), <code>player_details</code> (сумка), <code>place_info</code> (любое место),
+  <code>world_info</code> (знания о мире и прочитанное). Отдельный быстрый запрос без истории — планировщик — заранее
+  решает, какие справки нужны: с историей модель «обещала посмотреть» и не смотрела. Поведение правим описаниями
+  инструментов, а не промптом персонажа.</p>
+
+  <h3>Модели</h3>
+  <table>
+   <tr><th>Модель</th><th>Где</th><th>Для чего</th></tr>
+   <tr><td><b>Claude Haiku 5.5</b></td><td>OpenRouter</td><td>разговор с Владосом, реплики по своей инициативе и оценка
+     интереса, планировщик справок — важна скорость (~2 с)</td></tr>
+   <tr><td><b>Claude Sonnet 5.5</b></td><td>OpenRouter, в фоне</td><td>мыслитель, летописец (дневник, факты, цели),
+     пополнение шуток — никто не ждёт, важнее качество</td></tr>
+   <tr><td><b>Claude Opus 5.5</b></td><td>OpenRouter, вручную</td><td>разовая генерация шуток
+     (<code>tools/generate_jokes.py --model …</code>)</td></tr>
+   <tr><td><b>Whisper large-v3-turbo</b></td><td>локально, видеокарта</td><td>распознавание речи Владоса</td></tr>
+   <tr><td><b>XTTS-v2</b></td><td>локально, видеокарта</td><td>голос Эрика, эмоции — по референсам из диалогов игры</td></tr>
+   <tr><td><b>LipGenerator</b></td><td>локально (из Creation Kit)</td><td>движение губ (.lip) к каждой фразе — не нейросеть</td></tr>
+  </table>
+  <p>Знания о мире — не модель, а поиск (SQLite FTS5) по данным игры: экраны загрузки, люди, места, прочитанные книги.
+  Настройки моделей — <code>config.yaml</code> (<code>llm</code>, <code>stt</code>, <code>tts</code>, <code>jokes</code>),
+  ключ — <code>config.local.yaml</code>.</p>
+  <div class="files">Точка входа в логах: production_logs/2026-10-14_итоги_и_план.md; план памяти — 2026-10-15_план_памяти.md</div>` };
+
+// ------------------------------------------------------------------ рисование
+const NS = "http://www.w3.org/2000/svg";
+const el = (tag, attrs = {}, parent) => {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+};
+const cssVar = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const statusColor = s => ({ ok: "var(--ok)", new: "var(--new)", plan: "var(--plan)" })[s];
+const statusText = s => ({ ok: "работает в игре", new: "сделано, в игре не проверено", plan: "в планах" })[s];
+
+const gGroups = document.getElementById("groups"), gEdges = document.getElementById("edges");
+for (const g of GROUPS) {
+  const wrap = el("g", { "data-group": g.id, style: `--block: var(${g.color})` }, gGroups);
+  el("rect", { class: "grp-rect", x: g.x, y: g.y, width: g.w, height: g.h, rx: 16, "data-id": g.id }, wrap);
+  el("rect", { x: g.x, y: g.y, width: g.w, height: 10, rx: 5, fill: `var(${g.color})`, "pointer-events": "none" }, wrap);
+  const t = el("text", { class: "grp-title", x: g.x + 20, y: g.y + 40 }, wrap); t.textContent = g.title;
+  const s = el("text", { class: "grp-sub", x: g.x + 20, y: g.y + 62 }, wrap); s.textContent = g.sub;
+  g.kids.forEach((k, i) => {
+    const y = g.y + HEAD + i * ROW;
+    const c = el("g", { class: "chip" + (k.s === "plan" ? " plan" : ""), "data-id": k.id }, wrap);
+    el("rect", { x: g.x + 14, y, width: g.w - 28, height: ROW - 8, rx: 9 }, c);
+    el("circle", { cx: g.x + 32, cy: y + (ROW - 8) / 2, r: 5.5, fill: k.s === "plan" ? "none" : statusColor(k.s),
+      stroke: statusColor(k.s), "stroke-width": k.s === "plan" ? 1.8 : 0, "stroke-dasharray": k.s === "plan" ? "2 2" : "" }, c);
+    const kt = el("text", { x: g.x + 46, y: y + (ROW - 8) / 2 + 5 }, c); kt.textContent = k.t;
+  });
+}
+
+// Центр: фото в круге и подпись.
+{
+  const c = el("g", { class: "center", "data-id": "center" }, document.getElementById("center"));
+  const defs = document.querySelector("defs");
+  const clip = el("clipPath", { id: "photoClip" }, defs);
+  el("circle", { cx: 0, cy: 0, r: PHOTO_R }, clip);
+  el("circle", { class: "center-halo", cx: 0, cy: 0, r: PHOTO_R + 16 }, c);
+  el("image", { href: PHOTO, x: -PHOTO_R, y: -PHOTO_R, width: PHOTO_R * 2, height: PHOTO_R * 2,
+    "clip-path": "url(#photoClip)", preserveAspectRatio: "xMidYMid slice" }, c);
+  el("circle", { class: "center-ring", cx: 0, cy: 0, r: PHOTO_R }, c);
+  const t = el("text", { class: "center-title", x: 0, y: PHOTO_R + 80, "text-anchor": "middle" }, c); t.textContent = "Гослинг";
+  const st = el("text", { class: "center-sub", x: 0, y: PHOTO_R + 116, "text-anchor": "middle" }, c); st.textContent = CENTER.sub;
+}
+
+// Связи: из края одного блока к краю другого, кривой Безье; подпись — в середине. Если прямая прошла бы через
+// фото в центре — кривая огибает его снаружи.
+function anchor(g, toward) {
+  const cx = g.x + g.w / 2, cy = g.y + g.h / 2, dx = toward.x - cx, dy = toward.y - cy;
+  if (Math.abs(dx) * g.h > Math.abs(dy) * g.w) {
+    const side = dx > 0 ? 1 : -1;
+    return { x: cx + side * g.w / 2, y: Math.max(g.y + 30, Math.min(g.y + g.h - 30, cy + dy * 0.25)), nx: side, ny: 0 };
+  }
+  const side = dy > 0 ? 1 : -1;
+  return { x: Math.max(g.x + 40, Math.min(g.x + g.w - 40, cx + dx * 0.25)), y: cy + side * g.h / 2, nx: 0, ny: side };
+}
+function segDist(a, b) {  // расстояние от центра (0,0) до отрезка ab
+  const dx = b.x - a.x, dy = b.y - a.y, t = Math.max(0, Math.min(1, -(a.x * dx + a.y * dy) / (dx * dx + dy * dy)));
+  return Math.hypot(a.x + t * dx, a.y + t * dy);
+}
+const edgeEls = [];
+EDGES.forEach(([a, b, label], i) => {
+  const A = byId[a], B = byId[b];
+  const ca = { x: A.x + A.w / 2, y: A.y + A.h / 2 }, cb = { x: B.x + B.w / 2, y: B.y + B.h / 2 };
+  const pa = anchor(A, cb), pb = anchor(B, ca);
+  const reverse = EDGES.some(([x, y]) => x === b && y === a);  // встречные связи — разводим
+  const off = reverse ? (a < b ? 18 : -18) : 0;
+  const k = Math.max(70, Math.hypot(pb.x - pa.x, pb.y - pa.y) * 0.35);
+  let p1 = { x: pa.x + pa.nx * k + (pa.ny ? off : 0), y: pa.y + pa.ny * k + (pa.nx ? off : 0) };
+  let p2 = { x: pb.x + pb.nx * k + (pb.ny ? off : 0), y: pb.y + pb.ny * k + (pb.nx ? off : 0) };
+  const sa = { x: pa.x + (pa.ny ? off : 0), y: pa.y + (pa.nx ? off : 0) }, sb = { x: pb.x + (pb.ny ? off : 0), y: pb.y + (pb.nx ? off : 0) };
+  if (segDist(sa, sb) < PHOTO_R + 120) {  // через фото — огибаем: обе опоры кривой — снаружи круга, со стороны середины
+    const m = { x: (sa.x + sb.x) / 2, y: (sa.y + sb.y) / 2 }, len = Math.hypot(m.x, m.y);
+    const n = len > 40 ? { x: m.x / len, y: m.y / len } : (() => { const d = Math.hypot(sb.x - sa.x, sb.y - sa.y);
+      return { x: -(sb.y - sa.y) / d, y: (sb.x - sa.x) / d }; })();
+    const q = { x: n.x * (PHOTO_R + 560), y: n.y * (PHOTO_R + 560) };
+    p1 = { x: sa.x + (q.x - sa.x) * 0.75, y: sa.y + (q.y - sa.y) * 0.75 };
+    p2 = { x: sb.x + (q.x - sb.x) * 0.75, y: sb.y + (q.y - sb.y) * 0.75 };
+  }
+  const path = el("path", { class: "edge", d: `M${sa.x},${sa.y} C${p1.x},${p1.y} ${p2.x},${p2.y} ${sb.x},${sb.y}`,
+    "marker-end": "url(#arrow)" }, gEdges);
+  const mid = { x: 0.125 * sa.x + 0.375 * p1.x + 0.375 * p2.x + 0.125 * sb.x, y: 0.125 * sa.y + 0.375 * p1.y + 0.375 * p2.y + 0.125 * sb.y };
+  const bg = el("rect", { class: "edge-label-bg", rx: 5 }, gEdges);
+  const t = el("text", { class: "edge-label", x: mid.x, y: mid.y + 4, "text-anchor": "middle" }, gEdges);
+  t.textContent = label;
+  const box = t.getBBox();
+  bg.setAttribute("x", box.x - 6); bg.setAttribute("y", box.y - 3);
+  bg.setAttribute("width", box.width + 12); bg.setAttribute("height", box.height + 6);
+  edgeEls.push({ a, b, path, t, bg });
+});
+
+// ------------------------------------------------------------------ панорама и зум
+const svg = document.getElementById("canvas"), world = document.getElementById("world");
+let view = { x: 0, y: 0, k: 1 };
+const apply = () => world.setAttribute("transform", `translate(${view.x},${view.y}) scale(${view.k})`);
+const bounds = () => {
+  const xs = GROUPS.map(g => g.x), ys = GROUPS.map(g => g.y);  // центр (0,0) — внутри кольца
+  return { x: Math.min(...xs) - 30, y: Math.min(...ys) - 30,
+    w: Math.max(...GROUPS.map(g => g.x + g.w)) - Math.min(...xs) + 60,
+    h: Math.max(...GROUPS.map(g => g.y + g.h)) - Math.min(...ys) + 60 };
+};
+function viewFor(r, pad = 40) {
+  const W = svg.clientWidth, H = svg.clientHeight, top = 64;
+  const right = panel.classList.contains("open") && W > 700 ? Math.min(460, W * 0.45) : 0;
+  const bottom = panel.classList.contains("open") && W <= 700 ? H * 0.55 : 0;
+  const aw = W - right - pad * 2, ah = H - top - bottom - pad * 2;
+  const k = Math.max(0.08, Math.min(2.2, Math.min(aw / r.w, ah / r.h)));
+  return { k, x: pad + (aw - r.w * k) / 2 - r.x * k, y: top + pad + (ah - r.h * k) / 2 - r.y * k };
+}
+let anim = null;
+function animateTo(target, ms = 380) {
+  cancelAnimationFrame(anim);
+  const from = { ...view }, t0 = performance.now();
+  const step = now => {
+    const p = Math.min(1, (now - t0) / ms), e = p < .5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+    view = { x: from.x + (target.x - from.x) * e, y: from.y + (target.y - from.y) * e, k: from.k + (target.k - from.k) * e };
+    apply();
+    if (p < 1) anim = requestAnimationFrame(step);
+  };
+  anim = requestAnimationFrame(step);
+}
+const fit = () => animateTo(viewFor(bounds()));
+function zoomAt(factor, cx, cy) {
+  const k = Math.max(0.08, Math.min(4, view.k * factor));
+  view = { k, x: cx - (cx - view.x) * (k / view.k), y: cy - (cy - view.y) * (k / view.k) };
+  apply();
+}
+svg.addEventListener("wheel", e => {
+  e.preventDefault();
+  const r = svg.getBoundingClientRect();
+  zoomAt(Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top);
+}, { passive: false });
+
+// Перетаскивание (мышь, палец) и щипок двумя пальцами; клик — если почти не двигали.
+const pointers = new Map();
+let drag = null, pinch = null;
+svg.addEventListener("pointerdown", e => {
+  e.preventDefault();  // иначе браузер начинает выделять текст страницы, пока тащим карту
+  document.getSelection().removeAllRanges();
+  document.body.classList.add("dragging-map");
+  svg.setPointerCapture(e.pointerId);
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pointers.size === 1) drag = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y, moved: false, target: e.target };
+  if (pointers.size === 2) {
+    const [p, q] = [...pointers.values()];
+    pinch = { d: Math.hypot(p.x - q.x, p.y - q.y), k: view.k };
+    drag = null;
+  }
+});
+svg.addEventListener("pointermove", e => {
+  if (!pointers.has(e.pointerId)) return;
+  pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (pinch && pointers.size === 2) {
+    const [p, q] = [...pointers.values()], r = svg.getBoundingClientRect();
+    const d = Math.hypot(p.x - q.x, p.y - q.y);
+    zoomAt((pinch.k * d / pinch.d) / view.k, (p.x + q.x) / 2 - r.left, (p.y + q.y) / 2 - r.top);
+    return;
+  }
+  if (!drag) return;
+  const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+  if (Math.abs(dx) + Math.abs(dy) > 4) { drag.moved = true; svg.classList.add("dragging"); }
+  if (drag.moved) { view.x = drag.vx + dx; view.y = drag.vy + dy; apply(); }
+});
+const endPointer = e => {
+  pointers.delete(e.pointerId);
+  if (pointers.size < 2) pinch = null;
+  if (drag && !drag.moved && e.type === "pointerup") clickAt(drag.target);
+  if (pointers.size === 0) drag = null;
+  svg.classList.remove("dragging");
+  if (pointers.size === 0) document.body.classList.remove("dragging-map");
+};
+svg.addEventListener("pointerup", endPointer);
+svg.addEventListener("pointercancel", endPointer);
+svg.addEventListener("dblclick", e => {
+  const id = idOf(e.target);
+  if (id === "center") { select(null); fit(); }
+  else if (id) zoomToGroup(byId[id] || kidById[id].parent);
+});
+
+const idOf = t => { const n = t.closest && t.closest("[data-id]"); return n ? n.getAttribute("data-id") : null; };
+function clickAt(target) {
+  const id = idOf(target);
+  if (!id) { select(null); return; }
+  select(id);
+}
+
+// ------------------------------------------------------------------ выбор и панель
+const panel = document.getElementById("panel"), body = document.getElementById("panelBody");
+let selected = null;
+function zoomToGroup(g) {
+  animateTo(viewFor({ x: g.x - 20, y: g.y - 20, w: g.w + 40, h: g.h + 40 }, 30));
+}
+function select(id) {
+  document.querySelectorAll(".selected").forEach(n => n.classList.remove("selected"));
+  edgeEls.forEach(e => { e.path.classList.remove("hl", "dim"); e.t.classList.remove("hl-label", "dim"); e.bg.classList.remove("dim");
+    e.path.setAttribute("marker-end", "url(#arrow)"); });
+  document.querySelectorAll("[data-group]").forEach(n => n.classList.remove("dim"));
+  selected = id;
+  if (!id) { panel.classList.remove("open"); return; }
+  if (id === "center") {
+    body.innerHTML = `<h2>${CENTER.title}</h2><div class="path">${CENTER.sub}</div>${CENTER.d}
+      <div class="kids"><b>Из чего он состоит</b><br>${GROUPS.map(g => `<button data-go="${g.id}">${g.title}</button>`).join("")}</div>`;
+    body.querySelectorAll("[data-go]").forEach(b => b.addEventListener("click", () => {
+      const to = b.getAttribute("data-go"); select(to); zoomToGroup(byId[to]); }));
+    body.scrollTop = 0;
+    panel.classList.add("open");
+    animateTo(viewFor({ x: -PHOTO_R - 60, y: -PHOTO_R - 60, w: 2 * PHOTO_R + 120, h: 2 * PHOTO_R + 200 }, 30));
+    return;
+  }
+  const g = byId[id] || kidById[id].parent, kid = kidById[id];
+  const node = document.querySelector(`[data-id="${id}"]`);
+  (kid ? node.querySelector("rect") : node).classList.add("selected");
+  const linked = new Set([g.id]);
+  edgeEls.forEach(e => {
+    const on = e.a === g.id || e.b === g.id;
+    if (on) { e.path.classList.add("hl"); e.t.classList.add("hl-label"); e.path.setAttribute("marker-end", "url(#arrow-hl)"); linked.add(e.a); linked.add(e.b); }
+    else { e.path.classList.add("dim"); e.t.classList.add("dim"); e.bg.classList.add("dim"); }
+  });
+  document.querySelectorAll("[data-group]").forEach(n => { if (!linked.has(n.getAttribute("data-group"))) n.classList.add("dim"); });
+  body.innerHTML = kid ? kidHtml(kid) : groupHtml(g);
+  body.querySelectorAll("[data-go]").forEach(b => b.addEventListener("click", () => {
+    const to = b.getAttribute("data-go");
+    select(to);
+    if (byId[to]) zoomToGroup(byId[to]);
+  }));
+  const wasOpen = panel.classList.contains("open");
+  panel.classList.add("open");
+  if (!kid || !wasOpen) zoomToGroup(g);
+}
+const links = g => {
+  const out = EDGES.filter(([a]) => a === g.id).map(([, b, l]) => `→ <a data-go="${b}">${byId[b].title}</a>: ${l}`);
+  const inn = EDGES.filter(([, b]) => b === g.id).map(([a, , l]) => `← <a data-go="${a}">${byId[a].title}</a>: ${l}`);
+  return out.length + inn.length ? `<div class="links"><b>Связи</b><br>${[...out, ...inn].join("<br>")}</div>` : "";
+};
+const counts = g => {
+  const c = { ok: 0, new: 0, plan: 0 }; g.kids.forEach(k => c[k.s]++);
+  return Object.entries(c).filter(([, n]) => n).map(([s, n]) =>
+    `<span class="status" style="border-color:${statusColor(s)}"><span class="dot" style="background:${statusColor(s)}"></span>${statusText(s)}: ${n}</span>`).join(" ");
+};
+function groupHtml(g) {
+  return `<h2 style="border-left:6px solid var(${g.color});padding-left:10px">${g.title}</h2><div class="path">${g.sub || "&nbsp;"}</div>${counts(g)}${g.d}
+    <div class="kids"><b>Части</b><br>${g.kids.map(k => `<button data-go="${k.id}">
+      <span class="dot" style="background:${k.s === "plan" ? "transparent" : statusColor(k.s)};${k.s === "plan" ? "border:1.5px dashed var(--plan)" : ""}"></span>${k.t}</button>`).join("")}</div>
+    ${g.files ? `<div class="files">Файлы: ${g.files}</div>` : ""}${links(g)}`;
+}
+function kidHtml(k) {
+  const g = k.parent;
+  return `<h2 style="border-left:6px solid var(${g.color});padding-left:10px">${k.t}</h2><div class="path"><a data-go="${g.id}" style="color:var(--sel);cursor:pointer">${g.title}</a></div>
+    <span class="status" style="border-color:${statusColor(k.s)}"><span class="dot" style="background:${k.s === "plan" ? "transparent" : statusColor(k.s)}"></span>${statusText(k.s)}</span>
+    ${k.d}${g.files ? `<div class="files">Файлы блока: ${g.files}</div>` : ""}`;
+}
+
+// ------------------------------------------------------------------ кнопки, поиск, тема
+const center = () => ({ x: svg.clientWidth / 2, y: svg.clientHeight / 2 });
+document.getElementById("zoomIn").onclick = () => { const c = center(); zoomAt(1.3, c.x, c.y); };
+document.getElementById("zoomOut").onclick = () => { const c = center(); zoomAt(1 / 1.3, c.x, c.y); };
+document.getElementById("fit").onclick = () => { select(null); fit(); };
+document.getElementById("close").onclick = () => select(null);
+document.getElementById("about").onclick = () => select("center");
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT") return;
+  if (e.key === "Escape") { select(null); fit(); }
+  if (e.key === "+" || e.key === "=") { const c = center(); zoomAt(1.3, c.x, c.y); }
+  if (e.key === "-") { const c = center(); zoomAt(1 / 1.3, c.x, c.y); }
+});
+const search = document.getElementById("search");
+search.addEventListener("input", () => {
+  const q = search.value.trim().toLowerCase();
+  document.querySelectorAll(".match").forEach(n => n.classList.remove("match"));
+  if (q.length < 2) return;
+  const hits = [];
+  for (const g of GROUPS) {
+    if ((g.title + " " + g.sub + " " + g.d).toLowerCase().includes(q)) hits.push(g.id);
+    for (const k of g.kids) if ((k.t + " " + k.d).toLowerCase().includes(q)) {
+      hits.push(k.id); document.querySelector(`[data-id="${k.id}"]`).classList.add("match");
+    }
+  }
+  const first = hits.find(id => kidById[id]) || hits[0];
+  if (first) { const g = byId[first] || kidById[first].parent; zoomToGroup(g); }
+});
+search.addEventListener("keydown", e => {
+  if (e.key !== "Enter") return;
+  const m = document.querySelector(".match");
+  if (m) select(m.getAttribute("data-id"));
+});
+const root = document.documentElement;
+try { const saved = localStorage.getItem("gosling-theme"); if (saved) root.dataset.theme = saved; } catch (e) {}
+document.getElementById("theme").onclick = () => {
+  const dark = root.dataset.theme ? root.dataset.theme === "dark" : matchMedia("(prefers-color-scheme: dark)").matches;
+  root.dataset.theme = dark ? "light" : "dark";
+  try { localStorage.setItem("gosling-theme", root.dataset.theme); } catch (e) {}
+};
+window.addEventListener("resize", () => { if (!selected) view = viewFor(bounds()), apply(); });
+
+view = viewFor(bounds());
+apply();
+</script>
+</body>
+</html>

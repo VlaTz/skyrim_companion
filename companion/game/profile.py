@@ -139,6 +139,12 @@ class PlayerProfile:
             lines.append("По делам: " + ", ".join(f"{label} {v}" for v, label in habits[:MAX_HABITS]) + ".")
         return " ".join(lines)
 
+    def guilds(self) -> set[str]:
+        """Где Владос состоит («Гильдия воров», «Соратники», …) — по последнему профилю."""
+        with self._lock:
+            data = dict(self.data)
+        return set(self._guilds(data))
+
     # ------------------------------------------------------------ разбор
 
     def _guilds(self, data: dict) -> dict[str, str | None]:

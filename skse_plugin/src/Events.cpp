@@ -79,6 +79,15 @@ namespace events
 		bool              lockpicking = false;  // открыто меню взлома замка
 		Clock::time_point lockpickClosed{};
 
+		// Обмен вещами с Гослингом: игрок перекладывает пачкой — копим и шлём одним событием через kExchangeQuiet.
+		struct Exchange
+		{
+			std::map<RE::FormID, int> given;  // базовый предмет -> сколько игрок отдал Гослингу
+			std::map<RE::FormID, int> taken;  // и сколько забрал у него
+			Clock::time_point         lastAt{};
+		} exchange;
+		constexpr auto kExchangeQuiet = 2s;
+
 		void Post(std::string_view a_type, json a_data = json::object())
 		{
 			net::Post({ { "type", a_type }, { "data", std::move(a_data) } });
@@ -295,6 +304,29 @@ namespace events
 				{ "unique", IsUnique(actor) } };
 		}
 
+		// Ссылка с этим номером — NPC Гослинг.
+		bool IsGoslingId(RE::FormID a_id)
+		{
+			return a_id && voice::IsGosling(RE::TESForm::LookupByID<RE::TESObjectREFR>(a_id));
+		}
+
+		// Предмет для сервиса: название, сколько, книга ли; файл и номер — по ним сервис найдёт текст книги.
+		json ItemsJson(const std::map<RE::FormID, int>& a_items)
+		{
+			json out = json::array();
+			for (const auto& [id, count] : a_items) {
+				const auto form = RE::TESForm::LookupByID(id);
+				const auto file = form ? form->GetFile(0) : nullptr;
+				if (auto name = Name(form); count > 0 && !name.empty()) {
+					out.push_back({ { "name", std::move(name) }, { "count", count },
+						{ "book", form->GetFormType() == RE::FormType::Book },
+						{ "file", file ? std::string(file->GetFilename()) : std::string{} },
+						{ "form", form->GetLocalFormID() } });
+				}
+			}
+			return out;
+		}
+
 		// Раз в kTick, в игровом потоке.
 		void Tick()
 		{
@@ -319,6 +351,14 @@ namespace events
 				playerDirty = true;
 				profileDirty = true;
 				forceStatus = true;
+			}
+
+			if ((!exchange.given.empty() || !exchange.taken.empty()) && Clock::now() - exchange.lastAt >= kExchangeQuiet) {
+				auto given = ItemsJson(exchange.given);
+				auto taken = ItemsJson(exchange.taken);
+				logs::info("Обмен с Гослингом: отдал {}, забрал {}", given.size(), taken.size());
+				exchange = {};
+				Post("gosling_items", { { "given", std::move(given) }, { "taken", std::move(taken) } });
 			}
 
 			if (questsDirty) {
@@ -473,6 +513,15 @@ namespace events
 					return RE::BSEventNotifyControl::kContinue;
 				}
 				const auto dying = a_event->actorDying.get();
+				if (dying == player) {
+					// Владос погиб: кто убил (нет убийцы — упал, утонул, ловушка). Гослинг вспомнит после загрузки.
+					const auto killer = a_event->actorKiller ? a_event->actorKiller.get() : nullptr;
+					const auto actor = killer ? killer->As<RE::Actor>() : nullptr;
+					logs::info("Игрок погиб: {}", killer ? Name(killer) : std::string{ "без убийцы" });
+					Post("player_died", { { "killer", Name(killer) },
+						{ "race", RaceOf(actor) }, { "unique", IsUnique(actor) } });
+					return RE::BSEventNotifyControl::kContinue;
+				}
 				const bool byPlayer = a_event->actorKiller && a_event->actorKiller.get() == player;
 				if (dying != player && (byPlayer || player->GetDistance(dying) < kNearbyRadius)) {
 					const auto actor = dying->As<RE::Actor>();
@@ -497,6 +546,16 @@ namespace events
 				if (a_event && (a_event->newContainer == kPlayerRef || a_event->oldContainer == kPlayerRef)) {
 					playerDirty = true;
 				}
+				// Игрок отдал Гослингу или забрал у него (меню обмена со спутником, «отдать»).
+				if (inGame && a_event && a_event->baseObj && a_event->itemCount > 0) {
+					if (a_event->oldContainer == kPlayerRef && IsGoslingId(a_event->newContainer)) {
+						exchange.given[a_event->baseObj] += a_event->itemCount;
+						exchange.lastAt = Clock::now();
+					} else if (a_event->newContainer == kPlayerRef && IsGoslingId(a_event->oldContainer)) {
+						exchange.taken[a_event->baseObj] += a_event->itemCount;
+						exchange.lastAt = Clock::now();
+					}
+				}
 				// Событие для мозга — только подобранное с земли (не из сундуков, не покупки).
 				if (inGame && a_event && a_event->newContainer == kPlayerRef && a_event->oldContainer == 0 &&
 					a_event->reference) {
@@ -519,6 +578,17 @@ namespace events
 					lockpicking = a_event->opening;
 					if (!a_event->opening) {
 						lockpickClosed = Clock::now();
+					}
+				}
+				// Игрок открыл книгу (из сумки или с полки): какую — из глобальной переменной меню книги (чтение поля
+				// по Address Library, не вызов функции). Текст сервис возьмёт из файлов игры.
+				if (inGame && a_event && a_event->opening && a_event->menuName == RE::BookMenu::MENU_NAME) {
+					const auto book = RE::BookMenu::GetTargetForm();
+					const auto file = book ? book->GetFile(0) : nullptr;
+					logs::info("Книга открыта: {}", book ? Name(book) : std::string{ "не узнать" });
+					if (book && file && book->GetFormType() == RE::FormType::Book) {
+						Post("book_read", { { "name", Name(book) }, { "file", std::string(file->GetFilename()) },
+							{ "form", book->GetLocalFormID() } });
 					}
 				}
 				// Пока игрок говорит с NPC, Гослинг не встревает — сервис ждёт конца разговора.
@@ -626,9 +696,8 @@ namespace events
 					case RE::FormType::Container:
 						kind = "container";
 						break;
-					case RE::FormType::Book:
-						kind = "book";
-						break;
+					case RE::FormType::Book:  // читает — придёт book_read из меню книги; второе событие не нужно
+						return RE::BSEventNotifyControl::kContinue;
 					case RE::FormType::Furniture:
 						kind = "furniture";
 						break;
