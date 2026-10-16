@@ -19,10 +19,12 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from typing import Callable
 
 from companion.game.books import book_key
+from companion.knowledge import stems
 from companion.game.places import PlaceBook
 from companion.game.state import HEARD_SECONDS, Change, GameEvent, GameState, Heard
 from companion.memory.store import MemoryStore, Where, memory_key
@@ -34,6 +36,10 @@ DIARY_IN_PROMPT = 3   # последних записей дневника — �
 MAX_FACTS = 8         # фактов о месте и людях рядом — в «Сейчас в игре»
 GOAL_TITLES = {"goal": "Цели", "promise": "Договорённости", "player": "Что ты знаешь о Владосе"}
 NOW_DAYS = 0.05       # ~1 игровой час: «сейчас здесь», а не «бывали»
+# Справка recall: сколько строк из каждого раздела памяти (по порядку вывода) и длина строки журнала.
+RECALL_LIMITS = {"дневник": 3, "факты": 4, "цели и договорённости": 2, "журнал": 6}
+RECALL_LINE = 220
+RECALL_OWN = 2  # своих реплик в ответе — не больше: три его же «Лукан работает у Белетора» модель повторяла
 MEET_AGAIN = 600      # с: та же встреча (бой идёт, дракон кружит) — не новая
 
 
@@ -196,6 +202,8 @@ class MemoryKeeper:
             for name, first, _last in self.visits():
                 if name == area and self._days - first > NOW_DAYS:
                     parts.append(f"Вы уже бывали здесь вместе: впервые {days_ago(self._days - first)}.")
+                    if before := self._place_diary(area):  # память о месте при входе — не только «бывали»
+                        parts.append(before)
                     break
         if facts := self._facts_here(location):
             parts.append("Что ты сам узнал об этом месте и людях рядом:\n" + "\n".join(facts))
@@ -221,6 +229,70 @@ class MemoryKeeper:
         found = [f"- {subject}: {text}" + (f" ({source})" if source else "")
                  for subject, text, source in self.store.facts() if relevant(subject, text)]
         return found[-MAX_FACTS:]
+
+    # ------------------------------------------------------------ вспоминание
+
+    def recall(self, query: str) -> str:
+        """Справка recall: что было в вашем общем прошлом по запросу — дневник, факты, цели (и закрытые), журнал
+        (реплики, события, подслушанное). Всё — этой ветки сейва. Основы слов запроса — как в базе знаний; выше —
+        больше совпавших слов, при равенстве — свежее."""
+        if not self.store.is_open:
+            return "Память ещё не открыта — вспомнить нечего."
+        words = stems(query)
+        if not words:
+            return "Не понял, что вспомнить: назови место, человека, вещь или дело."
+        pats = [re.compile(r"(?<!\w)" + re.escape(w)) for w in words]
+
+        def hits(*texts: str | None) -> int:
+            low = " ".join(t for t in texts if t).casefold()
+            return sum(bool(p.search(low)) for p in pats)
+
+        def when(days: float | None, place: str | None) -> str:
+            ago = days_ago(self._days - days) if days is not None and self._days is not None else "?"
+            return f"{ago}, {place}" if place else ago
+
+        found: list[tuple[int, float, str, str]] = []  # (совпало слов, дата, раздел, строка)
+        for days, place, text in self.store.all_diary():
+            if n := hits(text, place):
+                found.append((n, days or 0, "дневник", f"[{when(days, place)}] {text}"))
+        for subject, text, source in self.store.facts():
+            if n := hits(subject, text):
+                found.append((n, 0, "факты", f"{subject}: {text}" + (f" ({source})" if source else "")))
+        for days, kind, text, status in self.store.all_goals():
+            if n := hits(text):
+                state = {"done": "сделано", "dropped": "отменено"}.get(status, "в силе")
+                found.append((n, days or 0, "цели и договорённости", f"{text} ({state})"))
+        for days, kind, text, place in self.store.journal_all():
+            if n := hits(text):
+                # Свои реплики — не факт: Гослинг мог ошибиться («Лукан работает в «Товарах Белетора»»), а найденное
+                # модель повторяет. Помечаем и ставим ниже остального при равных совпадениях.
+                who = {"player": f"{self.game.player_name}: «{text}»", "gosling": f"ты говорил (мог ошибаться): «{text}»",
+                       "heard": f"слышал: {text}"}.get(kind, text)
+                found.append((n - 0.5 * (kind == "gosling"), days or 0, "журнал",
+                              f"[{when(days, place)}] {who[:RECALL_LINE]}"))
+        if not found:
+            return (f"О «{query}» в твоей памяти ничего нет — этого не было или ты не помнишь. Так и скажи, "
+                    "не выдумывай.")
+        found.sort(key=lambda f: (-f[0], -f[1]))
+        out: dict[str, list[str]] = {}
+        own = 0
+        for _n, _d, part, line in found:
+            mine = "ты говорил (мог ошибаться)" in line
+            if len(out.setdefault(part, [])) < RECALL_LIMITS[part] and not (mine and own >= RECALL_OWN):
+                out[part].append(line)
+                own += mine
+        return ("Что ты помнишь (ваше общее прошлое по памяти; чего тут нет — того ты не помнишь, не выдумывай):\n"
+                + "\n".join(f"{part}:\n" + "\n".join(f"- {line}" for line in lines)
+                            for part in RECALL_LIMITS if (lines := out.get(part))))
+
+    def _place_diary(self, area: str) -> str:
+        """Что было в этом поселении в прошлый раз — последняя запись дневника о нём (не о нынешнем визите)."""
+        if self._days is None:
+            return ""
+        for days, place, text in reversed(self.store.all_diary()):
+            if place and days is not None and self._days - days > NOW_DAYS and self._area(place.split(", ")[0]) == area:
+                return f"Что было здесь в прошлый раз ({days_ago(self._days - days)}, твой дневник): {text}"
+        return ""
 
     def memory_context(self) -> str:
         """{memory} системного промпта. Пусто — память ещё не открыта или вспомнить нечего."""

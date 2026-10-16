@@ -326,9 +326,20 @@ namespace voice
 			return nullptr;
 		}
 		const bool loaded = !actor->IsDisabled() && actor->Is3DLoaded();
-		return { { "loaded", loaded },
+		json out = { { "loaded", loaded },
 			{ "distance", loaded ? a_player->GetDistance(actor) / kUnitsPerMeter : -1.0f },
 			{ "follower", actor->IsPlayerTeammate() } };
+		// Своё здоровье: как у игрока (значение и максимум), «упал без сил» — состояние спутника, которого почти добили
+		// (поле состояния актёра, не функция по адресу), мёртв.
+		if (loaded) {
+			const float maxHealth = actor->GetActorValueMax(RE::ActorValue::kHealth);
+			if (maxHealth > 0.0f) {
+				out["health"] = std::clamp(actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kHealth) / maxHealth, 0.0f, 1.0f);
+			}
+			out["bleedout"] = actor->AsActorState()->IsBleedingOut();
+			out["dead"] = actor->IsDead();
+		}
+		return out;
 	}
 
 	void HandleCommand(const json& a_command)

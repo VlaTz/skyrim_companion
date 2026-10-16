@@ -126,7 +126,7 @@ class BrainConfig(BaseModel):
     events: list[str] = [
         "loaded", "location", "wilderness", "interior", "combat_started", "combat_ended", "low_health", "item",
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
-        "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift",
+        "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "hurt_self",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился

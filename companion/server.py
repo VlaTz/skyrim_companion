@@ -144,13 +144,13 @@ def create_app(cfg: Config) -> FastAPI:
         service.start_push_to_talk()
         state["voice"] = service
         if service.llm:
-            service.llm.set_tools(build_tools(game, places, knowledge))
+            service.llm.set_tools(build_tools(game, places, knowledge, memory))
             asyncio.get_running_loop().run_in_executor(None, knowledge.search, "Скайрим")  # собрать заранее, ~1 с
             llm = service.llm
             llm.events_since = game.events_since
             memory.on_open = lambda: llm.restore(memory.store.last_dialogue(cfg.llm.history_turns))
             diarist = Diarist(memory.store, llm.complete_json, cfg.diarist,
-                              player_name=lambda: memory.store.player_name)
+                              player_name=lambda: memory.store.player_name, knowledge=knowledge)
             memory.on_place_changed = diarist.place_changed
             diarist.start()
         if cfg.brain.enabled and service.llm:

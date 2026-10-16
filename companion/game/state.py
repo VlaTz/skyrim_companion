@@ -109,6 +109,7 @@ QUEST_FRESH = 1800     # задание, менявшееся за полчас�
 DEATH_BEFORE = 300     # секунд «Недавно» перед гибелью — что пошло не так (бой, ранение)
 DEATH_LINES = 4        # строк из них — не больше
 BOOK_EXCERPT = 600     # знаков начала отданной книги — мозгу, чтобы было о чём сказать
+READING_EXCERPT = 250  # знаков начала книги, которую читает Владос, — в повод (без него модель гадала о содержании)
 
 # Игровая статистика -> событие для «Недавно» и мозга: (вид, текст, важное). Событие статистики игра шлёт,
 # когда счётчик растёт, — то есть ровно в момент поступка.
@@ -198,6 +199,9 @@ class GoslingStatus(BaseModel):
     loaded: bool = False
     distance: float = -1  # метров до игрока; -1 — не загружен
     follower: bool = False
+    health: float | None = None  # своё здоровье 0..1 (только когда загружен)
+    bleedout: bool = False       # упал без сил — спутника почти добили
+    dead: bool = False
 
 
 class Partner(BaseModel):
@@ -341,8 +345,9 @@ class GameState:
                     self._left = None
                     self.in_dialogue = False
                 changes = self._describe_event(event)
-            # Реплики NPC — в своём списке (heard), иначе в городе вытеснят из «Недавно» всё остальное.
-            self.recent.extend((self.updated, c) for c in changes if c.kind != "overheard")
+            # Реплики NPC — в своём списке (heard), иначе в городе вытеснят из «Недавно» всё остальное; записи журнала
+            # заданий — только в память (длинные; цели и так в «Сейчас в игре»).
+            self.recent.extend((self.updated, c) for c in changes if c.kind not in ("overheard", "quest_log"))
             return changes
 
     def _apply_stat(self, name: str, value: int) -> list[Change]:
@@ -434,6 +439,16 @@ class GameState:
         if (new.health is not None and new.health < LOW_HEALTH
                 and (old.health is None or old.health >= LOW_HEALTH)):
             changes.append(Change("low_health", "игрок тяжело ранен"))
+        # Своё здоровье Гослинга: тяжело ранен, упал без сил — срочные поводы, как ранение игрока.
+        og, ng = old.gosling, new.gosling
+        if ng and ng.loaded and not ng.dead:
+            if ng.bleedout and not (og and og.bleedout):
+                changes.append(Change("hurt_self", "ты, Гослинг, упал без сил — тебя самого почти добили, драться ты не можешь",
+                                      important=True))
+            elif (ng.health is not None and ng.health < LOW_HEALTH and not ng.bleedout
+                  and (og is None or og.health is None or og.health >= LOW_HEALTH)):
+                changes.append(Change("hurt_self", f"ты, Гослинг, сам тяжело ранен — твоё здоровье {round(ng.health * 100)}%",
+                                      important=True))
         # Знакомый был мирным — и стал врагом (Арвел вырвался из паутины и напал). Из «рядом» и из собеседника.
         was_peaceful = {n.name for n in old.nearby or [] if not n.hostile and not n.dead}
         if old.partner and not old.partner.hostile and not old.partner.dead and not old.partner.gone:
@@ -539,8 +554,14 @@ class GameState:
                                important=True)]
             case "book_read":
                 name = str(d.get("name") or "?")
-                return [Change("reading", f"Владос читает книгу «{name}» — ты её теперь тоже знаешь (читал через "
-                                          "плечо)", subject=f"книга: {name}")]
+                # «Через плечо» модель поняла как «краем глаза, не помню» и справку не звала (2026-10-16): говорим
+                # прямо, где содержание.
+                # И начало текста: на сам повод модель отвечает без справок и гадала о содержании («Ловушка Судьбы —
+                # роман про шпионов»).
+                book = self.books.get(str(d.get("file", "")), int(d.get("form", 0))) if self.books else None
+                start = f"; начало: «{book.text[:READING_EXCERPT].rsplit(' ', 1)[0]}…»" if book else ""
+                return [Change("reading", f"Владос читает книгу «{name}» — ты читал вместе с ним; что в ней, "
+                                          f"вспомнишь справкой world_info («{name}»){start}", subject=f"книга: {name}")]
             case "gosling_items":
                 return self._exchange(d)
             case "item_picked":
@@ -558,9 +579,9 @@ class GameState:
         taken = [r for r in d.get("taken") or [] if r.get("name")]
         parts = []
         if given:
-            parts.append(f"Владос отдал тебе: {items(given)}")
+            parts.append(f"Владос отдал тебе — теперь это у тебя в сумке: {items(given)}")
         if taken:
-            parts.append(f"Владос забрал у тебя: {items(taken)}")
+            parts.append(f"Владос забрал у тебя — теперь это у него: {items(taken)}")
         if not parts:
             return []
         text = "; ".join(parts)
@@ -659,6 +680,9 @@ class GameState:
                 player.append("крадётся")
             if player:
                 lines.append("Игрок: " + ", ".join(player) + ".")
+            if (g := s.gosling) and g.loaded and g.health is not None:  # своё — чтобы знал, что ранен и он
+                lines.append("Ты сам (Гослинг): " + ("упал без сил — тебя почти добили" if g.bleedout
+                                           else f"здоровье {round(g.health * 100)}%") + ".")
             if s.in_combat is not None:
                 lines.append("Сейчас идёт бой!" if s.in_combat else "Боя нет.")
             if s.nearby:

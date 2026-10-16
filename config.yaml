@@ -128,14 +128,14 @@ brain:
   # поручения), cleared (подземелье зачищено), crime, talk (уговорил/подкупил/запугал), deed (взлом, заклинание),
   # activated (рычаг, столб загадки), unlocked (отпер ключом), reading (Владос читает книгу), looted (сундук, тело),
   # furniture (верстак, кровать), novel (впервые видите такое существо), threat (вдали враг-нелюдь),
-  # gift (Владос отдал тебе вещи или забрал; отданную книгу ты читаешь),
+  # gift (Владос отдал тебе вещи или забрал; отданную книгу ты читаешь), hurt_self (ты сам тяжело ранен / упал без сил),
   # thought (мысль, которую мыслитель велел сказать сейчас, — говорит без оценки; мысли «при случае» —
   # на долгую тишину), died (Владос погиб и загрузил сохранение — вместо loaded).
   # Нет в списке — только в «Недавно» (killed: убитые враги — в сводке боя; talked: заговорил с NPC).
   # Пока Владос мёртв (до загрузки), Гослинг сам не заговаривает.
   events: [loaded, location, wilderness, interior, combat_started, combat_ended, low_health, item, discovered, profile,
            power, person, quest, quest_misc, cleared, crime, talk, deed, activated, unlocked, reading, looted, furniture,
-           novel, threat, thought, died, gift]
+           novel, threat, thought, died, gift, hurt_self]
   overheard_quiet: 3  # секунд без новых реплик NPC — разговор закончился, можно решать (и игрок вышел из меню разговора)
 
 # Летописец: по журналу пишет дневник, факты и цели (фоновая модель llm.background_model). Глава кончилась, когда:

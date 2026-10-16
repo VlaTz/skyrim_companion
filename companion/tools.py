@@ -8,11 +8,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from companion.game.places import PlaceBook
 from companion.game.state import GameState
 from companion.knowledge import Knowledge
+
+if TYPE_CHECKING:  # память импортирует состояние игры — только для подсказок типов
+    from companion.memory.keeper import MemoryKeeper
 
 
 @dataclass
@@ -38,7 +41,8 @@ def place_info(places: PlaceBook, name: str) -> str:
     return f"Места «{name}» не знаю."
 
 
-def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Knowledge | None = None) -> list[Tool]:
+def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Knowledge | None = None,
+                memory: MemoryKeeper | None = None) -> list[Tool]:
     tools = [
         Tool(
             name="find_places",
@@ -117,13 +121,34 @@ def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Kno
                 "живёт, кем работает), что за место, боги и даэдра, народы, история, война, фракции, существа, "
                 "а ещё что написано в книгах и записках, которые вы прочитали (Владос или ты сам). "
                 "Вызывай, когда спрашивают о людях, местах или мире, а этого нет в «Сейчас в игре», — и отвечай по "
-                "справке, своими словами. Чего в справке нет — того ты не знаешь: так и скажи, не выдумывай."),
+                "справке, своими словами. Спросили о прочитанной книге или записке («о чём она?», «что там "
+                "написано?») — вызывай с её названием: содержание только здесь, по памяти ты его не перескажешь. "
+                "Чего в справке нет — того ты не знаешь: так и скажи, не выдумывай."),
             parameters={
                 "type": "object",
                 "properties": {"query": {"type": "string", "description": (
-                    "О чём вспомнить: имя, место или тема — «Лукан», «Седобородые», «двемеры», «Талмор».")}},
+                    "О чём вспомнить: имя, место, тема или название книги — «Лукан», «Седобородые», «двемеры», "
+                    "«Кошки Скайрима».")}},
                 "required": ["query"],
             },
             handler=lambda query="": knowledge.answer(query),
+        ))
+    if memory:
+        tools.append(Tool(
+            name="recall",
+            description=(
+                "Вспомнить ваше общее с Владосом прошлое: где вы были, что делали, что говорили ты и он, что слышали от "
+                "людей, что узнали, о чём договорились, что ты ему уже предлагал и что он ответил. Вызывай, когда "
+                "Владос спрашивает «помнишь…?», «где мы…?», «что сказал…?», «что мы делали в…?», «я тебе говорил…» "
+                "— или тебе нужно проверить, было ли что-то. Отвечай по найденному; чего не нашлось — того ты не "
+                "помнишь: так и скажи, не выдумывай. О мире вообще (люди, места, книги) — это world_info."),
+            parameters={
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": (
+                    "Что вспомнить — ключевые слова: место, человек, вещь, дело: «золотой коготь», «Ветреный пик», "
+                    "«Лукан», «дракон у башни».")}},
+                "required": ["query"],
+            },
+            handler=lambda query="": memory.recall(query),
         ))
     return tools

@@ -64,7 +64,7 @@ CREATE TABLE IF NOT EXISTS goals (
     game_days REAL,
     kind      TEXT NOT NULL,      -- goal (цель) | promise (договорённость) | player (о Владосе) | idea (мысль)
     text      TEXT NOT NULL,
-    status    TEXT DEFAULT 'active',  -- active | done | dropped
+    status    TEXT DEFAULT 'active',  -- active | done | dropped | said (мысль высказана вслух)
     archived  INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS encounters (
@@ -280,6 +280,40 @@ class MemoryStore:
     def close_goal(self, goal_id: int, status: str) -> None:
         if status in ("done", "dropped"):
             self._write("UPDATE goals SET status = ? WHERE id = ?", (status, goal_id))
+
+    def mark_idea_said(self, text: str) -> None:
+        """Мысль высказана вслух: из «Твоих мыслей» — вон (иначе модель твердит её снова: «зовёшь в конюшню»),
+        мыслитель видит её в «уже сказал»."""
+        self._write("UPDATE goals SET status = 'said' WHERE kind = 'idea' AND status = 'active' AND text = ?", (text,))
+
+    def said_ideas(self, count: int) -> list[str]:
+        """Последние высказанные мысли, свежие первыми."""
+        return [text for (text,) in self._rows(
+            "SELECT text FROM goals WHERE archived = 0 AND kind = 'idea' AND status = 'said' ORDER BY id DESC LIMIT ?",
+            (count,))]
+
+    # ------------------------------------------------------------ вспоминание (справка recall)
+
+    def all_diary(self) -> list[tuple[float | None, str | None, str]]:
+        """Весь дневник: (игровая дата, место, текст), старые первыми."""
+        return self._rows("SELECT game_days, place, text FROM diary WHERE archived = 0 ORDER BY id")
+
+    def all_goals(self) -> list[tuple[float | None, str, str, str]]:
+        """Цели, договорённости, что знает о Владосе — и закрытые: (игровая дата, вид, текст, статус)."""
+        return self._rows("SELECT game_days, kind, text, status FROM goals WHERE archived = 0 AND kind != 'idea' "
+                          "ORDER BY id")
+
+    def journal_all(self) -> list[tuple[float | None, str, str, str | None]]:
+        """Весь журнал этой ветки: (игровая дата, вид, текст, место), старые первыми."""
+        return self._rows("SELECT game_days, kind, text, place FROM journal WHERE archived = 0 ORDER BY id")
+
+    def facts_with_ids(self) -> list[tuple[int, str, str, str | None]]:
+        """(id, о чём, факт, откуда) — для сверки с данными игры."""
+        return self._rows("SELECT id, subject, text, source FROM facts WHERE archived = 0 ORDER BY id")
+
+    def retire_fact(self, fact_id: int) -> None:
+        """Факт не сходится с данными игры — убрать (archived = 2: не «будущее», а неверное; не стирается)."""
+        self._write("UPDATE facts SET archived = 2 WHERE id = ?", (fact_id,))
 
     # ------------------------------------------------------------ встречи
 

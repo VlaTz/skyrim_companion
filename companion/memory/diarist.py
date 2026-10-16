@@ -51,13 +51,48 @@ def game_time(days: float | None) -> str:
     return f"день {int(days) + 1}, {int(hours):02d}:{int(hours % 1 * 60):02d}"
 
 
+VERIFY_SYSTEM = """Ты сверяешь заметки Гослинга о Скайриме с данными игры. Данные игры всегда верны, но неполны.
+Заметка неверна, только если данные прямо говорят иное о том же самом. Пример: заметка «Лукан работает в «Товарах
+Белетора» в Вайтране», данные «Лукан Валерий — торговец; Галантерея Лукана, Ривервуд» — неверна.
+Не противоречие (заметка верна): человека, события или слуха в данных нет; данные молчат о направлении, дороге,
+расстоянии; в заметке не сказано, о чём говорят данные (например, владение); это чьи-то слова или слухи — данные о
+них молчат; формулировка другая, а суть та же. Сомневаешься — заметка верна.
+Отвечай строго одним JSON-объектом без пояснений и markdown:
+{"wrong": [номера неверных], "why": {"номер": "что именно в данных говорит иное, коротко"}}"""
+VERIFY_EVIDENCE = 4      # записей базы знаний на заметку
+VERIFY_CHARS = 500       # знаков записи базы знаний
+
+
+def verify_facts(facts: list[tuple[str, str]], knowledge, complete: Callable[..., dict | None]) -> dict[int, str]:
+    """Какие заметки (о чём, что) противоречат данным игры: {номер с 0: почему}. Данные — поиск по базе знаний
+    (люди, места, общеизвестное; companion/knowledge.py). Ни для одной заметки данных нет — модель не спрашиваем."""
+    blocks, any_evidence = [], False
+    for i, (subject, text) in enumerate(facts, 1):
+        # Сначала — о ком/о чём заметка, потом — по всему тексту: иначе на «Лукан работает в «Товарах Белетора»» данные
+        # были про лавку и Вайтран, а запись о самом Лукане до сверки не доходила.
+        found = knowledge.search(subject, VERIFY_EVIDENCE) + knowledge.search(f"{subject} {text}", VERIFY_EVIDENCE)
+        evidence = list(dict.fromkeys(t for kind, t in found if not kind.startswith("book")))[:VERIFY_EVIDENCE + 2]
+        any_evidence |= bool(evidence)
+        blocks.append(f"{i}. {subject}: {text}\nДанные игры:\n"
+                      + ("\n".join(f"- {t[:VERIFY_CHARS]}" for t in evidence) or "- нет"))
+    if not any_evidence:
+        return {}
+    result = complete(VERIFY_SYSTEM, "\n\n".join(blocks), title=f"Сверка фактов: {len(facts)}")
+    if not isinstance(result, dict):
+        return {}
+    why = {str(k): str(v) for k, v in (result.get("why") or {}).items()}
+    return {int(n) - 1: why.get(str(n), "") for n in result.get("wrong") or []
+            if str(n).isdigit() and 1 <= int(n) <= len(facts)}
+
+
 class Diarist:
     def __init__(self, store: MemoryStore, complete: Callable[..., dict | None], cfg: DiaristConfig | None = None,
-                 player_name: Callable[[], str] = lambda: "Владос"):
+                 player_name: Callable[[], str] = lambda: "Владос", knowledge=None):
         self.cfg = cfg or DiaristConfig()
         self.store = store
         self.complete = complete
         self.player_name = player_name
+        self.knowledge = knowledge  # companion.knowledge.Knowledge — новые факты сверяем с данными игры
         self._wake = threading.Event()
         self._place_changed = False
         self._pending_since: float | None = None  # когда заметили первую неописанную запись
@@ -127,6 +162,14 @@ class Diarist:
         where = Where(spoken[4] or "", last[1])
         self.store.add_diary(str(result["diary"]).strip(), where, journal_to=last[0])
         new_facts = [f for f in result.get("facts") or [] if isinstance(f, dict)]
+        if self.knowledge and new_facts:
+            # Летописец закреплял выдумки из разговора («Лукан в лавке Белетора») — сверяем с данными игры.
+            wrong = verify_facts([(str(f.get("subject", "")), str(f.get("text", ""))) for f in new_facts],
+                                 self.knowledge, self.complete)
+            for i, why in wrong.items():
+                log.info("Летописец: факт не сходится с данными игры — не записываю: %s: %s (%s)",
+                         new_facts[i].get("subject"), new_facts[i].get("text"), why)
+            new_facts = [f for i, f in enumerate(new_facts) if i not in wrong]
         for f in new_facts:
             self.store.add_fact(str(f.get("subject", "")), str(f.get("text", "")), str(f.get("source", "")), where)
         new_goals = [g for g in result.get("goals_new") or [] if isinstance(g, dict) and g.get("kind") in GOAL_KINDS]

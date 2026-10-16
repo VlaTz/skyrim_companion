@@ -90,6 +90,7 @@ class Knowledge:
         self.places = places
         self.books = books
         self._read: dict[str, str] = {}  # прочитанные в этой ветке сейва: ключ книги -> кто (владос | гослинг)
+        self._chunk_pos: dict[tuple[str, str], int] = {}  # (название, кусок) -> номер куска в книге
         self._lock = threading.Lock()
         self._db: sqlite3.Connection | None = None
         self._titles: list[tuple[str, tuple[str, str, str]]] = []  # (название в нижнем регистре, запись)
@@ -131,10 +132,12 @@ class Knowledge:
                      + (kind == "lore" or kind in BOOK_KINDS))  # при прочих равных — объяснение и прочитанное,
             #                                                       а не перечень руин
             if any(a or b for a, b in hits):
-                scored.append((-score, order, kind, title, text))
+                # Куски одной книги при равных очках — по порядку текста: «о чём книга?» — с начала, а не с середины.
+                pos = self._chunk_pos.get((title, text)) if kind in BOOK_KINDS else None
+                scored.append((-score, 0 if pos is not None else 1, pos if pos is not None else order, kind, title, text))
         scored.sort()
         out, per_kind = [], {}
-        for _s, _o, kind, title, text in scored:
+        for _s, _b, _o, kind, title, text in scored:
             if per_kind.get(kind, 0) < PER_KIND:
                 per_kind[kind] = per_kind.get(kind, 0) + 1
                 out.append((kind, f"{title} — {text}" if title else text))
@@ -172,8 +175,9 @@ class Knowledge:
         db = self._load()
         with self._lock:
             db.execute("DELETE FROM know WHERE kind IN (?, ?) AND title = ?", (*BOOK_KINDS, f"«{book.title}»"))
-            db.executemany("INSERT INTO know VALUES (?, ?, ?)",
-                           [(f"book:{who}", f"«{book.title}»", part) for part in chunks(book.text)])
+            parts = chunks(book.text)
+            db.executemany("INSERT INTO know VALUES (?, ?, ?)", [(f"book:{who}", f"«{book.title}»", p) for p in parts])
+            self._chunk_pos.update({(f"«{book.title}»", p): i for i, p in enumerate(parts)})
             db.commit()
             self._read[key] = who
         log.info("Знания: книга «%s» — %s", book.title, READERS.get(who, who))

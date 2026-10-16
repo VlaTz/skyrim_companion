@@ -26,6 +26,7 @@ from companion.memory.keeper import MemoryKeeper
 log = logging.getLogger(__name__)
 
 GAME_STALE = 20       # с без событий из игры — игра не идёт, думать не о чем
+SAID_SHOWN = 10       # последних высказанных мыслей — мыслителю, чтобы не придумывал их заново
 
 SYSTEM = """Ты — внутренний голос Гослинга, спутника Владоса в Скайриме: весёлый молодой норд, бывший картограф.
 По обстановке, сумке, заданиям и памяти реши, что Гослингу сейчас стоит держать в голове и, может быть,
@@ -72,8 +73,10 @@ class Thinker:
         return next((t for t in self._speak if t not in self._said), None)
 
     def said(self, text: str) -> None:
-        """Мозг высказал мысль — больше её не предлагать (и мыслителю показать: «уже сказал вслух»)."""
+        """Мозг высказал мысль — больше её не предлагать: из «Твоих мыслей» в обстановке — вон (в памяти — «said»),
+        а мыслитель видит её в «уже сказал вслух» и не придумывает заново другими словами."""
         self._said.add(text)
+        self.store.mark_idea_said(text)
 
     def start(self) -> None:
         threading.Thread(target=self._run, daemon=True, name="thinker").start()
@@ -141,7 +144,9 @@ class Thinker:
                 + "\n\nПамять Гослинга:\n" + (self.keeper.memory_context() or "пока ничего")
                 + "\n\nПоследние реплики:\n" + ("\n".join(dialogue) or "пока не разговаривали")
                 + "\n\nПрежние мысли:\n" + ("\n".join(f"- {i}" + (" (уже сказал вслух)" if i in self._said else "")
-                                                      for i in old) or "нет"))
+                                                      for i in old) or "нет")
+                + "\n\nУже сказал вслух — не повторяй и не переформулируй, пока Владос сам не вернётся к этому:\n"
+                + ("\n".join(f"- {i}" for i in self.store.said_ideas(SAID_SHOWN)) or "ничего"))
         epoch, area = self.keeper.opened, self.keeper.area
         result = self.complete(SYSTEM, user, title=f"Мыслитель: {why}")
         if self.keeper.area != area:

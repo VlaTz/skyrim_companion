@@ -34,6 +34,7 @@ class QuestLogRef(BaseModel):
 
 
 MISC_TYPES = (0, 6)  # «прочее», «разное»: поручения вроде «отнести письмо» — не важное событие
+JOURNAL_CHARS = 600  # знаков записи журнала задания — в память
 
 
 class Quest(BaseModel):
@@ -89,6 +90,11 @@ class QuestLog:
         for q in quests:
             goals = [self._expand(o, q) for o in q.objectives]
             # Пропало и вернулось (на смене этапа игра на миг снимает все цели) — не «новое», а новые цели.
+            was = old.get(q.id) or self._gone.get(q.id)
+            # Новая запись в журнале задания — в память («что мы делали по заданию»), не мозгу и не в «Недавно».
+            if q.log and (not was or not was.log or was.log.id != q.log.id) and (entry := self._journal(q)):
+                changes.append(("quest_log", f"запись в журнале задания «{q.name}»: {entry[:JOURNAL_CHARS]}",
+                                f"журнал: {q.name}", False))
             was = old.get(q.id) or self._gone.pop(q.id, None)
             if not was:
                 add(q, f"новое задание «{q.name}»" + (": " + "; ".join(goals) if goals else ""))

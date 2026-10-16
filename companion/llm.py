@@ -391,8 +391,19 @@ class CompanionLLM:
         try:
             return json.loads(match.group(0)) if match else None
         except json.JSONDecodeError:
-            log.warning("Фоновый запрос: не JSON: %r", content[:300])
-            return None
+            # Бывает: JSON, потом «исправляюсь» и второй JSON — берём последний целый объект.
+            last, decoder, pos = None, json.JSONDecoder(), 0
+            while (start := content.find("{", pos)) >= 0:
+                try:
+                    obj, pos = decoder.raw_decode(content, start)  # дальше — после объекта, не внутрь него
+                except json.JSONDecodeError:
+                    pos = start + 1
+                    continue
+                if isinstance(obj, dict):
+                    last = obj
+            if last is None:
+                log.warning("Фоновый запрос: не JSON: %r", content[:300])
+            return last
 
     def drop_last(self, reply: Reply) -> None:
         """Ответ так и не прозвучал (игрок перебил) — убрать его вместе с вопросом из истории."""
