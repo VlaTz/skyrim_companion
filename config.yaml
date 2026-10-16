@@ -40,6 +40,22 @@ stt:
     Довакин, тан, Ульфрик Буревестник, драугр, Совнгард, Лидия, хускарл, Гослинг.
 
 tts:
+  # xtts — локально на видеокарте (голос Эрика по референсам); cloud — облачный TTS (ниже, tts.cloud):
+  # не занимает видеокарту, первый звук ~1 с, ~$2 за 1000 реплик. Проба — production_logs/2026-10-16_голос_через_OpenRouter.md
+  engine: cloud
+  cloud:
+    model: elevenlabs/eleven-v3-conversational   # через OpenRouter, ключ — тот же, что у llm
+    voice: charlie        # выбор игрока из liam / will / charlie (tools/tts_eleven_tags.py)
+    # Эмоция -> тег в начале каждой фразы. Теги — английские слова в скобках, список открытый:
+    # [excited], [annoyed], [panicking], [curious], [sarcastically], [whispers], [shouts] …
+    tags:
+      happy: "[happily]"
+      anger: "[angry]"
+      fear: "[worried]"
+      sad: "[sad]"
+      surprise: "[surprised]"
+      disgust: "[dismissive]"
+  # --- XTTS (engine: xtts) ---
   model: XTTS-v2        # папка в models/xtts/
   device: cuda          # cuda | cpu (на CPU в разы медленнее реального времени)
   language: ru

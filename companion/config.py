@@ -37,7 +37,20 @@ class STTConfig(BaseModel):
     initial_prompt: str | None = None
 
 
+class CloudTTSConfig(BaseModel):
+    base_url: str = "https://openrouter.ai/api/v1"
+    model: str = "elevenlabs/eleven-v3-conversational"
+    voice: str = "charlie"
+    api_key: str = ""         # пусто — ключ llm (тот же OpenRouter)
+    api_key_env: str = ""
+    timeout: float = 30
+    char_limit: int = 400     # кусок текста на один запрос
+    first_chars: int = 60     # в колонки: первый кусок короче — раньше звучит (в игре — npc_voice.first_chars)
+    tags: dict[str, str] = {}  # эмоция -> тег в начале фразы ([happily]); нет в списке — без тега
+
+
 class TTSConfig(BaseModel):
+    engine: str = "xtts"      # xtts — локально на видеокарте; cloud — облачный (tts.cloud)
     model: str = "XTTS-v2"
     device: str = "cuda"
     language: str = "ru"
@@ -46,6 +59,7 @@ class TTSConfig(BaseModel):
     stream: bool = True
     stream_chunk_size: int = 20
     stream_prebuffer: float = 1.0
+    cloud: CloudTTSConfig = CloudTTSConfig()
 
 
 class LLMConfig(BaseModel):

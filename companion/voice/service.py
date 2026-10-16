@@ -1,4 +1,5 @@
-"""Компаньон целиком: микрофон -> Whisper -> LLM -> XTTS (голос + эмоция) -> динамики.
+"""Компаньон целиком: микрофон -> Whisper -> LLM -> TTS (голос + эмоция) -> динамики.
+TTS — XTTS на видеокарте или облачный (tts.engine в config.yaml).
 
 С echo: true в config.yaml LLM пропускается — распознанная фраза озвучивается обратно
 (проверка голосового тракта).
@@ -7,6 +8,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -48,7 +50,12 @@ class VoiceService:
         models = cfg.models_path
 
         self.stt = SpeechToText(cfg.stt, models)
-        self.tts = XttsTTS(cfg.tts, models, cfg.character_path / "voice")
+        if cfg.tts.engine == "cloud":
+            from companion.voice.cloud_tts import CloudTTS
+            self.tts = CloudTTS(cfg.tts.cloud, fallback_key=cfg.llm.api_key or (
+                os.environ.get(cfg.llm.api_key_env, "") if cfg.llm.api_key_env else ""))
+        else:
+            self.tts = XttsTTS(cfg.tts, models, cfg.character_path / "voice")
 
         use_llm = (not cfg.echo) if use_llm is None else use_llm
         self.llm = None
