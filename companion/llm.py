@@ -191,16 +191,20 @@ class CompanionLLM:
         return reply
 
     def initiate(self, situation: str, game_context: str = "", memory: str = "",
-                 min_interest: int | None = None, quip_chance: float = 0.0) -> Reply:
+                 min_interest: int | None = None, quip_chance: float = 0.0, reasoning: str = "",
+                 max_tokens: int | None = None) -> Reply:
         """Реплика по своей инициативе на событие или тишину; пустой text — решил промолчать.
         min_interest — ответ ниже этой оценки interest (её просит situation) считается молчанием; но с шансом
         quip_chance он всё же звучит — ниже порога модель пишет короткую шутку (так просит situation).
+        reasoning — рассуждение модели перед ответом (low | medium | high) для этого запроса: обычно оно выключено
+        ради скорости (llm.extra_body), а размышлению в тишине спешить некуда; max_tokens — лимит с ним.
         Без инструментов: тут важнее быстро."""
         return self._ask(f"[{situation}]", game_context, memory, use_tools=False, min_interest=min_interest,
-                         quip_chance=quip_chance)
+                         quip_chance=quip_chance, reasoning=reasoning, max_tokens=max_tokens)
 
     def _ask(self, user_content: str, game_context: str, memory: str, use_tools: bool,
-             min_interest: int | None = None, quip_chance: float = 0.0) -> Reply:
+             min_interest: int | None = None, quip_chance: float = 0.0, reasoning: str = "",
+             max_tokens: int | None = None) -> Reply:
         """user_content уходит в историю как есть; обстановка «Сейчас в игре» и обмен
         с инструментами — только в этот запрос."""
         now = f"Сейчас в игре:\n{game_context or 'Нет данных из игры.'}\n\n{user_content}"
@@ -212,7 +216,8 @@ class CompanionLLM:
         block.section("Сейчас в игре", game_context or "нет данных")
         block.section("Память", memory or "пусто")
         try:
-            return self._ask_traced(user_content, now, memory, tools, min_interest, quip_chance, block)
+            return self._ask_traced(user_content, now, memory, tools, min_interest, quip_chance, block,
+                                    reasoning, max_tokens)
         except Exception as e:
             block.line(f"ОШИБКА: {e!r}")
             raise
@@ -220,7 +225,8 @@ class CompanionLLM:
             block.write()
 
     def _ask_traced(self, user_content: str, now: str, memory: str, tools: list[Tool],
-                    min_interest: int | None, quip_chance: float, block: trace.Block) -> Reply:
+                    min_interest: int | None, quip_chance: float, block: trace.Block,
+                    reasoning: str = "", max_tokens: int | None = None) -> Reply:
         with self._lock:
             if self._addressed_lately():  # история меняется только под блокировкой — смотрим здесь
                 now += f"\n{ADDRESS_NOTE}"
@@ -236,7 +242,8 @@ class CompanionLLM:
                 if round_ == 0 and tools and self.cfg.tool_router:
                     msg = self._first_round(messages, now, tools, block)
                 else:
-                    msg = self._complete(messages, tools, final=round_ == self.cfg.max_tool_rounds)
+                    msg = self._complete(messages, tools, final=round_ == self.cfg.max_tool_rounds,
+                                         reasoning=reasoning, max_tokens=max_tokens)
                 if not msg.tool_calls:
                     break
                 messages.append({"role": "assistant", "content": msg.content or "",
@@ -250,7 +257,8 @@ class CompanionLLM:
                     block.line(f"← {result}")
                     messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
             reply = parse_reply(msg.content or "")
-            block.line(f"Ответ модели {time.perf_counter() - t:.2f} с: [{reply.emotion}]"
+            block.line(f"Ответ модели {time.perf_counter() - t:.2f} с"
+                       + (f" (с рассуждением: {reasoning})" if reasoning else "") + f": [{reply.emotion}]"
                        + (f" интерес {reply.interest}" if reply.interest is not None else "")
                        + f" «{reply.text}»" + (f"\n  запомнить: {reply.remember}" if reply.remember else "")
                        + (f"\n  обыграл заготовку: {reply.joke}" if reply.joke else ""))
@@ -322,8 +330,12 @@ class CompanionLLM:
         block.line(f"План справок {time.perf_counter() - t:.2f} с: {names or 'не нужны'}")
         return planned
 
-    def _complete(self, messages: list[dict], tools: list[Tool], final: bool):
+    def _complete(self, messages: list[dict], tools: list[Tool], final: bool, reasoning: str = "",
+                  max_tokens: int | None = None):
         kwargs: dict = {}
+        extra_body = dict(self.cfg.extra_body or {})
+        if reasoning:
+            extra_body["reasoning"] = {"effort": reasoning}
         if self.cfg.json_mode:
             kwargs["response_format"] = {"type": "json_object"}
         if tools:
@@ -332,11 +344,11 @@ class CompanionLLM:
                 kwargs["tool_choice"] = "none"
         resp = self.client.chat.completions.create(
             model=self.cfg.model, messages=messages,
-            temperature=self.cfg.temperature, max_tokens=self.cfg.max_tokens,
-            extra_body=self.cfg.extra_body or None, **kwargs,
+            temperature=self.cfg.temperature, max_tokens=max_tokens or self.cfg.max_tokens,
+            extra_body=extra_body or None, **kwargs,
         )
         if resp.choices[0].finish_reason == "length":
-            log.warning("Ответ LLM обрезан по max_tokens (%d)", self.cfg.max_tokens)
+            log.warning("Ответ LLM обрезан по max_tokens (%d)", max_tokens or self.cfg.max_tokens)
         return resp.choices[0].message
 
     def _run_tool(self, call) -> str:

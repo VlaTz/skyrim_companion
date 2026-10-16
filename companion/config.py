@@ -120,6 +120,16 @@ class MapConfig(BaseModel):
     unknown_count: int = 3
 
 
+class MusingsConfig(BaseModel):
+    """Случайные размышления о мире в долгой тишине (companion/musings.py)."""
+    enabled: bool = True
+    gap: float = 600          # секунд — не чаще (от прошлого размышления)
+    chance: float = 0.5       # долгая тишина и gap прошёл — с этим шансом размышление вместо обычной реплики
+    local: float = 0.5        # шанс взять тему, связанную с местом, где вы сейчас (иначе — любая)
+    reasoning: str = "medium"  # рассуждение модели перед репликой: low | medium | high; "" — без него
+    max_tokens: int = 4000    # с рассуждением: его токены входят в лимит ответа
+
+
 class BrainConfig(BaseModel):
     enabled: bool = True
     # Говорить ли самому — решает модель: ставит поводу interest 0–10 (шкала в companion/brain.py) и видит, когда
@@ -144,6 +154,7 @@ class BrainConfig(BaseModel):
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
+    musings: MusingsConfig = MusingsConfig()
 
 
 class DiaristConfig(BaseModel):

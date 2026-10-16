@@ -149,14 +149,16 @@ class VoiceService:
         return self._turn.locked() or self.interrupted()
 
     def initiate(self, situation: str, min_interest: int | None = None,
-                 still_fresh: Callable[[], bool] | None = None, quip_chance: float = 0.0) -> bool:
+                 still_fresh: Callable[[], bool] | None = None, quip_chance: float = 0.0,
+                 reasoning: str = "", max_tokens: int | None = None) -> bool:
         """Реплика по своей инициативе (событие в игре, долгая тишина). Не перебивает:
         если сейчас идёт разговор — сразу False. False и если модель решила промолчать."""
         if self.llm is None or self.interrupted() or not self._turn.acquire(blocking=False):
             return False
         try:
             reply = self.llm.initiate(situation, self.game_context(), self.memory_context(),
-                                      min_interest=min_interest, quip_chance=quip_chance)
+                                      min_interest=min_interest, quip_chance=quip_chance,
+                                      reasoning=reasoning, max_tokens=max_tokens)
             if not reply.text:
                 return False
             if still_fresh and not still_fresh():  # пока модель думала, игрок вышел, вошёл, влез в бой

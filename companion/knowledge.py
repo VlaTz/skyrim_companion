@@ -145,6 +145,21 @@ class Knowledge:
                 break
         return out
 
+    def lore(self, about: str = "") -> list[str]:
+        """Общеизвестное (экраны загрузки): всё — или только где упомянуто about (место, владение). Отдельный поиск,
+        не search(): там общеизвестное о Вайтране тонет среди его жителей и домов."""
+        db = self._load()
+        with self._lock:
+            if not about:
+                return [text for (text,) in db.execute("SELECT text FROM know WHERE kind = 'lore'")]
+            # Короткие основы («пред» от «Предела») и «владение» совпадают почти со всем — только названия.
+            words = [w for w in stems(about) if len(w) >= 5 and not w.startswith("владен")]
+            if not words:
+                return []
+            match = " OR ".join('"' + w.replace('"', "") + '"' for w in words)
+            return [text for (text,) in db.execute(
+                "SELECT text FROM know WHERE know MATCH ? AND kind = 'lore'", (match,))]
+
     def answer(self, query: str) -> str:
         """Текст справки world_info для модели."""
         found = self.search(query)

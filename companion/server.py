@@ -35,6 +35,7 @@ from companion.game.profile import PlayerProfile
 from companion.game.state import GameEvent, GameState
 from companion.jokes import JokeBook, Jokes, JokeWriter
 from companion.knowledge import Knowledge
+from companion.musings import Musings
 from companion.memory.diarist import Diarist
 from companion.memory.keeper import MemoryKeeper
 from companion.memory.thinker import Thinker
@@ -159,6 +160,8 @@ def create_app(cfg: Config) -> FastAPI:
                 book = JokeBook(jokes_file, cfg.character_path / "jokes_auto.yaml")
                 writer = JokeWriter(book, service.llm.complete_json, cfg.jokes.model) if cfg.jokes.refill else None
                 state["brain"].jokes = Jokes(book, game, places, memory, writer, cfg.jokes)
+            if cfg.brain.musings.enabled:  # размышления о мире в тишине — темы из базы знаний
+                state["brain"].musings = Musings(knowledge, memory, cfg.brain.musings.local)
             state["brain"].start()
         if cfg.thinker.enabled and service.llm:  # мысли Гослинга: что держать в голове и предложить
             thinker = Thinker(memory, game, service.llm.complete_json,

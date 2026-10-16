@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import random
 import threading
 import time
 from typing import Callable
@@ -63,6 +64,13 @@ IDLE_PROMPT = "Вы уже давно идёте молча ({silence}). Мож�
 # Мысль (companion/memory/thinker.py): говорить ли и когда, решил мыслитель — шкалы нет, модель только говорит.
 THOUGHT_PROMPT = ("Тебе пришла мысль, которую стоит сказать Владосу {when}: {thought}\n"
                   "Скажи её своими словами, от себя и к месту: 1–2 коротких предложения, всего не больше 25 слов.")
+# Размышление о мире (companion/musings.py): повод — запись «общеизвестного» из игры; говорить ли — решает модель.
+MUSING_PROMPT = ("Игрок ничего не говорил, вы давно идёте молча ({silence}). Тебе вдруг пришла в голову мысль о "
+                 "мире — повод из того, что знает каждый местный: «{topic}»\n"
+                 "Если зацепило — порассуждай вслух от себя: удивление, вопрос Владосу, догадка или шутливая теория "
+                 "(вроде «ты вот никогда не думал, почему…»). Не пересказывай повод как справку — оттолкнись от "
+                 "него. Догадки — как догадки («а может…», «вот я думаю…»): не выдавай за правду о мире то, чего "
+                 "в поводе нет. 1–2 коротких предложения. Не зацепило или сейчас не к месту — оставь text пустым.")
 THOUGHT_NOW = "сейчас"
 THOUGHT_IDLE = "— самое время, раз вы давно идёте молча ({silence})"
 HEARD_MAX_AGE = 30    # подслушанное старше минуты (Гослинг всё это время был занят) — не комментируем
@@ -97,6 +105,8 @@ class Brain:
         self.unsaid_thought: Callable[[], str | None] = lambda: None
         self.thought_said: Callable[[str], None] = lambda text: None
         self.jokes = None  # companion.jokes.Jokes — заготовки шуток к обстановке (нет базы — без них)
+        self.musings = None  # companion.musings.Musings — темы для размышлений в тишине (нет — без них)
+        self._mused_at = 0.0  # когда последний раз пробовали размышление
 
     def start(self) -> None:
         self._thread.start()
@@ -230,8 +240,32 @@ class Brain:
                     when=THOUGHT_IDLE.format(silence=silence), thought=thought), now):
                 self.thought_said(thought)
             return
+        if self._maybe_muse(now, silence):
+            return
         log.info("Мозг: долгая тишина")
         self._ask(IDLE_PROMPT.format(silence=silence), now, IDLE_BANDS, extra_tags={"тишина"})
+
+    def _maybe_muse(self, now: float, silence: str) -> bool:
+        """Долгая тишина: иногда — размышление о мире (не чаще brain.musings.gap). True — спрашивали модель."""
+        cfg = self.cfg.musings
+        if (not cfg.enabled or self.musings is None or self.game.in_combat or now - self._mused_at < cfg.gap
+                or random.random() >= cfg.chance):
+            return False
+        s = self.game.status
+        topic = self.musings.topic(" ".join(p for p in (s.location, s.hold) if p))
+        if not topic:
+            return False
+        self._mused_at = now
+        log.info("Мозг: долгая тишина — размышление: %s", topic[:80])
+        self.last_ask = now
+        scene = self._scene()
+        if self.voice.initiate(MUSING_PROMPT.format(silence=silence, topic=topic),
+                               still_fresh=lambda: self._scene() == scene,
+                               reasoning=cfg.reasoning, max_tokens=cfg.max_tokens if cfg.reasoning else None):
+            self.musings.said(topic)
+        else:
+            self.musings.skipped(topic)
+        return True
 
     def _ask(self, situation: str, now: float, bands: str | None = None, changes: list[Change] | None = None,
              extra_tags: set[str] | None = None) -> bool:
