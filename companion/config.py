@@ -215,6 +215,7 @@ class ThinkerConfig(BaseModel):
     check_every: float = 3       # секунд — как часто смотреть, не поменялось ли что (проверка дешёвая)
     max_ideas: int = 3           # мыслей за раз — не больше
     dialogue_lines: int = 12     # последних реплик в запрос — что уже предлагал и что ответил Владос
+    revisit: float = 30          # с — вернулись туда, откуда ушли раньше этого, — заново не думать (граница локации)
 
 
 class JokesConfig(BaseModel):

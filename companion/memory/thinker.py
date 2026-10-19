@@ -58,7 +58,9 @@ class Thinker:
         self.on_thought = on_thought  # новые мысли — мозгу: повод заговорить
         self._last_run = 0.0
         self._seen: tuple | None = None  # (поселение, цели заданий, сумка) при прошлом раздумье
-        self._epoch = -1  # keeper.opened при прошлом раздумье: память открыли заново — думать заново
+        self._epoch = -1  # keeper.opened при прошлом раздумье: память открыли заново (запуск, загрузка сейва)
+        self._here: str | None = None  # где были при прошлой проверке
+        self._left: dict[str | None, float] = {}  # место -> когда ушли оттуда (вернулись быстро — не думаем заново)
         self._busy = threading.Lock()
         # Мысли последнего раздумья, которые стоит сказать вслух (when now/later), и где надуманы; что уже сказано.
         self._speak: list[str] = []
@@ -99,13 +101,16 @@ class Thinker:
         return self.keeper.area, quests, bag
 
     def _why(self, now: tuple) -> str:
-        """Что поменялось с прошлого раздумья (пусто — ничего)."""
-        if self._seen is None:
-            return "начало"
+        """Что поменялось с прошлого раздумья (пусто — ничего). Вернулись туда, откуда ушли меньше thinker.revisit
+        назад (граница локации: «вошли — ушли — вошли»), — не перемена: место запоминаем без раздумья."""
         area, quests, bag = now
         old_area, old_quests, old_bag = self._seen
         if area and area != old_area:
-            return f"другое место: {area}"
+            if time.time() - self._left.get(area, 0.0) < self.cfg.revisit:
+                log.info("Мыслитель: вернулись в «%s» меньше %d с назад — заново не думаю", area, self.cfg.revisit)
+                self._seen = (area, old_quests, old_bag)
+            else:
+                return f"другое место: {area}"
         if quests != old_quests:
             return "задания"
         if sum(abs(bag.get(k, 0) - old_bag.get(k, 0)) for k in bag.keys() | old_bag.keys()) >= self.cfg.bag_change:
@@ -120,8 +125,16 @@ class Thinker:
             return False
         try:
             state = self._state()
-            if self.keeper.opened != self._epoch:  # загрузили сейв (или другой персонаж) — всё с начала
-                self._seen, self._last_run, self._said = None, 0.0, set()
+            if state[0] != self._here:  # сменилось место — помним, когда ушли из прежнего
+                self._left[self._here] = now
+                self._here = state[0]
+            if self.keeper.opened != self._epoch:
+                # Запуск сервиса или загрузка сейва: мысли этой ветки — в памяти (в обстановке «Твои мысли»), заново не
+                # думаем — ждём перемен (место, задания, сумка) или thinker.quiet_every.
+                self._seen, self._last_run, self._said, self._epoch = state, now, set(), self.keeper.opened
+                self._speak, self._left = [], {}
+                log.info("Мыслитель: запуск или загрузка — мысли из памяти, заново не думаю")
+                return False
             why = self._why(state) or ("давно не думал" if now - self._last_run >= self.cfg.quiet_every else "")
             if not force and (not why or now - self._last_run < self.cfg.min_gap):
                 return False
