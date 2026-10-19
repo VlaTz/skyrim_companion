@@ -18,6 +18,7 @@
     health     — здоровье игрока 0..1
     in_combat  — игрок в бою
     sneaking   — крадётся
+    paused     — меню, пауза или загрузка: на экране не мир (зрение Гослинга кадр не снимает)
     level      — уровень игрока
     pos        — [x, y] игрока на карте мира (только на улице; в помещении не шлётся)
     gosling    — {"loaded", "distance" (м), "follower"}: где NPC Гослинг (если Gosling.esp подключён)
@@ -25,13 +26,14 @@
                  follower — спутник игрока; это тело Гослинга в игре, в «Рядом» его не показываем;
                  unique — единственный в игре (именной NPC, а не «Драугр»)
     threats    — живые враги дальше «рядом» (до ~140 м: дракон в небе) — те же поля, что у nearby
-                 (и в nearby: race — раса, если не людская: «Дракон»; distance — м)
+                 (и в nearby: race — раса, если не людская: «Дракон»; distance — м; level — уровень)
     partner    — {"name", "ago" (с), "distance" (м), "hostile", "dead", "unique", "gone"}: с кем игрок заговорил
                  (5 минут после разговора); нет поля в полном status — собеседника нет
 
 Разовые события:
     game_loaded     — {}  (загрузка сохранения)
-    combat_started  — {"enemies": ["Драугр-воитель", ...], "races": {"Мирмулнир": "Дракон"}}
+    combat_started  — {"enemies": ["Драугр-воитель", ...], "races": {"Мирмулнир": "Дракон"},
+                       "levels": {"Драугр-воитель": 6}}: levels — уровень (одноимённых — самый высокий)
     combat_ended    — {}
     actor_killed    — {"name": "Волк", "by_player": true, "unique": false}
     item_picked     — {"name": "Двемерская шестерня", "count": 1}
@@ -43,7 +45,7 @@
     book_read       — {"name", "file", "form"}: Владос открыл книгу (из сумки или с полки) — Гослинг знает её
                       («читал Владос», companion/knowledge.py); повод мозгу reading
     gosling_items   — {"given": [{"name", "count", "book", "file", "form"}], "taken": [...]}: Владос отдал Гослингу
-                      или забрал у него; отданную книгу Гослинг читает сам; повод мозгу gift (важный)
+                      или забрал у него; отданную книгу Гослинг читает сам; поводы мозгу gift и taken (важные)
     player_died     — {"killer", "race", "unique"}: Владос погиб (killer "" — упал, утонул, ловушка). Гослинг
                       говорит об этом после загрузки сейва: событие died вместо loaded
 
@@ -110,6 +112,19 @@ DEATH_BEFORE = 300     # секунд «Недавно» перед гибель
 DEATH_LINES = 4        # строк из них — не больше
 BOOK_EXCERPT = 600     # знаков начала отданной книги — мозгу, чтобы было о чём сказать
 READING_EXCERPT = 250  # знаков начала книги, которую читает Владос, — в повод (без него модель гадала о содержании)
+# Опасность врага — его уровень против уровня Владоса (из игры): во сколько раз сильнее обычного он тревожит
+# (Change.weight, настроение), в этих пределах; «слабее» / «сильнее Владоса» — пометка в тексте для модели.
+DANGER_RANGE = (0.25, 2.0)
+DANGER_WEAK, DANGER_STRONG = 0.5, 1.5
+
+
+def danger(level: int | None, player_level: int | None) -> tuple[float, str]:
+    """(вес для настроения, пометка): злокрыс 1-го уровня против Владоса 4-го — (0,25, «слабее Владоса»)."""
+    if not level or not player_level:
+        return 1.0, ""
+    ratio = level / player_level
+    note = "слабее Владоса" if ratio <= DANGER_WEAK else "сильнее Владоса" if ratio >= DANGER_STRONG else ""
+    return min(DANGER_RANGE[1], max(DANGER_RANGE[0], ratio)), note
 
 # Игровая статистика -> событие для «Недавно» и мозга: (вид, текст, важное). Событие статистики игра шлёт,
 # когда счётчик растёт, — то есть ровно в момент поступка.
@@ -149,10 +164,16 @@ class Change:
     #            location, interior, low_health, combat_started, combat_ended, killed, item, overheard,
     #            profile (вступил в гильдию, завершил квест, розыск...), quest, quest_misc (задания журнала),
     #            person (знакомый NPC напал или убит), power (слово силы, душа дракона), cleared, crime, talk,
-    #            deed (статистика игры), other
+    #            deed (статистика игры), weather (погода сменилась), other
     text: str
     subject: str = ""  # о чём событие (место) — чтобы не комментировать одно и то же дважды
     important: bool = False  # дольше держится в «Недавно», не тонет среди убитых злокрысов
+    brief: str = ""  # суть без подробностей и подсказок модели (причина настроения); пусто — text
+    weight: float = 1.0  # во сколько раз сильнее обычного трогает настроение (опасность врага — danger)
+
+    @property
+    def gist(self) -> str:
+        return self.brief or self.text
 
 
 class GameEvent(BaseModel):
@@ -167,6 +188,7 @@ class Nearby(BaseModel):
     follower: bool = False
     unique: bool | None = None  # единственный в игре (Арвел, Белетор), а не «Драугр»; None — плагин не прислал
     race: str = ""              # раса, если не людская («Дракон», «Драугр»)
+    level: int | None = None    # уровень — насколько опасен (против уровня игрока, danger)
     distance: float | None = None  # метров
 
     @property
@@ -202,6 +224,8 @@ class GoslingStatus(BaseModel):
     health: float | None = None  # своё здоровье 0..1 (только когда загружен)
     bleedout: bool = False       # упал без сил — спутника почти добили
     dead: bool = False
+    worn: list[str] = []         # что на нём надето (броня, одежда, щит)
+    hands: list[str] = []        # оружие в руках
 
 
 class Partner(BaseModel):
@@ -225,6 +249,7 @@ class Status(BaseModel):
     health: float | None = None
     in_combat: bool | None = None
     sneaking: bool | None = None
+    paused: bool | None = None
     level: int | None = None
     pos: list[float] | None = None
     gosling: GoslingStatus | None = None
@@ -294,7 +319,7 @@ class GameState:
         # Гибель Владоса: до загрузки он мёртв (Гослинг молчит), после — повод died. Живёт вне «Недавно» и вне
         # памяти по сейву: загрузка сейва постарше стёрла бы её. Сколько раз погибал от кого — за этот запуск.
         self.dead = False
-        self._death: str | None = None
+        self._death: Change | None = None
         self._deaths: Counter[str] = Counter()
 
     def apply(self, event: GameEvent) -> list[Change]:
@@ -378,10 +403,12 @@ class GameState:
             f"; {'от него' if killer else 'так'} гибнет уже {times}-й раз за вечер" if times > 1
             else "; за вечер — впервые")
         self.dead = True
-        self._death = (f"Владос погиб ({how})" + (f". Перед этим: {'; '.join(before)}" if before else "")
-                       + ". Он уже вернулся к последнему сохранению — вы снова там, где были тогда, а что было после, "
-                         "ещё не случилось. Ты это помнишь и знаешь, что он погиб: скажи прямо, с шуткой, что пошло "
-                         "не так и что в этот раз сделать иначе")
+        self._death = Change(
+            "died", f"Владос погиб ({how})" + (f". Перед этим: {'; '.join(before)}" if before else "")
+            + ". Он уже вернулся к последнему сохранению — вы снова там, где были тогда, а что было после, "
+              "ещё не случилось. Ты это помнишь и знаешь, что он погиб: скажи прямо, с шуткой, что пошло "
+              "не так и что в этот раз сделать иначе",
+            subject="гибель Владоса", important=True, brief=f"Владос погиб ({how})")
         log.info("Игрок погиб: %s", how)
         return [Change("player_died", f"Владос погиб ({how})", subject="Владос погиб", important=True)]
 
@@ -432,6 +459,8 @@ class GameState:
                 changes.append(Change("wilderness", "находимся: дикие земли", subject="дикие земли"))
         elif new.cell and new.cell != old.cell and new.interior and not old.interior:
             changes.append(Change("interior", f"вошли в помещение: {new.cell}", subject=new.cell))
+        if new.weather and old.weather and new.weather != old.weather:  # под открытым небом (в помещении — "")
+            changes.append(Change("weather", f"погода сменилась: {new.weather}", subject=f"погода: {new.weather}"))
         if self._left and new.location == "" and self.updated - self._left[0] >= WILD_CONFIRM:
             changes.append(Change("wilderness", f"ушли из локации {self._left[1]} в дикие земли",
                                   subject=f"дикие земли: {self._left[1]}"))
@@ -465,9 +494,10 @@ class GameState:
             seen = {n.name for n in (old.threats or []) + (old.nearby or [])}
             for n in new.threats:
                 if n.race and n.name not in seen:
-                    changes.extend(self._met_changes(
-                        "threat", f"вдали враг: {n.title}" + (f", ~{round(n.distance)} м" if n.distance else ""),
-                        [n.race]))
+                    weight, note = danger(n.level, new.level or old.level)
+                    changes.extend(self._met_changes(  # тот же враг — тот же subject, хоть и на другом расстоянии
+                        "threat", f"вдали враг: {n.title}" + (f", ~{round(n.distance)} м" if n.distance else "")
+                        + (f" — {note}" if note else ""), [n.race], subject=f"вдали враг: {n.title}", weight=weight))
         # Новый снимок дополняет старый: незаполненные поля остаются прежними.
         self.status = old.model_copy(update=new.model_dump(exclude_none=True))
         if new.nearby is not None:
@@ -491,7 +521,8 @@ class GameState:
         self.markers, self.map_world = markers, world
         return changes
 
-    def _met_changes(self, kind: str, text: str, races: list[str], subject: str = "") -> list[Change]:
+    def _met_changes(self, kind: str, text: str, races: list[str], subject: str = "",
+                     weight: float = 1.0) -> list[Change]:
         """Событие о встрече с существами races: кого видим впервые — отдельное срочное событие novel,
         кого уже встречали — пометка в тексте («уже встречали 2 раза, последний — Западная сторожевая башня»)."""
         changes, notes = [], []
@@ -506,7 +537,7 @@ class GameState:
             else:
                 notes.append(f"{race} — уже встречали {count} раз" + (f", последний — {last}" if last else ""))
         main = Change(kind, text + (f" ({'; '.join(notes)})" if notes else ""), subject=subject or text,
-                      important=bool(notes) and kind == "threat")
+                      important=bool(notes) and kind == "threat", weight=weight)
         return [main, *changes]
 
     def _describe_event(self, event: GameEvent) -> list[Change]:
@@ -515,14 +546,18 @@ class GameState:
             case "game_loaded":
                 if death := self._death:  # загрузился после гибели — это не «перерыв»
                     self._death = None
-                    return [Change("died", death, subject="гибель Владоса", important=True)]
+                    return [death]
                 return [Change("loaded", "игрок вернулся после перерыва")]  # загрузка сейва; без слова «игра»
             case "combat_started":
-                races = d.get("races") or {}
-                enemies = ", ".join(Nearby(name=n, race=races.get(n, "")).title for n in d.get("enemies", []))
+                races, levels = d.get("races") or {}, d.get("levels") or {}
+                # Опасность боя — по самому сильному врагу; пометка — у каждого («Великан — сильнее Владоса»).
+                dangers = {n: danger(levels.get(n), self.status.level) for n in d.get("enemies", [])}
+                enemies = ", ".join(Nearby(name=n, race=races.get(n, "")).title + (f" — {note}" if note else "")
+                                    for n, (_w, note) in dangers.items())
+                weight = max((w for w, _note in dangers.values()), default=1.0)
                 # Кого видим впервые — отдельным событием после самого боя (сводка боя начинается с combat_started).
                 return self._met_changes("combat_started", f"начался бой: {enemies}" if enemies else "начался бой",
-                                         list(races.values()))
+                                         list(races.values()), weight=weight)
             case "combat_ended":
                 return [Change("combat_ended", "бой закончился")]
             case "actor_killed":
@@ -561,7 +596,8 @@ class GameState:
                 book = self.books.get(str(d.get("file", "")), int(d.get("form", 0))) if self.books else None
                 start = f"; начало: «{book.text[:READING_EXCERPT].rsplit(' ', 1)[0]}…»" if book else ""
                 return [Change("reading", f"Владос читает книгу «{name}» — ты читал вместе с ним; что в ней, "
-                                          f"вспомнишь справкой world_info («{name}»){start}", subject=f"книга: {name}")]
+                                          f"вспомнишь справкой world_info («{name}»){start}", subject=f"книга: {name}",
+                               brief=f"Владос читает книгу «{name}»")]
             case "gosling_items":
                 return self._exchange(d)
             case "item_picked":
@@ -570,28 +606,28 @@ class GameState:
         return [Change("other", f"{event.type}: {d}" if d else event.type)]
 
     def _exchange(self, d: dict) -> list[Change]:
-        """Владос отдал Гослингу вещи или забрал. Отданную книгу Гослинг прочитал — мозгу её начало, чтобы было
-        о чём сказать (о прочитанном спросят — справка world_info)."""
+        """Владос отдал Гослингу вещи (gift) или забрал (taken) — два разных события: подарок радует, а забранное —
+        нет. Отданную книгу Гослинг прочитал — мозгу её начало, чтобы было о чём сказать (о прочитанном спросят —
+        справка world_info)."""
         def items(rows: list) -> str:
             return ", ".join(f"{r.get('name')}" + (f" ×{r['count']}" if r.get("count", 1) > 1 else "") for r in rows)
 
         given = [r for r in d.get("given") or [] if r.get("name")]
         taken = [r for r in d.get("taken") or [] if r.get("name")]
-        parts = []
+        changes = []
         if given:
-            parts.append(f"Владос отдал тебе — теперь это у тебя в сумке: {items(given)}")
+            text = brief = f"Владос отдал тебе — теперь это у тебя в сумке: {items(given)}"
+            book = next((self.books.get(str(r.get("file", "")), int(r.get("form", 0)))
+                         for r in given if r.get("book") and self.books), None)
+            if book:
+                start = book.text[:BOOK_EXCERPT].rsplit(" ", 1)[0]
+                text += (f". Книгу «{book.title}» ты сразу прочитал — вот её начало: «{start}…». Можешь сказать, "
+                         "что думаешь о ней")
+            changes.append(Change("gift", text, subject=text[:80], important=True, brief=brief))
         if taken:
-            parts.append(f"Владос забрал у тебя — теперь это у него: {items(taken)}")
-        if not parts:
-            return []
-        text = "; ".join(parts)
-        book = next((self.books.get(str(r.get("file", "")), int(r.get("form", 0)))
-                     for r in given if r.get("book") and self.books), None)
-        if book:
-            start = book.text[:BOOK_EXCERPT].rsplit(" ", 1)[0]
-            text += (f". Книгу «{book.title}» ты сразу прочитал — вот её начало: «{start}…». Можешь сказать, "
-                     "что думаешь о ней")
-        return [Change("gift", text, subject=text[:80], important=True)]
+            text = f"Владос забрал у тебя — теперь это у него: {items(taken)}"
+            changes.append(Change("taken", text, subject=text[:80], important=True))
+        return changes
 
     def find_places(self, kind: str = "", name: str = "", max_km: float = 0, limit: int = 6) -> str:
         """Инструмент агента: места на карте игрока. В помещении — от точки, где вышли с улицы."""
@@ -681,8 +717,12 @@ class GameState:
             if player:
                 lines.append("Игрок: " + ", ".join(player) + ".")
             if (g := s.gosling) and g.loaded and g.health is not None:  # своё — чтобы знал, что ранен и он
-                lines.append("Ты сам (Гослинг): " + ("упал без сил — тебя почти добили" if g.bleedout
-                                           else f"здоровье {round(g.health * 100)}%") + ".")
+                me = ["упал без сил — тебя почти добили" if g.bleedout else f"здоровье {round(g.health * 100)}%"]
+                if g.hands:  # своё снаряжение — из игры, а не выдуманное
+                    me.append("в руках: " + ", ".join(g.hands))
+                if g.worn:
+                    me.append("на тебе: " + ", ".join(g.worn))
+                lines.append("Ты сам (Гослинг): " + "; ".join(me) + ".")
             if s.in_combat is not None:
                 lines.append("Сейчас идёт бой!" if s.in_combat else "Боя нет.")
             if s.nearby:

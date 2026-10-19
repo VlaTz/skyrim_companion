@@ -24,6 +24,7 @@ GWL_EXSTYLE = -20
 WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW = 0x8, 0x20, 0x80
 WS_EX_LAYERED, WS_EX_NOACTIVATE = 0x80000, 0x8000000
 HWND_TOPMOST = -1
+WDA_EXCLUDEFROMCAPTURE = 0x11  # Windows 10 2004+
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
 TOPMOST_EVERY = 2000  # мс — заново поднять поверх (игра в окне без рамки иногда перекрывает)
 POLL_EVERY = 150      # мс — забрать новые строки лога
@@ -34,8 +35,10 @@ COLORS = {  # по началу имени логгера — цвет стро�
     "companion.llm": "#87d7ff",
     "companion.memory.thinker": "#87ff87",
     "companion.memory.diarist": "#d7afff",
-    "companion.memory": "#bcbcbc",
+    "companion.memory.soul": "#5fd7af",
+    "companion.memory": "#bcbcbc",  # после частных companion.memory.* — берётся первое совпадение
     "companion.voice": "#ffafd7",
+    "companion.vision": "#ffd7af",
 }
 WARN_COLOR = "#ff8700"
 TEXT_COLOR = "#e4e4e4"
@@ -107,6 +110,8 @@ class Overlay:
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
                               | WS_EX_NOACTIVATE | WS_EX_TOPMOST)
+        # Окно видно игроку, но не в снимках экрана: зрение Гослинга снимает кадр игры — без лога поверх.
+        user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
         root.attributes("-alpha", c.alpha)  # после смены стиля: прозрачность ставится заново
         root.attributes("-topmost", True)
         visible = c.visible

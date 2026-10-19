@@ -40,13 +40,14 @@ class STTConfig(BaseModel):
 class CloudTTSConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     model: str = "elevenlabs/eleven-v3-conversational"
-    voice: str = "charlie"
+    voice: str = "charlie"     # пусто — голос модели по умолчанию
     api_key: str = ""         # пусто — ключ llm (тот же OpenRouter)
     api_key_env: str = ""
     timeout: float = 30
     char_limit: int = 400     # кусок текста на один запрос
     first_chars: int = 60     # в колонки: первый кусок короче — раньше звучит (в игре — npc_voice.first_chars)
     tags: dict[str, str] = {}  # эмоция -> тег в начале фразы ([happily]); нет в списке — без тега
+    references: bool = False   # образец голоса к каждому запросу: characters/<имя>/voice/<эмоция>/ (клон, Fish)
 
 
 class TTSConfig(BaseModel):
@@ -101,10 +102,11 @@ class NpcVoiceConfig(BaseModel):
     # Голос из уст Гослинга-NPC (companion/voice/npc_voice.py); иначе — колонки.
     enabled: bool = True
     mod_dir: Path = Path(r"D:\Games\Modding\MO2\mods\Gosling")  # мод в MO2 (tools/build_gosling_esp.py)
-    max_distance: float = 30   # метров: дальше — говорим через колонки
-    max_chars: int = 120       # длина фразы: короче — раньше звучит первая
+    max_distance: float = 30   # метров: дальше — Гослинг не говорит (и не слышит), или колонки (speakers)
+    max_chars: int = 250       # длина фразы: каждый стык фраз — пауза в игре, поэтому длинные
     first_chars: int = 50      # первая фраза короче: звук начинается, как только она синтезирована целиком
-    gap: float = 0.3           # пауза между фразами, с
+    gap: float = 0.0           # пауза между фразами, с (стык и так даёт паузу: игра принимает Say() не сразу)
+    speakers: bool = False     # голосом из игры нельзя (далеко, игра не на связи) — в колонки; False — молчит
     result_timeout: float = 12  # сколько ждать подтверждения от плагина (он ждёт, пока звук пойдёт, до 10 с), с
     lip: bool = True           # губы: .lip к каждой фразе генератором CK (+~0,3 с к первой фразе)
 
@@ -150,7 +152,8 @@ class BrainConfig(BaseModel):
     events: list[str] = [
         "loaded", "location", "wilderness", "interior", "combat_started", "combat_ended", "low_health", "item",
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
-        "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "hurt_self",
+        "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "taken",
+        "hurt_self",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
@@ -167,6 +170,40 @@ class DiaristConfig(BaseModel):
     max_heard: int = 20          # подслушанного в запрос — не больше (последнее)
     max_lines: int = 120         # всего строк журнала в запрос
     known_facts: int = 40        # уже известных фактов в запрос (чтобы не повторялся)
+    model: str = ""              # своя модель летописца (и сверки фактов); пусто — llm.background_model
+    reasoning: str = ""          # рассуждение: low | medium | high; "" — как у остальных фоновых
+    max_tokens: int = 0          # лимит ответа вместе с рассуждением; 0 — llm.background_max_tokens
+
+
+class MoodConfig(BaseModel):
+    """Настроение Гослинга (companion/mood.py): из событий игры, само затухает."""
+    enabled: bool = True
+    voice_default: bool = True  # модель ответила нейтрально, а настроение сильное — голос с эмоцией настроения
+
+
+class VisionConfig(BaseModel):
+    """Зрение Гослинга (companion/vision.py): кадр игры — модели с картинками, описание — в обстановку и look."""
+    enabled: bool = True
+    model: str = "anthropic/claude-haiku-5.5"  # видит картинки; пусто — llm.model
+    max_distance: float = 25    # м — Гослинг дальше (или не загружен) — не видит, что видно Владосу
+    fresh: float = 120          # с — описание вида держится в обстановке (на том же месте)
+    glance_on: list[str] = ["location", "wilderness", "discovered", "weather"]  # события — взглянуть самому
+    silence: float = 45         # с без реплик — тишина: взглянуть, если давно не смотрел
+    silence_gap: float = 180    # с — в тишине не чаще
+    after_load: float = 10      # с после загрузки сейва — не смотреть (на экране ещё загрузка)
+    revisit: float = 30         # с — вернулись туда, откуда ушли раньше этого, — заново не смотреть
+    width: int = 1024           # px — кадр уменьшается до этой ширины
+    quality: int = 80           # JPEG
+    frames: int = 20            # последних кадров хранить в logs/frames (для разбора); 0 — не хранить
+    max_tokens: int = 400
+    extra_body: dict | None = None  # свои поля запроса; None — как llm.extra_body (Sonnet: {reasoning: {effort: low}})
+
+
+class SoulConfig(BaseModel):
+    """Душа Гослинга (companion/memory/soul.py): после главы летописца — что из сказанного о себе запомнить."""
+    enabled: bool = True
+    reasoning: str = "medium"  # рассуждение фоновой модели: low | medium | high; "" — как у остальных фоновых
+    max_tokens: int = 6000     # с рассуждением: его токены входят в лимит
 
 
 class ThinkerConfig(BaseModel):
@@ -223,6 +260,9 @@ class Config(BaseModel):
     brain: BrainConfig = BrainConfig()
     diarist: DiaristConfig = DiaristConfig()
     thinker: ThinkerConfig = ThinkerConfig()
+    soul: SoulConfig = SoulConfig()
+    mood: MoodConfig = MoodConfig()
+    vision: VisionConfig = VisionConfig()
     jokes: JokesConfig = JokesConfig()
     overlay: OverlayConfig = OverlayConfig()
 

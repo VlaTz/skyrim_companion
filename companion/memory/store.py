@@ -8,6 +8,8 @@
   Там же мысли Гослинга (kind idea, пишет companion/memory/thinker.py): что держать в голове и предложить.
 - encounters — кого и что встречали (раса врага, применённый Крик): первая встреча — удивление, следующие —
   «уже встречали N раз, последний — там-то».
+- soul — душа Гослинга: что он решил о себе (оружие, еда, страхи, мечты, мнения). Журнал изменений: нынешнее —
+  последняя запись по каждому ключу, пустой текст — передумал без замены (пишет companion/memory/soul.py).
 Подробно — production_logs/2026-10-14_память.md.
 
 Привязка к прохождению: каждая запись хранит игровую дату (дней прошло). Загрузили сейв старше —
@@ -16,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import sqlite3
@@ -77,8 +80,18 @@ CREATE TABLE IF NOT EXISTS encounters (
     archived  INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS encounters_key ON encounters (category, key, archived);
+CREATE TABLE IF NOT EXISTS soul (
+    id        INTEGER PRIMARY KEY,
+    real_time REAL NOT NULL,
+    game_days REAL,
+    key       TEXT NOT NULL,      -- о чём: «оружие», «еда», «страх: пауки» (в нижнем регистре)
+    text      TEXT NOT NULL,      -- что решил о себе; пусто — передумал и не заменил
+    why       TEXT,               -- откуда: что сказал и в ответ на что
+    feel      TEXT,               -- поводы для настроения (JSON): {"страх": ["паук"], "радость": ["топор"]}
+    archived  INTEGER DEFAULT 0
+);
 """
-TABLES = ("journal", "diary", "facts", "goals", "encounters")
+TABLES = ("journal", "diary", "facts", "goals", "encounters", "soul")
 # Журнал старше таблицы встреч: один раз собираем из него, с кем уже бились (по именам — у обычных существ
 # имя совпадает с расой: «Драугр», «Злокрыс»), и драконов — по поглощённым душам.
 BACKFILL_FIGHT = re.compile(r"^(?:начался бой|игрок убил|убит): (.+)$")
@@ -126,6 +139,8 @@ class MemoryStore:
                 self.root.mkdir(parents=True, exist_ok=True)
                 self._db = sqlite3.connect(self.root / f"{key}.db", check_same_thread=False)
                 self._db.executescript(SCHEMA)
+                if "feel" not in {r[1] for r in self._db.execute("PRAGMA table_info(soul)")}:  # база до 2026-10-19
+                    self._db.execute("ALTER TABLE soul ADD COLUMN feel TEXT")
                 self.key = key
                 log.info("Память: %s (%s), записей в журнале: %d", key, player_name or "?",
                          self._db.execute("SELECT count(*) FROM journal WHERE archived = 0").fetchone()[0])
@@ -314,6 +329,36 @@ class MemoryStore:
     def retire_fact(self, fact_id: int) -> None:
         """Факт не сходится с данными игры — убрать (archived = 2: не «будущее», а неверное; не стирается)."""
         self._write("UPDATE facts SET archived = 2 WHERE id = ?", (fact_id,))
+
+    # ------------------------------------------------------------ душа
+
+    def soul(self) -> list[tuple[str, str]]:
+        """Нынешняя душа: (ключ, текст) — последняя запись по каждому ключу этой ветки сейва, без пустых.
+        Журнал изменений, а не «заменить строку»: загрузили сейв постарше — поздние записи в архиве, и душа сама
+        такая, какой была тогда."""
+        return [(key, text) for key, text in self._rows(
+            "SELECT key, text FROM soul s WHERE archived = 0 AND id = "
+            "(SELECT MAX(id) FROM soul WHERE archived = 0 AND key = s.key) ORDER BY id")
+            if text]
+
+    def soul_feel(self) -> list[tuple[str, str, dict | None]]:
+        """Нынешняя душа с поводами для настроения: (ключ, текст, {чувство: [слова]}); None — поводов ещё не
+        спрашивали (запись до 2026-10-19), {} — спрашивали, их нет."""
+        out = []
+        for key, text, feel in self._rows(
+                "SELECT key, text, feel FROM soul s WHERE archived = 0 AND id = "
+                "(SELECT MAX(id) FROM soul WHERE archived = 0 AND key = s.key) ORDER BY id"):
+            if text:
+                try:
+                    out.append((key, text, json.loads(feel) if feel is not None else None))
+                except json.JSONDecodeError:
+                    out.append((key, text, None))
+        return out
+
+    def set_soul(self, key: str, text: str, why: str, where: Where, feel: dict | None = None) -> None:
+        self._write("INSERT INTO soul (real_time, game_days, key, text, why, feel) VALUES (?, ?, ?, ?, ?, ?)",
+                    (time.time(), where.game_days, key.strip().lower(), text.strip(), why.strip() or None,
+                     json.dumps(feel, ensure_ascii=False) if feel is not None else None))
 
     # ------------------------------------------------------------ встречи
 

@@ -37,6 +37,12 @@ RESPONSE_FORMAT = """
 "remember" — узнал что-то новое и важное (о месте, человеке, задании, о Владосе): что запомнить, одной фразой.
 Только действительно важное, не каждый раз; нечего запоминать — не пиши поле. Говоришь, что запомнишь, —
 заполни его.
+"idea" — в этой реплике ты высказал (хоть своими словами, хоть мимоходом) одну из «Твоих мыслей» из обстановки:
+её метка, например "m2". Не высказывал — не пиши поле.
+"felt" — в ответ на реплику Владоса: как она тебя задела, если задела: {{"чувство": "радость|обида|злость|страх|
+утешение", "сила": 1..3}}. Тёплые слова, похвала, доброе о тебе — радость; грубость всерьёз — обида или злость;
+тревога, опасность рядом — страх; поддержка после беды — утешение. Подколка в шутку и обычный разговор (куда идём,
+что делать) — не пиши поле.
 """
 
 # Пока нет команд в игру (кусок 6 плана) — честно говорим модели, что она умеет только говорить.
@@ -80,6 +86,15 @@ ADDRESS_LOOKBACK = 2
 ADDRESS_NOTE = ("(Ты уже обращался к нему в прошлых репликах — в этой говори без обращения: без «Владос», "
                 "«братан», «бро».)")
 
+# Длина ответа — по ситуации, как в живом разговоре. Правило в промпте модель не держит: на «Тук-тук» — 18 слов,
+# на реплики до 5 слов — медиана 23 (журнал 16.10, 53 ответа). Поэтому — пометка к ходу (только в этот запрос):
+# Владос сказал коротко — ответь в тон; идёт бой — пара слов. Длинная реплика — без пометки: модель решает сама.
+SHORT_WORDS = 6
+# Число, а не «коротко»: «часто одной фразой» модель не держала (медиана 17 -> 17,5 слова), «до 12 слов» — 8,5 (19.10).
+LENGTH_SHORT = ("(Владос сказал коротко — ответь в тон: одной фразой, до 12 слов. Подробнее — только если он просит "
+                "рассказать или объяснить.)")
+LENGTH_COMBAT = "(Идёт бой — ответь в пару слов, по делу.)"
+
 # Планировщик справок: отдельный короткий запрос без истории разговора — нужны ли справки для ответа игроку.
 # С историей модель держится своих прошлых ответов без справок («сейчас гляну» — и не смотрит: 0 из 4 на ходе
 # из трассы), без истории — зовёт справку (4 из 4). Идёт параллельно с основным запросом, ответ не замедляет.
@@ -104,6 +119,23 @@ class Reply:
     remember: str | None = None  # что запомнить (модель решила, что узнала важное)
     joke: str | None = None      # id заготовки шутки, которую обыграла (companion/jokes.py)
     quip: bool = False           # прозвучала шуткой ниже порога интереса
+    idea: str | None = None      # метка мысли из «Твоих мыслей», которую высказала (companion/memory/thinker.py)
+    felt: tuple[str, int] | None = None  # как задела реплика Владоса: (чувство, сила 1..3) — настроению
+
+
+FELT = ("радость", "обида", "злость", "страх", "утешение")
+
+
+def parse_felt(value) -> tuple[str, int] | None:
+    """{"чувство": "...", "сила": 1..3} -> (чувство, сила); непонятное — None."""
+    if not isinstance(value, dict):
+        return None
+    feeling = str(value.get("чувство") or "").strip().lower()
+    try:
+        strength = max(1, min(3, int(value.get("сила") or 1)))
+    except (TypeError, ValueError):
+        strength = 1
+    return (feeling, strength) if feeling in FELT else None
 
 
 def parse_reply(content: str) -> Reply:
@@ -121,7 +153,9 @@ def parse_reply(content: str) -> Reply:
                     interest = None
                 remember = str(data.get("remember") or "").strip() or None
                 joke = str(data.get("joke") or "").strip() or None
-                return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION, interest, remember, joke)
+                idea = str(data.get("idea") or "").strip() or None
+                return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION, interest, remember, joke,
+                             idea=idea, felt=parse_felt(data.get("felt")))
         except json.JSONDecodeError:
             pass
     log.warning("LLM ответила не чистым JSON: %r", content)
@@ -139,6 +173,15 @@ def parse_reply(content: str) -> Reply:
         if text:
             return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION)
     return Reply(content.strip().strip('"'), DEFAULT_EMOTION)
+
+
+def length_note(player_text: str, in_combat: bool) -> str:
+    """Пометка о длине ответа на реплику игрока: в бою — пара слов, на короткую реплику — коротко."""
+    if in_combat:
+        return LENGTH_COMBAT
+    if len(player_text.split()) <= SHORT_WORDS:
+        return LENGTH_SHORT
+    return ""
 
 
 class CompanionLLM:
@@ -182,12 +225,13 @@ class CompanionLLM:
         self.tools = {t.name: t for t in tools}
         log.info("Инструменты агента: %s", ", ".join(self.tools) or "нет")
 
-    def reply(self, player_text: str, game_context: str = "", memory: str = "") -> Reply:
+    def reply(self, player_text: str, game_context: str = "", memory: str = "", in_combat: bool = False) -> Reply:
         """Ответ на реплику игрока. Молчать в ответ нельзя — пустой ответ переспрашиваем один раз."""
-        reply = self._ask(f"Игрок: {player_text}", game_context, memory, use_tools=True)
+        note = length_note(player_text, in_combat)
+        reply = self._ask(f"Игрок: {player_text}", game_context, memory, use_tools=True, note=note)
         if not reply.text:
             log.warning("LLM промолчала в ответ игроку — переспрашиваем")
-            reply = self._ask(f"Игрок: {player_text}", game_context, memory, use_tools=True)
+            reply = self._ask(f"Игрок: {player_text}", game_context, memory, use_tools=True, note=note)
         return reply
 
     def initiate(self, situation: str, game_context: str = "", memory: str = "",
@@ -204,7 +248,7 @@ class CompanionLLM:
 
     def _ask(self, user_content: str, game_context: str, memory: str, use_tools: bool,
              min_interest: int | None = None, quip_chance: float = 0.0, reasoning: str = "",
-             max_tokens: int | None = None) -> Reply:
+             max_tokens: int | None = None, note: str = "") -> Reply:
         """user_content уходит в историю как есть; обстановка «Сейчас в игре» и обмен
         с инструментами — только в этот запрос."""
         now = f"Сейчас в игре:\n{game_context or 'Нет данных из игры.'}\n\n{user_content}"
@@ -217,7 +261,7 @@ class CompanionLLM:
         block.section("Память", memory or "пусто")
         try:
             return self._ask_traced(user_content, now, memory, tools, min_interest, quip_chance, block,
-                                    reasoning, max_tokens)
+                                    reasoning, max_tokens, note)
         except Exception as e:
             block.line(f"ОШИБКА: {e!r}")
             raise
@@ -226,8 +270,11 @@ class CompanionLLM:
 
     def _ask_traced(self, user_content: str, now: str, memory: str, tools: list[Tool],
                     min_interest: int | None, quip_chance: float, block: trace.Block,
-                    reasoning: str = "", max_tokens: int | None = None) -> Reply:
+                    reasoning: str = "", max_tokens: int | None = None, note: str = "") -> Reply:
         with self._lock:
+            if note:  # длина ответа по ситуации — только в этот запрос, не в историю
+                now += f"\n{note}"
+                block.line(f"Пометка: {note.strip('()')}")
             if self._addressed_lately():  # история меняется только под блокировкой — смотрим здесь
                 now += f"\n{ADDRESS_NOTE}"
                 block.line("Пометка: без обращения (оно было в прошлых репликах)")
@@ -261,7 +308,9 @@ class CompanionLLM:
                        + (f" (с рассуждением: {reasoning})" if reasoning else "") + f": [{reply.emotion}]"
                        + (f" интерес {reply.interest}" if reply.interest is not None else "")
                        + f" «{reply.text}»" + (f"\n  запомнить: {reply.remember}" if reply.remember else "")
-                       + (f"\n  обыграл заготовку: {reply.joke}" if reply.joke else ""))
+                       + (f"\n  обыграл заготовку: {reply.joke}" if reply.joke else "")
+                       + (f"\n  высказал мысль: {reply.idea}" if reply.idea else "")
+                       + (f"\n  задело: {reply.felt[0]} {reply.felt[1]}" if reply.felt else ""))
             log.info("LLM %.2f с%s: [%s]%s %r", time.perf_counter() - t,
                      f" (инструментов: {calls})" if calls else "", reply.emotion,
                      f" интерес {reply.interest}" if reply.interest is not None else "", reply.text)
@@ -373,26 +422,31 @@ class CompanionLLM:
         return any(ADDRESS.search(r) for r in replies)
 
     def complete_json(self, system: str, user: str, max_tokens: int | None = None,
-                      title: str = "Фоновый запрос", model: str | None = None) -> dict | None:
+                      title: str = "Фоновый запрос", model: str | None = None, reasoning: str = "") -> dict | None:
         """Отдельный запрос без истории и инструментов (дневник и т.п.): ответ — JSON-объект или None.
         Не берёт блокировку разговора — идёт в фоне, пока Гослинг болтает. Модель — llm.background_model
-        (или model: шутки пишет jokes.model)."""
+        (или model: шутки пишет jokes.model). reasoning — глубина рассуждения для этого запроса (low | medium |
+        high): душа — решение «кто я», ему нужно подумать."""
         model = model or self.background_model
-        block = trace.Block(f"{title} [{model}]")
+        block = trace.Block(f"{title} [{model}" + (f", рассуждение {reasoning}" if reasoning else "") + "]")
         block.section("Запрос", user)
         try:
-            return self._complete_json(system, user, max_tokens or self.cfg.background_max_tokens, block, model)
+            return self._complete_json(system, user, max_tokens or self.cfg.background_max_tokens, block, model,
+                                       reasoning)
         finally:
             block.write()
 
     def _complete_json(self, system: str, user: str, max_tokens: int, block: trace.Block,
-                       model: str) -> dict | None:
+                       model: str, reasoning: str = "") -> dict | None:
+        extra_body = dict((self.cfg.extra_body if self.cfg.background_extra_body is None
+                           else self.cfg.background_extra_body) or {})
+        if reasoning:
+            extra_body["reasoning"] = {"effort": reasoning}
         try:
             resp = self.client.chat.completions.create(
                 model=model, temperature=0.3, max_tokens=max_tokens,
                 messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-                extra_body=(self.cfg.extra_body if self.cfg.background_extra_body is None
-                            else self.cfg.background_extra_body) or None)
+                extra_body=extra_body or None)
         except Exception as e:  # noqa: BLE001 — сеть, лимиты: фоновая задача просто попробует позже
             log.warning("Фоновый запрос к LLM не удался: %s", e)
             block.line(f"ОШИБКА: {e!r}")

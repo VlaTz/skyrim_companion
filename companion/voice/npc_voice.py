@@ -60,20 +60,22 @@ class NpcVoice:
     def available(self) -> bool:
         """Можно говорить голосом из игры: включено, мод на месте, плагин на связи, Гослинг рядом."""
         return (self.cfg.enabled and self.voice_dir.is_dir() and self.plugin_connected()
-                and self.game.gosling_near(self.cfg.max_distance))
+                and self.game.gosling_near(self.cfg.max_distance) and not self.game.status.paused)
 
     def speak(self, pieces: list[str], synth: Synth,
-              should_stop: Callable[[], bool] = lambda: False) -> tuple[int, float | None]:
+              should_stop: Callable[[], bool] = lambda: False
+              ) -> tuple[int, float | None, tuple[np.ndarray, int] | None]:
         """Произносит фразы по очереди. Возвращает (сколько фраз сказано, через сколько секунд
-        прозвучала первая). Сказано меньше, чем фраз: либо Гослинг не смог (остаток — в колонки), либо
-        should_stop() — игрок заговорил, остаток не нужен (это решает вызывающий). Фразу, которая уже
+        прозвучала первая, звук несказанной фразы). Сказано меньше, чем фраз: либо Гослинг не смог (остаток — в
+        колонки; фраза, на которой не смог, уже синтезирована — её звук третьим, чтобы не платить за синтез дважды),
+        либо should_stop() — игрок заговорил, остаток не нужен (это решает вызывающий). Фразу, которая уже
         звучит в игре, не оборвать — но следующих не будет и ход разговора освобождается сразу."""
         t0 = time.perf_counter()
         first: float | None = None
         free_at = 0.0  # когда доиграет предыдущая фраза (time.monotonic)
         for i, piece in enumerate(pieces):
             if should_stop():
-                return i, first
+                return i, first, None
             audio, sr = synth(piece)
             line = self.next_line
             # Пишем в файл другой темы, пока звучит предыдущая: её файл не трогаем.
@@ -85,19 +87,19 @@ class NpcVoice:
             sf.write(wav, np.clip(game_audio, -1, 1), GAME_SAMPLE_RATE, subtype="PCM_16")
             self._make_lip(wav)
             if not self._wait_until(free_at, should_stop):
-                return i, first
+                return i, first, None
             duration = len(game_audio) / GAME_SAMPLE_RATE
             result = self._say(line, piece, duration)
             if not result.get("ok"):
                 log.warning("Гослинг не сказал фразу %d: %s — дальше через колонки",
                             i + 1, result.get("reason") or "плагин не ответил")
-                return i, first
+                return i, first, (audio, sr)
             self.next_line ^= 1
             if first is None:
                 first = time.perf_counter() - t0
             free_at = time.monotonic() + duration + self.cfg.gap
         self._wait_until(free_at, should_stop)  # не отпускаем ход разговора, пока Гослинг не договорил
-        return len(pieces), first
+        return len(pieces), first, None
 
     @staticmethod
     def _wait_until(moment: float, should_stop: Callable[[], bool]) -> bool:

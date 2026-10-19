@@ -34,13 +34,17 @@ from companion.game.places import PlaceBook
 from companion.game.profile import PlayerProfile
 from companion.game.state import GameEvent, GameState
 from companion.jokes import JokeBook, Jokes, JokeWriter
+from companion.game.items import ItemBook
 from companion.knowledge import Knowledge
+from companion.memory.soul import Soul
+from companion.mood import Mood
 from companion.musings import Musings
 from companion.memory.diarist import Diarist
 from companion.memory.keeper import MemoryKeeper
 from companion.memory.thinker import Thinker
 from companion.memory.store import MemoryStore
 from companion.tools import build_tools
+from companion.vision import Vision
 from companion.voice.npc_voice import NpcVoice
 from companion.voice.service import VoiceService
 
@@ -123,6 +127,9 @@ def create_app(cfg: Config) -> FastAPI:
     knowledge = Knowledge(cfg.game.data_dir, places, books)  # что Гослинг знает о мире — из файлов игры
     memory = MemoryKeeper(MemoryStore(cfg.memory_path), game, places)
     memory.knowledge = knowledge
+    # Настроение — из событий игры, в обстановку; душа усиливает то, что задевает лично.
+    mood = Mood(soul=lambda: memory.store.soul_feel() if memory.store.is_open else []) if cfg.mood.enabled else None
+    memory.mood = mood
     game.meet = memory.meet  # встречи (раса врага, Крик) — «впервые» или «уже встречали»
     npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
                          lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
@@ -134,6 +141,11 @@ def create_app(cfg: Config) -> FastAPI:
         memory.on_voice_event(event)
         if event.get("joke") and "brain" in state and state["brain"].jokes:  # обыграл заготовку — помним, что сказано
             state["brain"].jokes.said(str(event["joke"]))
+        if event.get("idea") and "thinker" in state:  # высказал мысль (хоть в ответе Владосу) — больше не предлагать
+            if idea := memory.shown_ideas.get(str(event["idea"]).strip("[] ")):
+                state["thinker"].said(idea)
+            else:
+                log.info("Мысль «%s»: такой метки в показанных нет — не помечаем", event["idea"])
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -141,17 +153,28 @@ def create_app(cfg: Config) -> FastAPI:
         commands.start(hub.loop)
         service = await run_in_threadpool(
             lambda: VoiceService(cfg, publish, game_context=memory.game_context, npc_voice=npc_voice,
-                                 memory_context=memory.memory_context))
+                                 memory_context=memory.memory_context, in_combat=lambda: game.in_combat,
+                                 mood_emotion=mood.emotion if mood and cfg.mood.voice_default else None,
+                                 on_felt=mood.felt if mood else None))
         service.start_push_to_talk()
         state["voice"] = service
         if service.llm:
-            service.llm.set_tools(build_tools(game, places, knowledge, memory))
+            vision = None
+            if cfg.vision.enabled:  # зрение: кадр игры — «глазам»; описание — в обстановку, по просьбе — look
+                vision = Vision(cfg.vision, game, service.llm.client, cfg.logs_path / "frames", model=cfg.llm.model,
+                                extra_body=cfg.llm.extra_body, last_activity=lambda: service.last_activity)
+                memory.vision = state["vision"] = vision
+                vision.start()
+            service.llm.set_tools(build_tools(game, places, knowledge, memory, vision))
             asyncio.get_running_loop().run_in_executor(None, knowledge.search, "Скайрим")  # собрать заранее, ~1 с
             llm = service.llm
             llm.events_since = game.events_since
             memory.on_open = lambda: llm.restore(memory.store.last_dialogue(cfg.llm.history_turns))
+            soul = (Soul(memory.store, llm.complete_json, cfg.character_path / "prompt.md", cfg.soul,
+                         items=ItemBook(cfg.game.data_dir))
+                    if cfg.soul.enabled else None)  # что Гослинг решил о себе — после каждой главы; предметы — из игры
             diarist = Diarist(memory.store, llm.complete_json, cfg.diarist,
-                              player_name=lambda: memory.store.player_name, knowledge=knowledge)
+                              player_name=lambda: memory.store.player_name, knowledge=knowledge, soul=soul)
             memory.on_place_changed = diarist.place_changed
             diarist.start()
         if cfg.brain.enabled and service.llm:
@@ -169,11 +192,14 @@ def create_app(cfg: Config) -> FastAPI:
                               cfg=cfg.thinker)
             if "brain" in state:  # мысли «при случае» — мозгу на долгую тишину
                 state["brain"].unsaid_thought, state["brain"].thought_said = thinker.unsaid, thinker.said
+            state["thinker"] = thinker
             thinker.start()
         log.info("Сервис готов: http://%s:%d", cfg.server.host, cfg.server.port)
         yield
         if "brain" in state:
             state["brain"].stop()
+        if "vision" in state:
+            state["vision"].stop()
         service.stop()
 
     app = FastAPI(title="Skyrim Companion — voice", lifespan=lifespan)
@@ -240,6 +266,10 @@ def create_app(cfg: Config) -> FastAPI:
         except ValidationError as e:
             raise HTTPException(422, f"Неверные поля {event.type}: {e}")
         memory.on_game_event(event, changes)
+        if mood and changes:
+            mood.notify(changes)
+        if "vision" in state and changes:  # новое место, смена погоды — взглянуть (в фоне)
+            state["vision"].notify(changes)
         texts = [c.text for c in changes]
         if changes:  # служебные (карта, квесты, сведения об игроке, say_result) в журнал не пишем
             hub.publish({"type": "game_event", "event": event.type, "changes": texts})

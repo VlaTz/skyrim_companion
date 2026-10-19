@@ -28,6 +28,7 @@ from companion.knowledge import stems
 from companion.game.places import PlaceBook
 from companion.game.state import HEARD_SECONDS, Change, GameEvent, GameState, Heard
 from companion.memory.store import MemoryStore, Where, memory_key
+from companion.memory.soul import soul_block
 
 log = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ class MemoryKeeper:
         # (мыслитель) — уже про другое прошлое.
         self.opened = 0
         self.knowledge = None  # companion.knowledge.Knowledge — прочитанные книги в поиск (ставит сервер)
+        self.shown_ideas: dict[str, str] = {}  # метка -> мысль, как показаны модели в «Твоих мыслях» последний раз
+        self.mood = None  # companion.mood.Mood — настроение в обстановку (ставит сервер)
+        self.vision = None  # companion.vision.Vision — что вы видите вокруг (ставит сервер)
 
     @property
     def area(self) -> str | None:
@@ -192,6 +196,10 @@ class MemoryKeeper:
     def game_context(self) -> str:
         """«Сейчас в игре»: обстановка + что Гослинг знает о текущем месте."""
         parts = [self.game.describe()]
+        if self.mood:  # настроение — из того, что было: говорит в нём, а не беззаботен после гибели Владоса
+            parts.append(self.mood.describe())
+        if self.vision and (seen := self.vision.describe()):  # вид — то, чего нет в данных игры
+            parts.append(seen)
         location = self.game.status.location
         card = self.places.card(location) if self.places and location else ""
         if card:
@@ -209,9 +217,13 @@ class MemoryKeeper:
             parts.append("Что ты сам узнал об этом месте и людях рядом:\n" + "\n".join(facts))
         # Мысли — только надуманные здесь же: «Адрианна совсем рядом» после ухода из Вайтрана — не к месту.
         ideas = self.store.ideas() if (self.store.get_meta("ideas_area") or "") == (self._area_now or "") else []
+        # С метками: высказал мысль хоть в ответе Владосу — модель пишет её метку ("idea"), и мысль помечается
+        # сказанной (Thinker.said). Без этого «шахту» из мыслей он предлагал в ответах, а в тишине — снова (16.10).
+        self.shown_ideas = {f"m{i}": idea for i, idea in enumerate(ideas, 1)}
         if ideas:
-            parts.append("Твои мысли (можешь высказать, когда к месту, своими словами; что уже сказал — не повторяй):\n"
-                         + "\n".join(f"- {idea}" for idea in ideas))
+            parts.append("Твои мысли (можешь высказать, когда к месту, своими словами; что уже сказал — не повторяй; "
+                         "высказал — метку в \"idea\"):\n"
+                         + "\n".join(f"- [{key}] {idea}" for key, idea in self.shown_ideas.items()))
         return "\n".join(p for p in parts if p)
 
     def _facts_here(self, location: str | None) -> list[str]:
@@ -301,6 +313,8 @@ class MemoryKeeper:
         parts = []
         if profile := self.game.profile.summary(self.game.player_name):
             parts.append(profile)
+        if soul := soul_block(self.store):  # что Гослинг решил о себе — о себе говорит в согласии с этим
+            parts.append(soul)
         goals = self.store.active_goals()
         for kind, title in GOAL_TITLES.items():
             items = [text for _gid, k, text in goals if k == kind]

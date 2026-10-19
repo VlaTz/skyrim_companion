@@ -26,7 +26,9 @@ namespace voice
 		// (Гослинг для неё ещё «говорит») — тогда повторяем Say(), пока не зазвучит.
 		constexpr auto kStartTimeout = std::chrono::milliseconds(10000);
 		constexpr auto kStartPoll = std::chrono::milliseconds(100);
-		constexpr auto kSayRetry = std::chrono::milliseconds(600);
+		// Повтор — часто: каждая лишняя доля секунды — пауза посреди реплики (субтитр уже сменился, а звука нет).
+		// Дважды не скажет: зазвучала одна — следующие Say() игра отбрасывает (Гослинг уже говорит).
+		constexpr auto kSayRetry = std::chrono::milliseconds(200);
 
 		using SoundIds = std::array<std::uint32_t, 2>;
 
@@ -314,6 +316,30 @@ namespace voice
 			quest->data.flags.underlying(), quest->IsEnabled(), quest->StartsEnabled());
 	}
 
+	namespace
+	{
+		// Что надето на Гослинге и что у него в руках: как у игрока (Player.cpp) — готовый инвентарь с noInit, флаг
+		// «надето» у записи. Иначе модель выдумывает его снаряжение («ношу кожаную броню»), а душа это закрепляет.
+		void Equipment(RE::Actor* a_actor, json& a_out)
+		{
+			json worn = json::array();
+			json hands = json::array();
+			const auto inventory = a_actor->GetInventory([](RE::TESBoundObject&) { return true; }, true);
+			for (const auto& [object, data] : inventory) {
+				const auto& [count, entry] = data;
+				if (!object || count <= 0 || !entry || !entry->IsWorn() || object->IsAmmo()) {
+					continue;
+				}
+				auto name = net::ToUtf8(object->GetName());
+				if (!name.empty()) {
+					(object->IsWeapon() ? hands : worn).push_back(std::move(name));
+				}
+			}
+			a_out["worn"] = std::move(worn);
+			a_out["hands"] = std::move(hands);
+		}
+	}
+
 	bool IsGosling(const RE::TESObjectREFR* a_ref)
 	{
 		return a_ref && a_ref == Gosling();
@@ -338,6 +364,7 @@ namespace voice
 			}
 			out["bleedout"] = actor->AsActorState()->IsBleedingOut();
 			out["dead"] = actor->IsDead();
+			Equipment(actor, out);
 		}
 		return out;
 	}

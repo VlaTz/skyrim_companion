@@ -16,6 +16,7 @@ from companion.knowledge import Knowledge
 
 if TYPE_CHECKING:  # память импортирует состояние игры — только для подсказок типов
     from companion.memory.keeper import MemoryKeeper
+    from companion.vision import Vision
 
 
 @dataclass
@@ -42,7 +43,7 @@ def place_info(places: PlaceBook, name: str) -> str:
 
 
 def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Knowledge | None = None,
-                memory: MemoryKeeper | None = None) -> list[Tool]:
+                memory: MemoryKeeper | None = None, vision: Vision | None = None) -> list[Tool]:
     tools = [
         Tool(
             name="find_places",
@@ -150,5 +151,23 @@ def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Kno
                 "required": ["query"],
             },
             handler=lambda query="": memory.recall(query),
+        ))
+    if vision:
+        tools.append(Tool(
+            name="look",
+            description=(
+                "Посмотреть вокруг — на то, что сейчас видно вам с Владосом: вид и даль, местность, погода и свет, "
+                "кто и что рядом, что у Владоса в руках, надписи. Вызывай, когда спрашивают о том, что видно: "
+                "«видишь вон ту башню?», «как тебе вид?», «что это там?», «что у меня в руках?», «что написано?» — "
+                "а этого нет в «Сейчас в игре» и в «Что вы видите вокруг». Взгляд — мгновенно: не обещай "
+                "посмотреть потом. Отвечай по увиденному; чего не видно — так и скажи. Что в сумке, где места на "
+                "карте, кто такой человек — это другие справки."),
+            parameters={
+                "type": "object",
+                "properties": {"question": {"type": "string", "description": (
+                    "Что высмотреть, своими словами: «башня впереди», «что у Владоса в руках», «какой вид».")}},
+                "required": ["question"],
+            },
+            handler=lambda question="": vision.look(question),
         ))
     return tools

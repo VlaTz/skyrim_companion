@@ -38,6 +38,7 @@ namespace events
 		{
 			bool        valid = false;
 			bool        inCombat = false;
+			bool        paused = false;  // меню, пауза, загрузка — мира на экране не видно
 			std::string location;
 			std::string cell;
 		} last;
@@ -215,6 +216,16 @@ namespace events
 			return !creature || a_actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kAggression) > 0.0f;
 		}
 
+		// Дерётся с нами: в бою, и цель — игрок или его спутник. Враждебный великан в стороне — не участник боя.
+		bool FightsUs(RE::Actor* a_actor, RE::PlayerCharacter* a_player)
+		{
+			if (!a_actor->IsInCombat()) {
+				return false;
+			}
+			const auto target = a_actor->GetActorRuntimeData().currentCombatTarget.get();
+			return target && (target.get() == a_player || target->IsPlayerTeammate());
+		}
+
 		struct Around
 		{
 			std::vector<Near> nearby;   // ближе kNearbyRadius, kNearbyMax ближайших
@@ -261,11 +272,12 @@ namespace events
 		json ActorJson(RE::PlayerCharacter* a_player, const Near& a_near)
 		{
 			return { { "name", Name(a_near.actor) },
-				{ "hostile", Hostile(a_near.actor, a_player) },
+				{ "hostile", Hostile(a_near.actor, a_player) || FightsUs(a_near.actor, a_player) },
 				{ "dead", a_near.actor->IsDead() },
 				{ "follower", a_near.actor->IsPlayerTeammate() },
 				{ "unique", IsUnique(a_near.actor) },
 				{ "race", RaceOf(a_near.actor) },
+				{ "level", a_near.actor->GetLevel() },  // насколько опасен — сравнивают с уровнем игрока
 				{ "distance", std::round(a_near.distance / kUnitsPerMeter) } };
 		}
 
@@ -342,6 +354,8 @@ namespace events
 			const std::string location = (!loc || loc == hold) ? std::string{} : Name(loc);
 			const std::string cellName = Name(cell);
 			const bool        inCombat = player->IsInCombat();
+			const auto        ui = RE::UI::GetSingleton();
+			const bool        paused = ui && (ui->GameIsPaused() || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME));
 			const auto        around = ActorsAround(player);
 			const json        partnerNow = PartnerStatus(player, Clock::now());  // каждый тик — ловим бегство
 
@@ -392,29 +406,46 @@ namespace events
 
 			if (last.valid && inCombat != last.inCombat) {
 				if (inCombat) {
-					// Враги рядом и вдали (дракон кружит дальше 35 м); races — кто они, если не люди.
+					// С кем бой: кто дерётся с игроком или спутником — рядом и вдали (дракон кружит дальше 35 м).
+					// Таких ещё нет (игрок напал первым) — враждебные рядом. Враждебные вдали, которые в бой не
+					// вступили (великаны у лагеря), — не в счёт. races — кто они, если не люди; levels — уровень
+					// (одноимённых — самый высокий), чтобы сравнить с игроком.
 					json enemies = json::array();
 					json races = json::object();
+					json levels = json::object();
+					bool anyFights = false;
+					for (const auto* list : { &around.nearby, &around.threats }) {
+						for (const auto& entry : *list) {
+							anyFights = anyFights || (!entry.actor->IsDead() && FightsUs(entry.actor, player));
+						}
+					}
 					for (const auto* list : { &around.nearby, &around.threats }) {
 						for (const auto& [distance, actor] : *list) {
-							if (Hostile(actor, player) && !actor->IsDead()) {
+							const bool enemy = anyFights ? FightsUs(actor, player) :
+							                               list == &around.nearby && Hostile(actor, player);
+							if (enemy && !actor->IsDead()) {
 								if (auto name = Name(actor); !name.empty()) {
 									if (auto race = RaceOf(actor); !race.empty()) {
 										races[name] = std::move(race);
+									}
+									const auto level = actor->GetLevel();
+									if (!levels.contains(name) || levels[name].get<int>() < level) {
+										levels[name] = level;
 									}
 									enemies.push_back(std::move(name));
 								}
 							}
 						}
 					}
-					Post("combat_started", { { "enemies", std::move(enemies) }, { "races", std::move(races) } });
+					Post("combat_started", { { "enemies", std::move(enemies) }, { "races", std::move(races) },
+											   { "levels", std::move(levels) } });
 				} else {
 					Post("combat_ended");
 				}
 			}
 
 			const auto now = Clock::now();
-			const bool changed = !last.valid || inCombat != last.inCombat ||
+			const bool changed = !last.valid || inCombat != last.inCombat || paused != last.paused ||
 			                     location != last.location || cellName != last.cell;
 			if (changed || forceStatus || now - lastStatus >= kStatusEvery) {
 				// Строки шлём всегда: пустая значит «нет» (иначе сервис оставит старое значение).
@@ -440,6 +471,7 @@ namespace events
 				}
 				data["in_combat"] = inCombat;
 				data["sneaking"] = player->IsSneaking();
+				data["paused"] = paused;  // кадр игры в это время — меню или загрузка, не мир (зрение Гослинга)
 				// Чья игра — и в status: после перезапуска сервиса game_loaded не повторяется.
 				data["character"] = CharacterId();
 				data["player_name"] = Name(player->GetActorBase());
@@ -470,7 +502,7 @@ namespace events
 				lastStatus = now;
 				forceStatus = false;
 			}
-			last = { true, inCombat, location, cellName };
+			last = { true, inCombat, paused, location, cellName };
 		}
 
 		void StartTimer()

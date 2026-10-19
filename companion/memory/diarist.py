@@ -87,12 +87,16 @@ def verify_facts(facts: list[tuple[str, str]], knowledge, complete: Callable[...
 
 class Diarist:
     def __init__(self, store: MemoryStore, complete: Callable[..., dict | None], cfg: DiaristConfig | None = None,
-                 player_name: Callable[[], str] = lambda: "Владос", knowledge=None):
+                 player_name: Callable[[], str] = lambda: "Владос", knowledge=None, soul=None):
         self.cfg = cfg or DiaristConfig()
         self.store = store
-        self.complete = complete
+        c = self.cfg  # своя модель и рассуждение летописца (diarist.model, diarist.reasoning) — и для сверки фактов
+        self.complete = lambda system, user, **kw: complete(system, user, model=c.model or None,
+                                                            reasoning=c.reasoning, max_tokens=c.max_tokens or None,
+                                                            **kw)
         self.player_name = player_name
         self.knowledge = knowledge  # companion.knowledge.Knowledge — новые факты сверяем с данными игры
+        self.soul = soul  # companion.memory.soul.Soul — после главы: что из сказанного о себе запомнить
         self._wake = threading.Event()
         self._place_changed = False
         self._pending_since: float | None = None  # когда заметили первую неописанную запись
@@ -183,6 +187,11 @@ class Diarist:
         log.info("Летописец %.1f с: глава из %d записей -> дневник, фактов %d, целей %d | %s",
                  time.perf_counter() - t, len(rows), len(new_facts), len(new_goals), result["diary"])
         self._pending_since = None
+        if self.soul:
+            try:
+                self.soul.reflect(lines, where)
+            except Exception:  # noqa: BLE001 — глава записана; душа подождёт следующей
+                log.exception("Душа: ошибка")
         return True
 
     @staticmethod
