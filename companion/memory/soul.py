@@ -51,6 +51,9 @@ feel — поводы для настроения: что в событиях и
 обычных событий (карта, место, новое место, открытие, бой, дорога, оружие, броня, щит, еда, рубить) — не поводы:
 «на карте появилось новое место» бывает постоянно и не исполняет мечту о месте, которого нет ни на одной карте. Не
 узнать такое событие конкретным словом — у записи поводов нет.
+Место, работа или время из прошлого — не повод для страха и неприязни: «боюсь вернуться картографом в Солитьюд»
+или «в Солитьюде было скучно» — воспоминание, а не страх перед самим городом; событие «вошли в Солитьюд» ничего из этого
+не значит. Такое слово в страх и неприязнь не пиши (радость — если запись прямо говорит, что место тебя радует).
 Перед ответом проверь каждое слово: случится в игре событие с ним — правда ли ты это почувствуешь? Названное в записи
 мимоходом — для сравнения, украшения, как место из прошлого — не повод (дракон, нарисованный на полях карты, — не
 встреча с драконом; город, где было скучно, сам по себе не неприятен). Нет — убери слово.
@@ -89,11 +92,14 @@ FEEL_SYSTEM = """Ты — Гослинг, спутник Владоса в Ск�
 обычных событий (карта, место, новое место, открытие, бой, дорога, оружие, броня, щит, еда, рубить) — не поводы:
 «на карте появилось новое место» бывает постоянно и не исполняет мечту о месте, которого нет ни на одной карте. Не
 узнать такое событие конкретным словом — у записи поводов нет.
+Место, работа или время из прошлого — не повод для страха и неприязни: «боюсь вернуться картографом в Солитьюд»
+или «в Солитьюде было скучно» — воспоминание, а не страх перед самим городом; событие «вошли в Солитьюд» ничего из этого
+не значит. Такое слово в страх и неприязнь не пиши (радость — если запись прямо говорит, что место тебя радует).
 Перед ответом проверь каждое слово: случится в игре событие с ним — правда ли ты это почувствуешь? Названное в записи
 мимоходом — для сравнения, украшения, как место из прошлого — не повод (дракон, нарисованный на полях карты, — не
 встреча с драконом; город, где было скучно, сам по себе не неприятен). Нет — убери слово.
 Отвечай строго одним JSON-объектом без пояснений и markdown:
-{"feel": {"<key>": {"радость": [...], "страх": [...], "неприязнь": [...], "грусть": [...]}, ...}}"""
+{"feel": {"<номер записи>": {"радость": [...], "страх": [...], "неприязнь": [...], "грусть": [...]}, ...}}"""
 
 # Названный в душе предмет, которого в игре нет («рагу из медведя с картошкой»), — запись переписать без него.
 FIX_SYSTEM = """Ты — Гослинг, спутник Владоса в Скайриме. В записи о себе ты назвал предметы, которых в Скайриме нет.
@@ -151,13 +157,30 @@ class Soul:
                    or "пока ничего")
                 + "\n\nЗаписи последнего разговора:\n" + "\n".join(lines))
         t = time.perf_counter()
-        result = self.complete(SYSTEM, user, title="Душа: что я сказал о себе", reasoning=self.cfg.reasoning,
-                               max_tokens=self.cfg.max_tokens)
+        known = {key: text for key, text, _feel in current}
+        known_feel = {key: feel for key, _text, feel in current}
+        if self.cfg.screen_model:
+            # Дешёвый отбор: четыре главы из пяти записывать нечего — решающую (дорогую) модель зовём, только если
+            # отбор предлагает сменить текст души; поводы без смены текста — дело _backfill.
+            screen = self.complete(SYSTEM, user, title="Душа: отбор", model=self.cfg.screen_model,
+                                   reasoning=self.cfg.screen_reasoning, max_tokens=self.cfg.max_tokens)
+            if isinstance(screen, dict) and isinstance(screen.get("soul"), list):
+                proposed = [e for e in screen["soul"] if isinstance(e, dict) and str(e.get("key", "")).strip()
+                            and self._changes_text(e, known)]
+                if not proposed:
+                    changed = self._backfill(where)
+                    log.info("Душа %.1f с: отбор (%s) — записывать нечего, изменено %d", time.perf_counter() - t,
+                             self.cfg.screen_model, changed)
+                    return changed
+                log.info("Душа: отбор предлагает %s — решает %s", ", ".join(str(e["key"]) for e in proposed),
+                         self.cfg.model or "фоновая модель")
+            else:
+                log.warning("Душа: отбор не ответил — решает основная модель")
+        result = self.complete(SYSTEM, user, title="Душа: что я сказал о себе", model=self.cfg.model or None,
+                               reasoning=self.cfg.reasoning, max_tokens=self.cfg.max_tokens)
         if not isinstance(result, dict) or not isinstance(result.get("soul"), list):
             log.warning("Душа: модель не вернула ответ")
             return 0
-        known = {key: text for key, text, _feel in current}
-        known_feel = {key: feel for key, _text, feel in current}
         changed = 0
         for entry in result["soul"]:
             if not isinstance(entry, dict) or not str(entry.get("key", "")).strip():
@@ -179,27 +202,33 @@ class Soul:
         log.info("Душа %.1f с: изменено %d", time.perf_counter() - t, changed)
         return changed
 
+    @staticmethod
+    def _changes_text(entry: dict, known: dict[str, str]) -> bool:
+        """Запись из ответа меняет текст души: новая, другой текст или «убрать» (пустой text) существующей."""
+        key, text = str(entry["key"]).strip().lower(), str(entry.get("text") or "").strip()
+        return (text != known[key]) if key in known else bool(text)
+
     def _backfill(self, where: Where) -> int:
         """Записям души без поводов (сделаны до них) — поводы, одним запросом; нет поводов — пустые, чтобы не
         спрашивать заново."""
         missing = [(key, text) for key, text, feel in self.store.soul_feel() if feel is None]
         if not missing:
             return 0
-        result = self.complete(FEEL_SYSTEM, "\n".join(f"- {key} — {text}" for key, text in missing),
-                               title=f"Душа: поводы для {len(missing)} записей")
+        # Записи — по номерам: ключ с двоеточием («страх: великаны») модель в ответе обрезала до «страх», и поводов
+        # у такой записи не было никогда — спрашивали бы после каждой главы.
+        listing = "\n".join(f"{i}. {key} — {text}" for i, (key, text) in enumerate(missing, 1))
+        result = self.complete(FEEL_SYSTEM, listing, title=f"Душа: поводы для {len(missing)} записей")
         feels = result.get("feel") if isinstance(result, dict) else None
         if not isinstance(feels, dict):
             log.warning("Душа: поводы не пришли — спросим в следующий раз")
             return 0
-        # Ключ в ответе модель иногда пишет с текстом записи («оружие — Мой любимый вид оружия — топор») — узнаём по
-        # началу. Записи нет в ответе — поводы не пишем (пустые значат «спрашивали, нет»): спросим в следующий раз.
-        answered = {str(k).split(" — ", 1)[0].strip().lower(): v for k, v in feels.items()}
+        answered = {str(k).strip(". "): v for k, v in feels.items()}
         done = 0
-        for key, text in missing:
-            if key not in answered:
+        for i, (key, text) in enumerate(missing, 1):
+            if str(i) not in answered:  # нет в ответе — не пишем пустые (они значат «спрашивали, поводов нет»)
                 log.warning("Душа: поводов для «%s» в ответе нет — спросим в следующий раз", key)
                 continue
-            feel = clean_feel(answered[key])
+            feel = clean_feel(answered[str(i)])
             self.store.set_soul(key, text, "поводы для настроения", where, feel)
             log.info("Душа: поводы %s — %s", key, feel_text(feel))
             done += 1

@@ -21,7 +21,8 @@
     paused     — меню, пауза или загрузка: на экране не мир (зрение Гослинга кадр не снимает)
     level      — уровень игрока
     pos        — [x, y] игрока на карте мира (только на улице; в помещении не шлётся)
-    gosling    — {"loaded", "distance" (м), "follower"}: где NPC Гослинг (если Gosling.esp подключён)
+    gosling    — {"loaded", "distance" (м), "follower", "waiting", "health", "bleedout", "dead", "worn", "hands"}:
+                 где NPC Гослинг (если Gosling.esp подключён); waiting — ждёт, где велели (приказ или «Жди здесь»)
     nearby     — [{"name": "Назим", "hostile": false, "dead": false, "follower": false, "unique": true}, ...]
                  follower — спутник игрока; это тело Гослинга в игре, в «Рядом» его не показываем;
                  unique — единственный в игре (именной NPC, а не «Драугр»)
@@ -60,6 +61,7 @@
     player          — {"gold", "level", "health", "magicka", "stamina", "worn", "bag", "effects"}
                       подробности об игроке (инструмент player_details); при смене инвентаря/экипировки
     say_result      — {"id", "ok", "reason"}: Гослинг произнёс реплику (или почему нет) — для голоса из NPC
+    order_result    — {"id", "ok", "reason"}: приказ голосом выполнен (или код причины) — companion/orders.py
     npc_line        — {"speaker", "file", "form", "category", "subtype", "to_player"}: NPC рядом (~25 м) начал
                       реплику; текст — по файлу плагина и номеру INFO (companion/game/dialogue.py).
                       to_player — игрок в это время в меню разговора (скорее всего, говорят с ним)
@@ -70,6 +72,11 @@
                       рост счётчика из MOMENTS — событие («выучил слово силы», «что-то украл»)
 
 «Недавно» в {game_context}: события с давностью; бой — одной строкой; важное (Change.important) держится дольше.
+
+Гослинг не рядом (далеко или не загружен — ждёт, где велели, или Владос ушёл сам): что происходит с Владосом, он
+не видит и не слышит. Такие события помечены unseen: их нет в «Недавно», они не трогают настроение и не повод
+мозгу, в журнал памяти — с пометкой «без тебя»; подслушанное не слышит, встреч не засчитывает. Разошлись и снова
+вместе — события parted и rejoined.
 """
 
 from __future__ import annotations
@@ -79,7 +86,7 @@ import re
 import threading
 import time
 from collections import Counter, deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -97,6 +104,14 @@ log = logging.getLogger(__name__)
 LOW_HEALTH = 0.3
 RECENT_SECONDS = 600  # «недавно» — события за последние 10 минут
 WILD_CONFIRM = 8      # секунд вне локации, чтобы засчитать уход: на границе игра дёргает локацию туда-сюда
+# Гослинг не рядом: дальше APART_DISTANCE (или не загружен) дольше APART_CONFIRM — отстал на бегу, вошёл в дверь
+# на пару секунд позже, быстрое перемещение — не в счёт. Снова вместе — ближе BACK_DISTANCE (оттуда он слышит
+# и говорит: npc_voice.max_distance 30 м).
+APART_DISTANCE = 60
+APART_CONFIRM = 20
+BACK_DISTANCE = 25
+# Что Гослинг знает и не видя: своё (ранен, приказ), загрузку сейва и гибель Владоса, само расставание.
+WITNESS_ALWAYS = {"loaded", "died", "player_died", "hurt_self", "order_failed", "arrived", "parted", "rejoined"}
 HEARD_SECONDS = 300   # реплики NPC рядом помним 5 минут (для ответа на «что он сказал?»)
 HEARD_REPEAT = 10     # та же реплика того же NPC за 10 с — повтор события, не новая
 
@@ -153,8 +168,8 @@ MOMENTS: dict[str, tuple[str, str, bool]] = {
 
 
 # Поступок, из которого ясно, кого встретили (душа дракона — значит, был дракон): [(категория, ключ)] для meet.
-# Раса драконов в русской игре — «dragon race» (не переведена), в памяти встреч — «dragon».
-MOMENT_MEETS = {"Dragon Souls Collected": [("раса", "dragon"), ("раса", "дракон")]}
+# Раса драконов в русской игре — «dragon race» (не переведена): по-русски — дракон (RACE_RU).
+MOMENT_MEETS = {"Dragon Souls Collected": [("раса", "дракон")]}
 
 
 @dataclass(frozen=True)
@@ -164,12 +179,14 @@ class Change:
     #            location, interior, low_health, combat_started, combat_ended, killed, item, overheard,
     #            profile (вступил в гильдию, завершил квест, розыск...), quest, quest_misc (задания журнала),
     #            person (знакомый NPC напал или убит), power (слово силы, душа дракона), cleared, crime, talk,
-    #            deed (статистика игры), weather (погода сменилась), other
+    #            deed (статистика игры), weather (погода сменилась), order_failed (приказ голосом не вышел),
+    #            parted / rejoined (Гослинг и Владос разошлись / снова вместе), other
     text: str
     subject: str = ""  # о чём событие (место) — чтобы не комментировать одно и то же дважды
     important: bool = False  # дольше держится в «Недавно», не тонет среди убитых злокрысов
     brief: str = ""  # суть без подробностей и подсказок модели (причина настроения); пусто — text
     weight: float = 1.0  # во сколько раз сильнее обычного трогает настроение (опасность врага — danger)
+    unseen: bool = False  # было без Гослинга (он не рядом) — он этого не видел
 
     @property
     def gist(self) -> str:
@@ -221,6 +238,7 @@ class GoslingStatus(BaseModel):
     loaded: bool = False
     distance: float = -1  # метров до игрока; -1 — не загружен
     follower: bool = False
+    waiting: bool = False        # ждёт, где велели (приказ голосом или диалог «Жди здесь»)
     health: float | None = None  # своё здоровье 0..1 (только когда загружен)
     bleedout: bool = False       # упал без сил — спутника почти добили
     dead: bool = False
@@ -269,11 +287,22 @@ ACTIVATED = {
 }
 
 
+# Расы, названия которых в русской игре остались английскими (без хвоста « race»): по-русски — в тексте событий, в
+# поводах души («боюсь драконов»), в памяти встреч. Нашли по трассам: dragon, old people (пожилые люди — Олава
+# Немощная, Фрейлия Серая Грива); новые — сюда же, когда встретятся (латиница в скобках: «Имя (xxx)»).
+RACE_RU = {"dragon": "дракон", "old people": "пожилой человек"}
+
+
 def race_name(race: str) -> str:
-    """Название расы для текста и памяти встреч: часть рас в русской игре не переведена («dragon race») —
-    хвост « race» убираем."""
+    """Название расы для текста и памяти встреч: хвост « race» убираем, непереведённое — по-русски (RACE_RU)."""
     race = race.strip()
-    return race[:-5] if race.lower().endswith(" race") else race
+    race = race[:-5] if race.lower().endswith(" race") else race
+    return RACE_RU.get(race.lower(), race)
+
+
+def legacy_race_keys() -> dict[str, str]:
+    """Прежние ключи встреч (до перевода рас) -> нынешние: «dragon», «dragon race» -> «дракон»."""
+    return {key: ru for en, ru in RACE_RU.items() for key in (en, f"{en} race")}
 
 
 def ago(seconds: float) -> str:
@@ -307,6 +336,12 @@ class GameState:
         self._left: tuple[float, str] | None = None  # (когда, откуда) — уход ещё не подтверждён
         self.player: dict = {}  # подробности об игроке (событие player)
         self.on_say_result: Callable[[dict], None] = lambda data: None  # голос из NPC ждёт подтверждения
+        # Приказ выполнен или нет (companion/orders.py): что из этого вышло — события.
+        self.on_order_result: Callable[[dict], list[Change]] = lambda data: []
+        self.task: str | None = None  # дело по приказу («идёшь к месту «…»») — ставит companion/orders.py
+        self.task_done = False        # дело сделано (дошёл) — при встрече с Владосом забыть
+        self.apart_since: float | None = None  # с какого момента Гослинг не рядом; None — вместе
+        self._far_since: float | None = None   # далеко — с этого момента, но ещё не засчитано (APART_CONFIRM)
         self.dialogue = dialogue  # тексты реплик игры; None — реплики NPC не слышим
         self.books = books  # тексты книг игры: отданную книгу Гослинг читает — мозгу её начало
         self.heard: deque[Heard] = deque(maxlen=12)
@@ -341,6 +376,8 @@ class GameState:
             elif event.type == "say_result":
                 self.on_say_result(event.data)
                 changes = []
+            elif event.type == "order_result":
+                changes = self.on_order_result(event.data)
             elif event.type == "npc_line":
                 changes = self._apply_npc_line(event.data)
             elif event.type == "dialogue_menu":
@@ -369,7 +406,11 @@ class GameState:
                     self.last_place = None
                     self._left = None
                     self.in_dialogue = False
+                    self.apart_since = self._far_since = None  # вместе ли — узнаем из следующего status
+                    self.task = None
                 changes = self._describe_event(event)
+            if self.apart_since is not None:  # Гослинг не рядом — этого он не видел
+                changes = [c if c.kind in WITNESS_ALWAYS else replace(c, unseen=True) for c in changes]
             # Реплики NPC — в своём списке (heard), иначе в городе вытеснят из «Недавно» всё остальное; записи журнала
             # заданий — только в память (длинные; цели и так в «Сейчас в игре»).
             self.recent.extend((self.updated, c) for c in changes if c.kind not in ("overheard", "quest_log"))
@@ -385,7 +426,7 @@ class GameState:
             return []
         kind, text, important = moment
         for meet in MOMENT_MEETS.get(name, []):
-            self.meet(*meet)
+            self._meet(*meet)
         return [Change(kind, text, subject=f"{text} {value}", important=important)]
 
     def _apply_death(self, d: dict) -> list[Change]:
@@ -412,6 +453,39 @@ class GameState:
         log.info("Игрок погиб: %s", how)
         return [Change("player_died", f"Владос погиб ({how})", subject="Владос погиб", important=True)]
 
+    def _meet(self, category: str, key: str) -> tuple[int, str] | None:
+        """Встреча — только на глазах у Гослинга: без него дракона он не видел."""
+        return None if self.apart_since is not None else self.meet(category, key)
+
+    def _track_apart(self, g: GoslingStatus | None) -> list[Change]:
+        """Вместе ли Владос с Гослингом: разошлись (parted) и снова вместе (rejoined)."""
+        if g is None:  # Gosling.esp не подключён — Гослинг-NPC нет, следить не за кем
+            return []
+        if self.apart_since is None:
+            if g.loaded and 0 <= g.distance <= APART_DISTANCE:
+                self._far_since = None
+                return []
+            self._far_since = self._far_since or self.updated
+            if self.updated - self._far_since < APART_CONFIRM:
+                return []
+            self.apart_since, self._far_since = self._far_since, None
+            text = ("Владос ушёл, а ты ждёшь его, где он велел" if g.waiting
+                    else "вы с Владосом разошлись — он далеко от тебя" if g.follower
+                    else "Владос ушёл без тебя — ты не его спутник")
+            log.info("Гослинг не рядом: %s", text)
+            return [Change("parted", text + "; что он делает без тебя, ты не видишь и не слышишь",
+                           subject="разошлись", brief=text)]
+        if not (g.loaded and 0 <= g.distance <= BACK_DISTANCE):
+            return []
+        minutes = max(1, round((self.updated - self.apart_since) / 60))
+        self.apart_since = None
+        if self.task_done and not g.waiting:  # сходил и вернулся, или Владос пришёл и позвал — дело кончено
+            self.task = None
+        log.info("Гослинг снова рядом (порознь %d мин)", minutes)
+        return [Change("rejoined", f"вы с Владосом снова вместе — порознь были {minutes} мин; что он делал без "
+                                   "тебя, ты не видел — можешь спросить",
+                       subject="снова вместе", important=True, brief=f"снова вместе после {minutes} мин порознь")]
+
     def _known(self, name: str, unique: bool | None = None) -> bool:
         """Знакомый человек, а не «Драугр»: собеседник игрока, единственный в игре, говорил рядом,
         или он из задания журнала."""
@@ -426,7 +500,7 @@ class GameState:
         file, form = str(data.get("file", "")), int(data.get("form", 0))
         text = self.dialogue.text(file, form) if self.dialogue else ""
         speaker = str(data.get("speaker") or "Кто-то")
-        if not text:  # реплика мода, вздох, крик без текста
+        if not text or self.apart_since is not None:  # реплика мода, вздох, крик без текста; Гослинга нет рядом
             return []
         if any(h.speaker == speaker and h.text == text and self.updated - h.at < HEARD_REPEAT for h in self.heard):
             return []
@@ -444,6 +518,8 @@ class GameState:
 
     def _apply_status(self, new: Status) -> list[Change]:
         old, changes = self.status, []
+        if new.gosling is not None:  # первым: что ещё в этом снимке, Гослинг видел, только если вы вместе
+            changes.extend(self._track_apart(new.gosling))
         if new.hold == "":
             new.hold = None  # в диких землях владение не всегда известно — помним прежнее
         if new.location is not None and new.location != old.location:
@@ -527,7 +603,7 @@ class GameState:
         кого уже встречали — пометка в тексте («уже встречали 2 раза, последний — Западная сторожевая башня»)."""
         changes, notes = [], []
         for race in dict.fromkeys(race_name(r).lower() for r in races if r):
-            seen = self.meet("раса", race)
+            seen = self._meet("раса", race)
             if seen is None:
                 continue
             count, last = seen
@@ -582,7 +658,7 @@ class GameState:
                 return [Change("person", f"{name} убегает от вас", subject=f"убегает: {name}", important=True)]
             case "shout":
                 name = str(d.get("name") or "?")
-                seen = self.meet("крик", name)
+                seen = self._meet("крик", name)
                 note = ("" if seen is None else " — впервые на твоих глазах" if seen[0] == 0
                         else f" — этот Крик ты видел уже {seen[0]} раз")
                 return [Change("power", f"игрок применил Крик: {name}{note}", subject=f"крик: {name}",
@@ -718,6 +794,11 @@ class GameState:
                 lines.append("Игрок: " + ", ".join(player) + ".")
             if (g := s.gosling) and g.loaded and g.health is not None:  # своё — чтобы знал, что ранен и он
                 me = ["упал без сил — тебя почти добили" if g.bleedout else f"здоровье {round(g.health * 100)}%"]
+                # Что делаешь — по данным игры, а не по тому, что обещал: приказ мог не выйти, а «Жди здесь» —
+                # выбран в обычном диалоге.
+                me.append(self.task or ("ждёшь на месте, где Владос велел" if g.waiting
+                                        else "идёшь с Владосом — ты его спутник" if g.follower
+                                        else "ты не спутник Владоса — с ним не ходишь, пока он не позовёт"))
                 if g.hands:  # своё снаряжение — из игры, а не выдуманное
                     me.append("в руках: " + ", ".join(g.hands))
                 if g.worn:
@@ -778,7 +859,7 @@ class GameState:
         for t, c in self.recent:
             too_old = (t <= since) if since is not None else (
                 now - t > (IMPORTANT_SECONDS if c.important else RECENT_SECONDS))
-            if too_old:
+            if too_old or c.unseen:  # без Гослинга — он этого не видел
                 continue
             if c.kind == "combat_started":
                 enemies = c.text.partition(": ")[2]
@@ -823,6 +904,11 @@ class GameState:
         if fight["others"]:
             text += "; погибли: " + names(fight["others"])
         return text
+
+    def note(self, changes: list[Change]) -> None:
+        """Событие не из игры (приказ не вышел ещё до неё) — в «Недавно», как пришедшее из игры."""
+        with self._lock:
+            self.recent.extend((time.time(), c) for c in changes)
 
     def events_since(self, since: float) -> list[str]:
         """Что случилось после момента since (сжато, как «Недавно», но без давности) — для истории разговора:

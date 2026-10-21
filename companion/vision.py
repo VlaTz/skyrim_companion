@@ -42,6 +42,8 @@ NOT_VISIBLE = "мира не видно"
 # Из обстановки — «глазам» только то, что помогает узнать увиденное: где, когда, кто рядом.
 CONTEXT_LINES = ("Место:", "Время:", "Ты сам", "Боя нет", "Идёт бой", "Рядом:", "Враги")
 TICK = 5  # с — как часто проверять тишину
+BLACK = b""  # grab: кадр почти чёрный — экран загрузки или затемнение (в «глаза» не шлём)
+BLACK_MEAN, BLACK_SPREAD = 10, 8  # яркость 0..255 в среднем и разброс: ниже обоих — «чёрный»
 LOADED = {"loaded", "died"}  # загрузка сейва
 PLACE_KINDS = {"location", "wilderness"}  # сменилось место — вернулись быстро, вид тот же
 
@@ -50,8 +52,9 @@ SYSTEM = f"""Ты — глаза Гослинга, спутника Владос
 Как читать кадр:
 - Интерфейс игры — не мир, о нём не говори вовсе: компас вверху, полоски здоровья, магии и запаса сил внизу, прицел,
   подсказки клавиш, субтитры. Прочитать субтитр или надпись — только если о них спрашивают.
-- Вид от третьего лица: фигура в центре кадра, обычно спиной, — Владос. Вид от первого лица: руки и оружие на
-  переднем плане — руки Владоса.
+- Камера — Владоса, а не Гослинга: Гослинг — отдельный персонаж, он идёт рядом и может попасть в кадр, но смотрим не
+  его глазами. Вид от третьего лица: фигура в центре кадра, обычно спиной, — Владос. Вид от первого лица: руки и оружие
+  на переднем плане — руки Владоса, что бы ни было в данных о снаряжении Гослинга.
 - Меню, карта, инвентарь, экран загрузки, чёрный экран — мира не видно: ответь ровно «{NOT_VISIBLE}».
 Правда:
 - Говори только о том, что видно на кадре. Не додумывай, что за кадром, внутри зданий и сундуков.
@@ -78,8 +81,8 @@ def _game_window() -> int:
 
 def grab(width: int, quality: int) -> bytes | None:
     """Кадр окна игры (JPEG, не шире width) или None: окна нет, свёрнуто или не на переднем плане (тогда на экране
-    не игра)."""
-    from PIL import ImageGrab
+    не игра); BLACK — кадр почти чёрный (загрузка при переходе в другую ячейку, затемнение)."""
+    from PIL import ImageGrab, ImageStat
 
     hwnd = _game_window()
     if not hwnd or user32.IsIconic(hwnd) or user32.GetForegroundWindow() != hwnd:
@@ -97,6 +100,9 @@ def grab(width: int, quality: int) -> bytes | None:
         return None
     left, top = origin.x - vx, origin.y - vy
     frame = screen.crop((left, top, left + rect.right, top + rect.bottom)).convert("RGB")
+    stat = ImageStat.Stat(frame.convert("L").resize((64, 36)))
+    if stat.mean[0] < BLACK_MEAN and stat.stddev[0] < BLACK_SPREAD:
+        return BLACK
     if frame.width > width:
         frame = frame.resize((width, round(frame.height * width / frame.width)))
     buf = io.BytesIO()
@@ -145,14 +151,23 @@ class Vision:
 
     # ------------------------------------------------------------ смотреть
 
-    def _see(self, reason: str, task: str) -> str | None:
+    def _frame(self) -> bytes | None:
+        """Кадр мира или None: окна нет или кадр чёрный (загрузка, затемнение) — такой в «глаза» не шлём."""
+        frame = grab(self.cfg.width, self.cfg.quality)
+        if frame == BLACK:
+            log.info("Зрение: кадр чёрный (загрузка) — не смотрим")
+            return None
+        return frame
+
+    def _see(self, reason: str, task: str, frame: bytes | None) -> str | None:
         """Кадр -> «глаза». Текст ответа или None (кадра нет или мира не видно)."""
         t = time.perf_counter()
-        frame = grab(self.cfg.width, self.cfg.quality)
         if frame is None:
             return None
         saved = self._save(frame, reason)
         data = "\n".join(line for line in self.game.describe().splitlines() if line.startswith(CONTEXT_LINES))
+        # «Ты сам (Гослинг)» глаза «Гослинга» читали как «камера — моя»: «в руках Гослинга топор».
+        data = data.replace("Ты сам (Гослинг):", "Гослинг, идёт рядом (камера не его; снаряжение — его, не Владоса):")
         block = trace.Block(f"Глаза: {reason} [{self.model}]")
         block.section("Кадр", f"{saved or 'не сохранён'} ({len(frame) // 1024} КБ)")
         block.section("Данные игры", data or "нет")
@@ -183,7 +198,7 @@ class Vision:
         if why := self.blind():
             return why
         task = LOOK.format(question=question.strip() or "что вокруг?")
-        text = self._see("по просьбе", task)
+        text = self._see("по просьбе", task, self._frame())
         self._last_glance = time.time()
         return text or "Сейчас не видно: на экране не мир (меню, загрузка или игра свёрнута)."
 
@@ -192,8 +207,12 @@ class Vision:
         if self.blind() or not self._busy.acquire(blocking=False):
             return
         try:
-            place, when = self._place(), time.time()
-            text = self._see(reason, GLANCE)
+            place = self._place()
+            time.sleep(self.cfg.settle)  # событие о новом месте приходит, пока на экране ещё загрузка
+            if self._place() != place or self.blind():  # пока ждали, ушли или Гослинг отстал
+                return
+            when = time.time()
+            text = self._see(reason, GLANCE, self._frame())
             self._last_glance = time.time()
             if text and self._place() == place:  # пока смотрел, не ушли
                 with self._lock:

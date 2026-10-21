@@ -176,7 +176,9 @@ namespace events
 					if (data && data->type.get() < RE::MARKER_TYPE::kTotalLocationTypes) {
 						if (auto name = net::ToUtf8(data->locationName.GetFullName()); !name.empty()) {
 							const auto pos = a_ref->GetPosition();
+							// form — сам маркер (постоянная ссылка): к нему можно послать Гослинга (приказ go_to).
 							markers.push_back({ { "name", std::move(name) },
+								{ "form", a_ref->GetFormID() },
 								{ "type", static_cast<int>(data->type.get()) },
 								{ "x", pos.x }, { "y", pos.y },
 								{ "visible", data->flags.any(RE::MapMarkerData::Flag::kVisible) },

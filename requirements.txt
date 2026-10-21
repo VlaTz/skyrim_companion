@@ -20,6 +20,9 @@ pynput>=1.7
 # LLM (любой OpenAI-совместимый сервер)
 openai>=1.40
 
+# Зрение: снимок окна игры (Pillow ImageGrab)
+pillow>=10
+
 # Service
 fastapi>=0.110
 uvicorn[standard]>=0.29

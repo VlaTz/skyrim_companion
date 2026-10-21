@@ -271,8 +271,10 @@ class VoiceService:
                         log.info("Игрок заговорил снова — прежний ответ не говорим")
                         trace.event("Не сказано: игрок заговорил снова")
                         return
+                    # "do" — только в ответе Владосу: по своей инициативе Гослинг приказов себе не отдаёт.
                     self.on_event({"type": "companion_reply", "text": reply_text, "emotion": emotion,
-                                   "remember": remember, "idea": reply.idea})
+                                   "remember": remember, "idea": reply.idea, "do": reply.do,
+                                   "place": reply.place, "back": reply.back})
                 before_tts = time.perf_counter() - t
                 speech = self.speak(reply_text, emotion)
             log.info("от конца фразы до начала ответа: %.2f с", before_tts + speech.first_audio)

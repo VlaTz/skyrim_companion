@@ -77,11 +77,18 @@ HEARD_MAX_AGE = 30    # подслушанное старше минуты (Го
 DIALOGUE_STALE = 60  # меню разговора «открыто», а реплик нет 2 минуты — видимо, пропустили его закрытие
 GAME_STALE = 20       # секунд без событий из игры — игра не запущена или висит на загрузке
 # Срочное — держится до brain.fresh_important, даже если не помечено важным: тяжело ранен, Крик, впервые увиденное.
-URGENT = {"low_health", "power", "novel", "died", "hurt_self"}
+URGENT = {"low_health", "power", "novel", "died", "hurt_self", "order_failed"}
 # Поводы, которые Владос адресовал лично Гослингу: на них он отвечает, как на обращение, — без шкалы интереса.
 PERSONAL = {"gift", "taken"}
 PERSONAL_PROMPT = ("Это Владос сделал лично тебе — ответь ему, как если бы он к тебе обратился: от себя, к месту, "
                    "1–2 коротких предложения, всего не больше 25 слов.")
+# Приказ голосом не вышел (companion/orders.py): Гослинг обещал — должен сказать, что не сделал, без шкалы.
+ORDER_FAILED_PROMPT = ("Ты только что пообещал это Владосу, а сделать не вышло — скажи ему об этом от себя: "
+                       "одно короткое предложение, почему.")
+# Событие задело запись души (companion/personal.py): повод сказать от себя — по обычной шкале (не к месту — промолчит).
+PERSONAL_TOUCH = ("Это задевает тебя лично — так написано в твоей душе, ты сам это о себе решил. Если правда зацепило, "
+                  "скажи от себя, как своё (страх, радость, воспоминание), а не как справку о событии, и оцени interest "
+                  "не ниже 7; не к месту — оцени ниже.\n")
 THOUGHT = "мысль: "  # Change.subject мысли — «мысль: <текст>»
 LOADED = {"loaded", "died"}  # загрузка сейва (died — после гибели Владоса): всё, что было до неё, — другое прошлое
 TICK = 0.25           # с — как часто мозг смотрит, не пора ли (раньше 1 с — до секунды лишней задержки)
@@ -188,6 +195,10 @@ class Brain:
             self._commented[c.subject or c.text] = now
         events = [c for c in fresh if c not in thoughts]
         what = "; ".join(c.text for c in events)
+        if any(c.kind == "order_failed" for c in events):
+            log.info("Мозг: приказ не вышел -> %s", what)
+            self._ask(EVENT_PROMPT.format(what=what) + ORDER_FAILED_PROMPT, now, changes=events)
+            return True
         if any(c.kind in PERSONAL for c in events) and not self.game.in_combat:
             # Владос сделал что-то лично Гослингу (отдал вещь, забрал) — это как обращение к нему: отвечает без шкалы.
             # По шкале «только что говорил — не выше 6» глушило: щит отдали через 18 с после реплики — интерес 3–4.
@@ -204,7 +215,8 @@ class Brain:
                 self.thought_said(thought)
             return True
         log.info("Мозг: событие -> %s", what)
-        self._ask(EVENT_PROMPT.format(what=what), now, EVENT_BANDS, changes=events)
+        touch = PERSONAL_TOUCH if any(c.kind == "personal" for c in events) else ""
+        self._ask(EVENT_PROMPT.format(what=what) + touch, now, EVENT_BANDS, changes=events)
         return True
 
     def _maybe_overheard(self, now: float) -> None:

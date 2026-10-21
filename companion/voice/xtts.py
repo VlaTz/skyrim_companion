@@ -2,7 +2,8 @@
 
 Референсы лежат в characters/<персонаж>/voice/<эмоция>/*.wav. При запуске для каждой
 эмоции один раз считается условие голоса (GPT-латент + эмбеддинг диктора), дальше
-синтез только подставляет нужное.
+синтез только подставляет нужное. tts.references: false — без референсов: один встроенный диктор XTTS
+(tts.speaker) на все эмоции — голос не персонажа, эмоции без разницы.
 """
 
 from __future__ import annotations
@@ -92,22 +93,32 @@ class XttsTTS:
         self.char_limit = self.model.tokenizer.char_limits.get(cfg.language, 200)
 
         self.presets: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
-        for emotion in EMOTIONS:
-            refs = sorted((voice_dir / emotion).glob("*.wav"))
-            if refs:
-                self.presets[emotion] = self.model.get_conditioning_latents(audio_path=[str(p) for p in refs])
-        if DEFAULT_EMOTION not in self.presets:
-            raise FileNotFoundError(
-                f"Нет референсов {voice_dir / DEFAULT_EMOTION}/*.wav. Собери: python tools/make_voice_refs.py"
-            )
-        missing = [e for e in EMOTIONS if e not in self.presets]
-        if missing:
-            log.warning("Нет референсов для эмоций %s — будет %s", missing, DEFAULT_EMOTION)
+        if cfg.references:
+            for emotion in EMOTIONS:
+                refs = sorted((voice_dir / emotion).glob("*.wav"))
+                if refs:
+                    self.presets[emotion] = self.model.get_conditioning_latents(audio_path=[str(p) for p in refs])
+            if DEFAULT_EMOTION not in self.presets:
+                raise FileNotFoundError(
+                    f"Нет референсов {voice_dir / DEFAULT_EMOTION}/*.wav. Собери: python tools/make_voice_refs.py"
+                )
+            missing = [e for e in EMOTIONS if e not in self.presets]
+            if missing:
+                log.warning("Нет референсов для эмоций %s — будет %s", missing, DEFAULT_EMOTION)
+        else:  # без референсов — встроенный диктор (условие уже посчитано в speakers_xtts.pth)
+            speakers = torch.load(model_dir / "speakers_xtts.pth", map_location="cpu", weights_only=False)
+            if cfg.speaker not in speakers:
+                raise ValueError(f"Нет встроенного диктора «{cfg.speaker}» в speakers_xtts.pth; есть: "
+                                 + ", ".join(speakers))
+            voice = speakers[cfg.speaker]
+            self.presets[DEFAULT_EMOTION] = (voice["gpt_cond_latent"].to(cfg.device),
+                                             voice["speaker_embedding"].to(cfg.device))
+            log.info("XTTS без референсов: встроенный диктор «%s», эмоции не различаются", cfg.speaker)
 
         # Прогрев: первая генерация на GPU заметно медленнее.
         self.synthesize("Привет.", DEFAULT_EMOTION)
-        log.info("XTTS '%s' загружен на %s за %.1f с, эмоции: %s",
-                 cfg.model, cfg.device, time.perf_counter() - t, ", ".join(self.presets))
+        log.info("XTTS '%s' загружен на %s за %.1f с, %s", cfg.model, cfg.device, time.perf_counter() - t,
+                 ("эмоции: " + ", ".join(self.presets)) if cfg.references else f"диктор «{cfg.speaker}», без референсов")
 
     def _preset(self, emotion: str | None) -> tuple[torch.Tensor, torch.Tensor]:
         return self.presets.get(emotion or DEFAULT_EMOTION, self.presets[DEFAULT_EMOTION])

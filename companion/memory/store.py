@@ -301,11 +301,11 @@ class MemoryStore:
         мыслитель видит её в «уже сказал»."""
         self._write("UPDATE goals SET status = 'said' WHERE kind = 'idea' AND status = 'active' AND text = ?", (text,))
 
-    def said_ideas(self, count: int) -> list[str]:
-        """Последние высказанные мысли, свежие первыми."""
-        return [text for (text,) in self._rows(
-            "SELECT text FROM goals WHERE archived = 0 AND kind = 'idea' AND status = 'said' ORDER BY id DESC LIMIT ?",
-            (count,))]
+    def said_ideas(self, count: int, within: float = 0) -> list[tuple[str, float]]:
+        """Высказанные мысли с временем (реальным), свежие первыми; within — только за столько секунд (0 — любые)."""
+        return self._rows(
+            "SELECT text, real_time FROM goals WHERE archived = 0 AND kind = 'idea' AND status = 'said' "
+            "AND real_time >= ? ORDER BY id DESC LIMIT ?", (time.time() - within if within else 0, count))
 
     # ------------------------------------------------------------ вспоминание (справка recall)
 
@@ -383,6 +383,16 @@ class MemoryStore:
     def add_encounter(self, category: str, key: str, where: Where) -> None:
         self._write("INSERT INTO encounters (real_time, game_days, category, key, place) VALUES (?, ?, ?, ?, ?)",
                     (time.time(), where.game_days, category, key.lower(), where.place or None))
+
+    def rename_encounters(self, category: str, legacy: dict[str, str]) -> None:
+        """Встречи под прежними ключами — под нынешними (раса «dragon» стала «дракон»): счётчик «уже встречали»
+        не теряется."""
+        with self._lock:
+            if not self._db:
+                return
+            for old, new in legacy.items():
+                self._db.execute("UPDATE encounters SET key = ? WHERE category = ? AND key = ?", (new, category, old))
+            self._db.commit()
 
     def _backfill_encounters(self) -> None:
         """Под блокировкой open(): один раз на базу — встречи из старого журнала."""

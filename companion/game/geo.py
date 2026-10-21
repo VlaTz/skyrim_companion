@@ -33,6 +33,7 @@ DIRECTIONS = ["север", "северо-восток", "восток", "юго
 
 class Marker(BaseModel):
     name: str
+    form: int = 0          # сам маркер в игре (постоянная ссылка) — цель приказа go_to
     type: int = 0
     x: float
     y: float
@@ -90,7 +91,9 @@ def describe_surroundings(px: float, py: float, markers: list[Marker], here: str
                if not m.visible and distance_m(px, py, m) <= unknown_radius][:unknown_count]
     lines = []
     if known:
-        lines.append("Знакомые места на карте: " + "; ".join(
+        # «Ближайшие, не все»: без этого модель считала список всей картой — «Ривервуд на карте не отмечен» (20.10).
+        lines.append("Ближайшие знакомые места на карте (это не все — остальные открытые места: справка find_places): "
+                     + "; ".join(
             f"{m.name} ({m.kind}) — {format_distance(distance_m(px, py, m))} на {direction(px, py, m)}"
             for m in known) + ".")
     if unknown:

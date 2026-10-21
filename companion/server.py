@@ -32,12 +32,14 @@ from companion.game.books import BookLibrary
 from companion.game.dialogue import DialogueTexts
 from companion.game.places import PlaceBook
 from companion.game.profile import PlayerProfile
-from companion.game.state import GameEvent, GameState
+from companion.game.state import Change, GameEvent, GameState
 from companion.jokes import JokeBook, Jokes, JokeWriter
 from companion.game.items import ItemBook
 from companion.knowledge import Knowledge
 from companion.memory.soul import Soul
 from companion.mood import Mood
+from companion.orders import Orders
+from companion.personal import Personal
 from companion.musings import Musings
 from companion.memory.diarist import Diarist
 from companion.memory.keeper import MemoryKeeper
@@ -130,22 +132,34 @@ def create_app(cfg: Config) -> FastAPI:
     # Настроение — из событий игры, в обстановку; душа усиливает то, что задевает лично.
     mood = Mood(soul=lambda: memory.store.soul_feel() if memory.store.is_open else []) if cfg.mood.enabled else None
     memory.mood = mood
+    personal = Personal(mood, cfg.personal) if mood and cfg.personal.enabled else None  # событие задело душу — повод
     game.meet = memory.meet  # встречи (раса врага, Крик) — «впервые» или «уже встречали»
     npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
                          lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
+    orders = Orders(commands.send, commands.connected, game)  # «жди», «пошли» — поле "do" ответа -> игре
     state: dict = {}
 
     def publish(event: dict) -> None:
         """События голосового сервиса — в журнал WebSocket и в память (реплики игрока и Гослинга)."""
         hub.publish(event)
         memory.on_voice_event(event)
+        if event.get("type") == "companion_reply" and event.get("do"):  # согласился — делает, пока говорит
+            orders.give(str(event["do"]), place=str(event.get("place") or ""), back=bool(event.get("back")))
         if event.get("joke") and "brain" in state and state["brain"].jokes:  # обыграл заготовку — помним, что сказано
             state["brain"].jokes.said(str(event["joke"]))
-        if event.get("idea") and "thinker" in state:  # высказал мысль (хоть в ответе Владосу) — больше не предлагать
-            if idea := memory.shown_ideas.get(str(event["idea"]).strip("[] ")):
+        if event.get("type") == "companion_reply" and "thinker" in state:
+            # высказал мысль (хоть в ответе Владосу) — больше не предлагать; метку модели проверяем по тексту реплики
+            for idea in state["thinker"].spoken(event.get("idea"), str(event.get("text") or ""), memory.shown_ideas):
                 state["thinker"].said(idea)
-            else:
-                log.info("Мысль «%s»: такой метки в показанных нет — не помечаем", event["idea"])
+
+    def order_changes(changes: list[Change]) -> None:
+        """Приказ не вышел ещё до игры (места нет на карте) — как событие игры: в «Недавно», в память, мозгу."""
+        game.note(changes)
+        memory.record_changes(changes)
+        if "brain" in state:
+            state["brain"].notify(changes)
+
+    orders.on_changes = order_changes
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -266,15 +280,19 @@ def create_app(cfg: Config) -> FastAPI:
         except ValidationError as e:
             raise HTTPException(422, f"Неверные поля {event.type}: {e}")
         memory.on_game_event(event, changes)
-        if mood and changes:
-            mood.notify(changes)
-        if "vision" in state and changes:  # новое место, смена погоды — взглянуть (в фоне)
-            state["vision"].notify(changes)
-        texts = [c.text for c in changes]
-        if changes:  # служебные (карта, квесты, сведения об игроке, say_result) в журнал не пишем
+        # Чего Гослинг не видел (он не рядом), то его не трогает и не повод говорить — только в журнал памяти.
+        seen = [c for c in changes if not c.unseen]
+        if mood and seen:
+            mood.notify(seen)
+        touched = personal.notify(seen) if personal and seen else []  # задело запись души — повод мозгу: от себя
+        seen += touched
+        if "vision" in state and seen:  # новое место, смена погоды — взглянуть (в фоне)
+            state["vision"].notify(seen)
+        texts = [c.text for c in changes + touched]
+        if texts:  # служебные (карта, квесты, сведения об игроке, say_result) в журнал не пишем
             hub.publish({"type": "game_event", "event": event.type, "changes": texts})
-        if "brain" in state and changes:
-            state["brain"].notify(changes)
+        if "brain" in state and seen:
+            state["brain"].notify(seen)
         return {"changes": texts}
 
     @app.get("/game/state")

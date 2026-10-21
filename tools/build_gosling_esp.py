@@ -2,7 +2,8 @@
 
 Gosling.esp:
 - NPC «Гослинг» — копия записи HirelingErikTheSlayer (Эрик-наёмник) из Skyrim.esm: лицо, раса, голос
-  MaleYoungEager — его; правим имя, фракции компаньона, пакет поведения (бродит по таверне), флаги, уровень.
+  MaleYoungEager — его; правим имя, фракции компаньона, пакет поведения (бродит по таверне), флаги
+  (бессмертен — essential), уровень.
   Без шаблона (Use Traits): с ним игра собирает «составного» NPC с другим итоговым типом голоса, и реплики
   из нашего .wav не звучат. Файл лица (FaceGen) копируем из архивов игры под номером Гослинга.
   Личные реплики Эрика привязаны к нему самому — к Гослингу не переходят.
@@ -10,7 +11,7 @@ Gosling.esp:
   (в диалоге есть «Следуй за мной»).
 - Квест GoslingVQ (стартует с игрой) с двумя темами-заглушками: голос из уст Гослинга (кусок 5б).
   Звук реплик сервис кладёт в Sound\\Voice\\Gosling.esp\\MaleYoungEager\\ перед каждой фразой.
-Ещё в моде: Scripts\\GoslingVoice.pex (компилируется из mod/Scripts/Source), Seq\\Gosling.seq (без него
+Ещё в моде: Scripts\\GoslingVoice.pex и GoslingOrders.pex (компилируются из mod/Scripts/Source), Seq\\Gosling.seq (без него
 реплики квеста, стартующего с игрой, не звучат), заглушки .wav и .lip для тем
 и файлы лица Гослинга (meshes/textures\\...\\FaceGenData\\...\\Gosling.esp\\00000800.*).
 
@@ -165,7 +166,8 @@ def gosling_npc(w: Writer, template: list[tuple[bytes, bytes]]) -> bytes:
         elif typ == b"ACBS":
             (flags, magicka, stamina, level, cmin, cmax, speed, disp, tflags,
              health, bleedout) = struct.unpack("<IhhHHHHhHhH", payload)
-            flags = (flags | UNIQUE | PROTECTED | PC_LEVEL_MULT) & ~(ESSENTIAL | RESPAWN)
+            # Бессмертен: в бою падает на колено и встаёт после боя (защищённого мог убить сам игрок).
+            flags = (flags | UNIQUE | ESSENTIAL | PC_LEVEL_MULT) & ~(PROTECTED | RESPAWN)
             out.append((typ, struct.pack("<IhhHHHHhHhH", flags, magicka, stamina, 1000, 1, 50, speed,
                                          disp, 0, health, bleedout)))  # без шаблона
         elif typ == b"SNAM":  # фракции Эрика -> только фракции компаньона

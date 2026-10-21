@@ -76,7 +76,8 @@ EVENT_MOOD: dict[str, dict[str, float]] = {
 FEELINGS = {"радость": "joy", "страх": "tension", "неприязнь": "irritation", "грусть": "gloom"}
 PERSONAL = 0.35
 # Не с ним самим: что говорят NPC, что Владос подобрал или нашёл в сундуке (железный щит в его сумке — не подарок).
-NOT_PERSONAL = {"overheard", "item", "looted"}
+# Названия заданий, записи журнала и книги — слова, а не встреча: «Дракон в небе» завершено — не дракон перед глазами.
+NOT_PERSONAL = {"overheard", "item", "looted", "quest", "quest_misc", "quest_log", "profile", "reading", "deed"}
 # Потеря (taken — Владос забрал вещь): своё в таблице не радует, а забрали то, что радует по душе, — лёгкая грусть
 # («немного не в духе»), не больше; страх и неприязнь к забранному не задевают.
 LOSS = {"taken"}
@@ -131,6 +132,11 @@ class Mood:
         value, at = self._value.get(name, 0.0), self._at.get(name, now)
         return value * 0.5 ** ((now - at) / COMPONENTS[name].half_life)
 
+    @staticmethod
+    def _hit(stems: list[str], have: list[str]) -> bool:
+        """Все основы stems есть среди слов have (по началу слова: «солитьюд» — «Солитьюде»)."""
+        return bool(stems) and all(any(w.startswith(m) for w in have) for m in stems)
+
     def _personal(self, change: Change, soul: list[tuple[str, str, dict | None]]) -> list[tuple[str, float, str]]:
         """Что в событии задело Гослинга лично: [(составляющая, на сколько, причина)] — по поводам из души."""
         if change.kind in NOT_PERSONAL:
@@ -142,10 +148,31 @@ class Mood:
         for key, _text, feel in soul:
             for feeling, triggers in (feel or {}).items():  # None — поводов ещё не спрашивали (старая запись)
                 name = feelings.get(feeling)
-                hit = next((t for t in triggers if (want := words(t))
-                            and all(any(w.startswith(m) for w in have) for m in want)), None)
+                hit = next((t for t in triggers if self._hit(words(t), have)), None)
                 if name and hit:
                     out.append((name, delta, f"{change.gist} — {'жаль' if loss else 'задело лично'} ({key})"))
+        return out
+
+    def touched(self, change: Change) -> list[tuple[str, str, str, str]]:
+        """Какие записи души задело событие: [(ключ, текст записи, чувство, слово)] — для личной реплики
+        (companion/personal.py). По поводам записи (радость, страх, неприязнь, грусть) и, у новой локации, по названию
+        места в самой записи («прошлое: Солитьюд…» — «воспоминание»)."""
+        if change.kind in NOT_PERSONAL:
+            return []
+        try:
+            soul = self.soul()
+        except Exception:  # noqa: BLE001
+            return []
+        have = words(change.gist)
+        place = [w for w in words(change.subject or "") if len(w) >= 5] if change.kind == "location" else []
+        out = []
+        for key, text, feel in soul:
+            hit = next(((feeling, t) for feeling, ts in (feel or {}).items() for t in ts
+                        if self._hit(words(t), have)), None)
+            if hit:
+                out.append((key, text, hit[0], hit[1]))
+            elif place and self._hit(place, words(text)):
+                out.append((key, text, "воспоминание", change.subject))
         return out
 
     def notify(self, changes: list[Change]) -> None:
@@ -171,8 +198,11 @@ class Mood:
                         self._value[name] = max(0.0, self._now(name, now) + delta)
                         self._at[name] = now
                         continue
-                    add = max(0.0, delta - self._left(key, name, now))
-                    self._value[name] = min(1.0, self._now(name, now) + add)
+                    # Убывающая отдача: чем выше уже настроение, тем меньше прибавляет следующее событие (одно за
+                    # другим «в восторге» от трёх новых мест подряд, а не от каждого, и не весь час).
+                    current = self._now(name, now)
+                    add = max(0.0, delta - self._left(key, name, now)) * (1 - current)
+                    self._value[name] = min(1.0, current + add)
                     self._at[name] = now
                     self._from[(key, name)] = (delta, now)
                     # Причина — что больше всего держит настроение: новое событие её перехватывает, только если
@@ -204,7 +234,11 @@ class Mood:
                 current = self._now(grow, now)
                 self._value[grow] = min(max(current, FELT_CEILING), current + budget)
                 self._at[grow] = now
-                self._cause[grow] = (cause, now, "")
+                was = self._cause.get(grow)
+                # Слова — причина, только если настроение держится на них: событие, которое ещё держит больше
+                # прибавки от слов, остаётся причиной («в восторге — новое место», а не «Владос сказал: куда идти?»).
+                if not was or was[2] == "" or self._left(was[2], grow, now) < budget:
+                    self._cause[grow] = (cause, now, "")
 
     def state(self) -> dict[str, float]:
         now = self.clock()

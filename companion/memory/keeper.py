@@ -2,7 +2,7 @@
 из памяти текст для модели.
 
 - game_loaded / status с ID персонажа -> открыть его память (и убрать в архив записи «из будущего»);
-- изменения в игре (события, подслушанное у NPC) -> журнал;
+- изменения в игре (события, подслушанное у NPC) -> журнал; без Гослинга (Change.unseen) — «без тебя: …»;
 - реплики игрока и Гослинга (события голосового сервиса) -> журнал;
 - открыли память персонажа -> подслушанное за последние минуты обратно в обстановку и on_open (сервис
   восстанавливает историю разговора LLM);
@@ -26,13 +26,16 @@ from typing import Callable
 from companion.game.books import book_key
 from companion.knowledge import stems
 from companion.game.places import PlaceBook
-from companion.game.state import HEARD_SECONDS, Change, GameEvent, GameState, Heard
+from companion.game.state import HEARD_SECONDS, Change, GameEvent, GameState, Heard, legacy_race_keys
 from companion.memory.store import MemoryStore, Where, memory_key
 from companion.memory.soul import soul_block
 
 log = logging.getLogger(__name__)
 
-MAX_VISITS = 8        # сколько посещённых мест называть в {memory}
+MAX_VISITS = 8        # сколько посещённых мест называть в {memory} с давностью; остальные — только названием
+# Места старше — названием, не больше стольких. Обрезанный без пометки список модель считала всем прошлым:
+# Ривервуд был девятым — «мы там не бывали» (20.10).
+MAX_VISIT_NAMES = 40
 DIARY_IN_PROMPT = 3   # последних записей дневника — в {memory}
 MAX_FACTS = 8         # фактов о месте и людях рядом — в «Сейчас в игре»
 GOAL_TITLES = {"goal": "Цели", "promise": "Договорённости", "player": "Что ты знаешь о Владосе"}
@@ -92,15 +95,15 @@ class MemoryKeeper:
             # status приходит раз в 5 с — открываем, только если это другой персонаж (или сервис перезапущен);
             # game_loaded — всегда: мог загрузиться сейв постарше того же персонажа.
             if event.type == "game_loaded" or memory_key(character, name) != self.store.key:
-                if self.store.open(character, name, self._days):
+                changed = self.store.open(character, name, self._days)
+                self.store.rename_encounters("раса", legacy_race_keys())
+                if changed:
                     self.opened += 1
                     self._restore_heard()
                     self._restore_stats()
                     self._restore_read()
                     self.on_open()
-        where = self.where()
-        for change in changes:
-            self.store.record("heard" if change.kind == "overheard" else "event", change.text, where)
+        self.record_changes(changes)
         # Прочитанное: Владос открыл книгу — «читал Владос»; отдал книгу Гослингу — тот прочитал сам.
         if event.type == "book_read":
             self._read(book_key(str(data.get("file", "")), int(data.get("form", 0))), "владос")
@@ -116,6 +119,14 @@ class MemoryKeeper:
             if area and self._area_now and area != self._area_now:
                 self.on_place_changed()
             self._area_now = area or self._area_now
+
+    def record_changes(self, changes: list[Change]) -> None:
+        """Изменения в игре — в журнал."""
+        where = self.where()
+        for change in changes:
+            # Без Гослинга (он не рядом) — с пометкой: летописец пишет дневник от его лица, а он этого не видел.
+            text = f"без тебя: {change.text}" if change.unseen else change.text
+            self.store.record("heard" if change.kind == "overheard" else "event", text, where)
 
     def on_voice_event(self, event: dict) -> None:
         """События голосового сервиса: player_speech, companion_reply."""
@@ -325,10 +336,14 @@ class MemoryKeeper:
             parts.append("Твой дневник (последние записи):\n" + "\n".join(
                 f"- {days_ago(self._days - days) if days is not None else '?'}, {place or '?'}: {text}"
                 for days, place, text in diary))
-        visits = [f"{name} — {days_ago(self._days - last)}"
-                  for name, _first, last in self.visits()[:MAX_VISITS]]
-        if visits:
-            parts.append("Где вы бывали вместе (по игровому времени): " + "; ".join(visits) + ".")
+        visits = self.visits()
+        recent = [f"{name} — {days_ago(self._days - last)}" for name, _first, last in visits[:MAX_VISITS]]
+        older = [name for name, _first, _last in visits[MAX_VISITS:MAX_VISITS + MAX_VISIT_NAMES]]
+        more = len(visits) - MAX_VISITS - len(older)
+        if recent:
+            parts.append("Где вы бывали вместе (по игровому времени): " + "; ".join(recent)
+                         + (f"; раньше: {', '.join(older)}" if older else "")
+                         + (f" и ещё {more} мест (что там было — справка recall)" if more > 0 else "") + ".")
         if parts:
             parts.append("Чего нет в памяти и дневнике, ты не помнишь — подробностей не выдумывай.")
         return "\n".join(parts)

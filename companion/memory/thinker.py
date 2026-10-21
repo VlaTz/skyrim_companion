@@ -20,13 +20,34 @@ import time
 from typing import Callable
 
 from companion.config import ThinkerConfig
+from companion.game.items import words
 from companion.game.state import Change, GameState
 from companion.memory.keeper import MemoryKeeper
 
 log = logging.getLogger(__name__)
 
 GAME_STALE = 20       # с без событий из игры — игра не идёт, думать не о чем
-SAID_SHOWN = 10       # последних высказанных мыслей — мыслителю, чтобы не придумывал их заново
+SAID_WINDOW = 3600    # с — высказанные за этот срок мыслитель видит (было «10 последних» — через 20 минут забывал)
+SAID_MAX = 40         # и не больше стольких
+# Метка «idea» в ответе: модель путает номера (после высказанной мысли список «Твоих мыслей» сдвигается, а ответ уже
+# идёт со старыми метками — 9 меток из 28 за час стояли у мыслей, о которых в реплике ни слова) и не ставит её у
+# реплики, что почти пересказывает мысль. Сходство — доля характерных основ мысли (слова от 5 букв), что есть в реплике.
+MARK_MIN = 0.15       # метке верим, если реплика хоть немного похожа на мысль
+GUESS_MIN = 0.6       # метка ложная или её нет, а реплика почти пересказывает мысль из списка — это она
+
+
+def distinct(text: str) -> set[str]:
+    return {w for w in words(text) if len(w) >= 5}
+
+
+def resemblance(idea: str, reply: str) -> float:
+    """Какая доля характерных основ мысли есть в реплике (0..1)."""
+    mine = distinct(idea)
+    return len(mine & distinct(reply)) / len(mine) if mine else 0.0
+
+
+def ago_minutes(seconds: float) -> str:
+    return "только что" if seconds < 90 else f"{round(seconds / 60)} мин назад"
 
 SYSTEM = """Ты — внутренний голос Гослинга, спутника Владоса в Скайриме: весёлый молодой норд, бывший картограф.
 По обстановке, сумке, заданиям и памяти реши, что Гослингу сейчас стоит держать в голове и, может быть,
@@ -54,7 +75,9 @@ class Thinker:
         self.keeper = keeper
         self.store = keeper.store
         self.game = game
-        self.complete = complete
+        c = self.cfg  # своя модель мыслителя (thinker.model): мысли заменяются каждый раз, ошибка живёт недолго
+        self.complete = lambda system, user, **kw: complete(system, user, model=c.model or None, reasoning=c.reasoning,
+                                                            max_tokens=c.max_tokens or None, **kw)
         self.on_thought = on_thought  # новые мысли — мозгу: повод заговорить
         self._last_run = 0.0
         self._seen: tuple | None = None  # (поселение, цели заданий, сумка) при прошлом раздумье
@@ -73,6 +96,20 @@ class Thinker:
         if self._speak_at != (self.keeper.opened, self.keeper.area):
             return None
         return next((t for t in self._speak if t not in self._said), None)
+
+    def spoken(self, label: str | None, reply: str, shown: dict[str, str]) -> list[str]:
+        """Какие мысли из показанных (метка -> мысль) реплика высказала: по метке модели, если реплика на мысль
+        похожа; иначе — самая похожая, если почти пересказывает её. Остальное — никакая."""
+        by_label = shown.get(str(label or "").strip("[] "))
+        if by_label and resemblance(by_label, reply) >= MARK_MIN:
+            return [by_label]
+        best = max(shown.values(), key=lambda idea: resemblance(idea, reply), default=None)
+        if best and resemblance(best, reply) >= GUESS_MIN:
+            log.info("Мысль «%s»: метка %s, а реплика пересказывает другую — помечаю её", best[:60], label or "не стоит")
+            return [best]
+        if by_label:
+            log.info("Мысль «%s»: метка %s не про эту реплику — не помечаю", by_label[:60], label)
+        return []
 
     def said(self, text: str) -> None:
         """Мозг высказал мысль — больше её не предлагать: из «Твоих мыслей» в обстановке — вон (в памяти — «said»),
@@ -146,6 +183,7 @@ class Thinker:
     # ------------------------------------------------------------ раздумье
 
     def _think(self, why: str) -> bool:
+        now = time.time()
         old = self.store.ideas()
         name = self.store.player_name or "Владос"
         dialogue = [f"{name}: {text}" if kind == "player" else f"Гослинг: {text}"
@@ -158,8 +196,9 @@ class Thinker:
                 + "\n\nПоследние реплики:\n" + ("\n".join(dialogue) or "пока не разговаривали")
                 + "\n\nПрежние мысли:\n" + ("\n".join(f"- {i}" + (" (уже сказал вслух)" if i in self._said else "")
                                                       for i in old) or "нет")
-                + "\n\nУже сказал вслух — не повторяй и не переформулируй, пока Владос сам не вернётся к этому:\n"
-                + ("\n".join(f"- {i}" for i in self.store.said_ideas(SAID_SHOWN)) or "ничего"))
+                + "\n\nУже сказал вслух (когда) — не повторяй и не переформулируй, пока Владос сам не вернётся к этому:\n"
+                + ("\n".join(f"- {i} ({ago_minutes(now - at)})" for i, at in self.store.said_ideas(SAID_MAX, SAID_WINDOW))
+                   or "ничего"))
         epoch, area = self.keeper.opened, self.keeper.area
         result = self.complete(SYSTEM, user, title=f"Мыслитель: {why}")
         if self.keeper.area != area:

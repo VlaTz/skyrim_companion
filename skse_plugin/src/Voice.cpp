@@ -14,13 +14,16 @@ namespace voice
 		constexpr std::array<RE::FormID, 2> kTopics = { 0x810, 0x812 };
 		constexpr float                     kUnitsPerMeter = 70.0f;
 		constexpr double                    kStaleCommand = 2.0;  // с в очереди игрового потока — игра была на паузе
+	}
 
-		RE::Actor* Gosling()
-		{
-			const auto handler = RE::TESDataHandler::GetSingleton();
-			return handler ? handler->LookupForm<RE::Actor>(kNpcRef, kPlugin) : nullptr;
-		}
+	RE::Actor* Gosling()
+	{
+		const auto handler = RE::TESDataHandler::GetSingleton();
+		return handler ? handler->LookupForm<RE::Actor>(kNpcRef, kPlugin) : nullptr;
+	}
 
+	namespace
+	{
 		// Сколько ждать, что реплика зазвучала, и как часто проверять. Say() идёт через Papyrus (не сразу),
 		// звук стартует ещё чуть позже (~0,13 с). Сразу после прошлой фразы игра Say() молча отбрасывает
 		// (Гослинг для неё ещё «говорит») — тогда повторяем Say(), пока не зазвучит.
@@ -354,7 +357,9 @@ namespace voice
 		const bool loaded = !actor->IsDisabled() && actor->Is3DLoaded();
 		json out = { { "loaded", loaded },
 			{ "distance", loaded ? a_player->GetDistance(actor) / kUnitsPerMeter : -1.0f },
-			{ "follower", actor->IsPlayerTeammate() } };
+			{ "follower", actor->IsPlayerTeammate() },
+			// Ждёт, где велели (приказ голосом или диалог «Жди здесь»): значение актёра, как у ванильных спутников.
+			{ "waiting", actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kWaitingForPlayer) > 0.0f } };
 		// Своё здоровье: как у игрока (значение и максимум), «упал без сил» — состояние спутника, которого почти добили
 		// (поле состояния актёра, не функция по адресу), мёртв.
 		if (loaded) {

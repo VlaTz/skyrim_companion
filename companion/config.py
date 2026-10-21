@@ -57,6 +57,8 @@ class TTSConfig(BaseModel):
     language: str = "ru"
     temperature: float = 0.7
     speed: float = 1.0
+    references: bool = True   # xtts: голос и эмоции — по референсам персонажа; False — встроенный голос XTTS (speaker)
+    speaker: str = "Viktor Eka"  # xtts без референсов: встроенный диктор из speakers_xtts.pth (58 голосов)
     stream: bool = True
     stream_chunk_size: int = 20
     stream_prebuffer: float = 1.0
@@ -153,7 +155,7 @@ class BrainConfig(BaseModel):
         "loaded", "location", "wilderness", "interior", "combat_started", "combat_ended", "low_health", "item",
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
         "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "taken",
-        "hurt_self",
+        "hurt_self", "personal", "order_failed", "rejoined", "arrived",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
@@ -192,6 +194,7 @@ class VisionConfig(BaseModel):
     silence_gap: float = 180    # с — в тишине не чаще
     after_load: float = 10      # с после загрузки сейва — не смотреть (на экране ещё загрузка)
     revisit: float = 30         # с — вернулись туда, откуда ушли раньше этого, — заново не смотреть
+    settle: float = 2           # с — подождать перед взглядом сам (событие приходит, пока на экране загрузка)
     width: int = 1024           # px — кадр уменьшается до этой ширины
     quality: int = 80           # JPEG
     frames: int = 20            # последних кадров хранить в logs/frames (для разбора); 0 — не хранить
@@ -199,11 +202,22 @@ class VisionConfig(BaseModel):
     extra_body: dict | None = None  # свои поля запроса; None — как llm.extra_body (Sonnet: {reasoning: {effort: low}})
 
 
+class PersonalConfig(BaseModel):
+    """Личные реплики (companion/personal.py): событие задело запись души — повод заговорить от себя."""
+    enabled: bool = True
+    gap: float = 900      # с — одну запись души не чаще
+    gap_all: float = 120  # с — любую не чаще
+
+
 class SoulConfig(BaseModel):
     """Душа Гослинга (companion/memory/soul.py): после главы летописца — что из сказанного о себе запомнить."""
     enabled: bool = True
-    reasoning: str = "medium"  # рассуждение фоновой модели: low | medium | high; "" — как у остальных фоновых
+    model: str = ""            # решающая модель души; пусто — llm.background_model
+    reasoning: str = "medium"  # её рассуждение: low | medium | high; "" — как у остальных фоновых
     max_tokens: int = 6000     # с рассуждением: его токены входят в лимит
+    # Дешёвый отбор: после каждой главы сперва он; нечего записывать (так в 4 главах из 5) — model не зовём.
+    screen_model: str = ""     # пусто — без отбора, сразу model
+    screen_reasoning: str = "medium"
 
 
 class ThinkerConfig(BaseModel):
@@ -216,6 +230,9 @@ class ThinkerConfig(BaseModel):
     max_ideas: int = 3           # мыслей за раз — не больше
     dialogue_lines: int = 12     # последних реплик в запрос — что уже предлагал и что ответил Владос
     revisit: float = 30          # с — вернулись туда, откуда ушли раньше этого, — заново не думать (граница локации)
+    model: str = ""              # своя модель мыслителя; пусто — llm.background_model
+    reasoning: str = ""          # её рассуждение: low | medium | high; "" — как у остальных фоновых
+    max_tokens: int = 0          # лимит ответа вместе с рассуждением; 0 — llm.background_max_tokens
 
 
 class JokesConfig(BaseModel):
@@ -263,6 +280,7 @@ class Config(BaseModel):
     thinker: ThinkerConfig = ThinkerConfig()
     soul: SoulConfig = SoulConfig()
     mood: MoodConfig = MoodConfig()
+    personal: PersonalConfig = PersonalConfig()
     vision: VisionConfig = VisionConfig()
     jokes: JokesConfig = JokesConfig()
     overlay: OverlayConfig = OverlayConfig()

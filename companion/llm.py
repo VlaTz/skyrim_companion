@@ -24,6 +24,7 @@ from typing import Callable
 from companion.config import LLMConfig
 from companion import trace
 from companion.emotions import DEFAULT_EMOTION, EMOTIONS
+from companion.orders import ACTIONS
 from companion.tools import Tool
 
 log = logging.getLogger(__name__)
@@ -43,15 +44,24 @@ RESPONSE_FORMAT = """
 утешение", "сила": 1..3}}. Тёплые слова, похвала, доброе о тебе — радость; грубость всерьёз — обида или злость;
 тревога, опасность рядом — страх; поддержка после беды — утешение. Подколка в шутку и обычный разговор (куда идём,
 что делать) — не пиши поле.
+"do" — сделать в игре то, что ты в этой реплике согласился сделать по просьбе Владоса: "wait" — остаться ждать
+здесь (на время, он вернётся); "follow" — идти за ним (ты не его спутник — значит, пойти с ним); "dismiss" — он
+отпускает тебя совсем: ты больше не его спутник и уходишь к себе, туда, где он тебя нашёл; "go_to" — сходить к
+месту с карты Владоса, тогда ещё "place" — его название точно как на карте (ближайшие — в «Сейчас в игре»,
+любые другие — справка find_places) и "back": true, если потом вернуться к Владосу, false — ждать его там.
+Сходить сам ты можешь только недалеко — до ~150 м; дальше пока не умеешь: так и скажи, предложи пойти вместе.
+Сказал «жду», «иду за тобой», «пошли», «ну, бывай», «сбегаю туда» — заполни поле: без него ты этого не сделаешь.
+Отказался, пошутил, переспрашиваешь или уточняешь, что он хочет, или просто говорите о планах — не пиши поле:
+вопрос — ещё не согласие, сначала дождись ответа.
 """
 
-# Пока нет команд в игру (кусок 6 плана) — честно говорим модели, что она умеет только говорить.
+# Действия голосом — поле "do" ответа (companion/orders.py), выполняет игра. Чего пока нет — честно говорим модели.
 CAPABILITIES = """
 ТВОИ ВОЗМОЖНОСТИ
-Пока ты можешь только говорить. По просьбе голосом ты не умеешь идти, ждать, следовать,
-осматриваться, сражаться или брать вещи — это игрок выбирает в обычном разговоре с тобой.
-Если просят что-то сделать, не обещай и не говори, что уже делаешь: пошути или скажи,
-что пока останешься рядом.
+По просьбе Владоса ты можешь остаться ждать на месте, идти за ним, расстаться с ним и уйти к себе или сходить к
+месту с его карты, если оно недалеко (поле "do"). Сражаешься ты сам, как обычный спутник. Подбирать вещи и исследовать по просьбе голосом
+ты пока не умеешь: если просят, не обещай и не говори, что уже делаешь, — пошути или скажи, что пока останешься рядом.
+Когда ты далеко от Владоса, ты его не видишь и не слышишь; что он делал без тебя, ты не знаешь.
 """
 
 SELF_TALK = """
@@ -121,6 +131,9 @@ class Reply:
     quip: bool = False           # прозвучала шуткой ниже порога интереса
     idea: str | None = None      # метка мысли из «Твоих мыслей», которую высказала (companion/memory/thinker.py)
     felt: tuple[str, int] | None = None  # как задела реплика Владоса: (чувство, сила 1..3) — настроению
+    do: str | None = None        # что сделать в игре (wait | follow | dismiss | go_to) — companion/orders.py
+    place: str | None = None     # go_to: куда — название места с карты
+    back: bool = False           # go_to: потом вернуться к Владосу (иначе ждать там)
 
 
 FELT = ("радость", "обида", "злость", "страх", "утешение")
@@ -154,8 +167,10 @@ def parse_reply(content: str) -> Reply:
                 remember = str(data.get("remember") or "").strip() or None
                 joke = str(data.get("joke") or "").strip() or None
                 idea = str(data.get("idea") or "").strip() or None
+                do = str(data.get("do") or "").strip().lower()
                 return Reply(text, emotion if emotion in EMOTIONS else DEFAULT_EMOTION, interest, remember, joke,
-                             idea=idea, felt=parse_felt(data.get("felt")))
+                             idea=idea, felt=parse_felt(data.get("felt")), do=do if do in ACTIONS else None,
+                             place=str(data.get("place") or "").strip() or None, back=data.get("back") is True)
         except json.JSONDecodeError:
             pass
     log.warning("LLM ответила не чистым JSON: %r", content)
@@ -310,7 +325,9 @@ class CompanionLLM:
                        + f" «{reply.text}»" + (f"\n  запомнить: {reply.remember}" if reply.remember else "")
                        + (f"\n  обыграл заготовку: {reply.joke}" if reply.joke else "")
                        + (f"\n  высказал мысль: {reply.idea}" if reply.idea else "")
-                       + (f"\n  задело: {reply.felt[0]} {reply.felt[1]}" if reply.felt else ""))
+                       + (f"\n  задело: {reply.felt[0]} {reply.felt[1]}" if reply.felt else "")
+                       + (f"\n  сделать: {reply.do}" + (f" → {reply.place}" if reply.place else "")
+                          + (", потом назад" if reply.back else "") if reply.do else ""))
             log.info("LLM %.2f с%s: [%s]%s %r", time.perf_counter() - t,
                      f" (инструментов: {calls})" if calls else "", reply.emotion,
                      f" интерес {reply.interest}" if reply.interest is not None else "", reply.text)
@@ -333,9 +350,11 @@ class CompanionLLM:
                 self._last_turn = self.last_reply_at = time.time()
                 self.last_reply_text = reply.text
                 self.history.append({"role": "user", "content": user_content})
-                self.history.append({"role": "assistant",
-                                     "content": json.dumps({"emotion": reply.emotion, "text": reply.text},
-                                                           ensure_ascii=False)})
+                # "do" — тоже: иначе через пару ходов модель не помнит, что согласилась ждать.
+                said = {"emotion": reply.emotion, "text": reply.text} | ({"do": reply.do} if reply.do else {})
+                if reply.do == "go_to":
+                    said |= {"place": reply.place, "back": reply.back}
+                self.history.append({"role": "assistant", "content": json.dumps(said, ensure_ascii=False)})
             return reply
 
     def _first_round(self, messages: list[dict], now: str, tools: list[Tool], block: trace.Block):

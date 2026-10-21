@@ -10,10 +10,13 @@ namespace voice
 	// В лог: запущен ли квест-контейнер тем голоса (без него игра молча не произносит реплики).
 	void LogQuestState();
 
+	// Гослинг в мире (постоянная ссылка из Gosling.esp); nullptr — мод не подключён.
+	RE::Actor* Gosling();
+
 	// Это Гослинг (его собственные реплики сервису пересказывать не нужно).
 	bool IsGosling(const RE::TESObjectREFR* a_ref);
 
-	// Где Гослинг: {"loaded", "distance" (м), "follower"}; null — Gosling.esp не подключён.
+	// Где Гослинг: {"loaded", "distance" (м), "follower", "waiting", ...}; null — Gosling.esp не подключён.
 	json Status(RE::PlayerCharacter* a_player);
 
 	// Команда сервиса {"type": "say", "line": 0|1, "id": "...", "text": "фраза для субтитра"} — выполняется в игровом потоке,

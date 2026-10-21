@@ -40,7 +40,7 @@ stt:
     Довакин, тан, Ульфрик Буревестник, драугр, Совнгард, Лидия, хускарл, Гослинг.
 
 tts:
-  engine: cloud
+  engine: xtts
   # xtts — локально на видеокарте (голос Эрика по референсам); cloud — облачный TTS (ниже, tts.cloud):
   # не занимает видеокарту, первый звук ~1 с, ~$2 за 1000 реплик. Проба — production_logs/2026-10-16_голос_через_OpenRouter.md
   cloud:
@@ -60,7 +60,10 @@ tts:
   device: cuda          # cuda | cpu (на CPU в разы медленнее реального времени)
   language: ru
   temperature: 0.7      # выше — живее и разнообразнее, но больше риск оговорок
-  speed: 1.2            # темп речи: 1.0 у Эрика звучит медленно; 1.1–1.3 — живее (образцы: recordings/speed_test)
+  references: true      # голос и эмоции — по референсам персонажа (characters/<имя>/voice/<эмоция>/); false — без
+                        # референсов: встроенный диктор XTTS (speaker), эмоции не различаются
+  speaker: Viktor Eka   # встроенный диктор для references: false (58 голосов в models/xtts/XTTS-v2/speakers_xtts.pth)
+  speed: 1.1            # темп речи: 1.0 у Эрика звучит медленно; 1.1–1.3 — живее (образцы: recordings/speed_test)
   stream: true          # озвучивать по мере синтеза: звук начинается раньше
   stream_chunk_size: 20 # меньше — раньше первый звук, но больше накладных расходов
   stream_prebuffer: 0.5 # секунд звука копится до старта: больше — ровнее речь, но позже начало
@@ -163,7 +166,7 @@ brain:
     max_tokens: 4000  # лимит ответа вместе с рассуждением
   events: [loaded, location, wilderness, interior, combat_started, combat_ended, low_health, item, discovered, profile,
            power, person, quest, quest_misc, cleared, crime, talk, deed, activated, unlocked, reading, looted, furniture,
-           novel, threat, thought, died, gift, taken, hurt_self]
+           novel, threat, thought, died, gift, taken, hurt_self, personal, order_failed, rejoined, arrived]
   overheard_quiet: 3  # секунд без новых реплик NPC — разговор закончился, можно решать (и игрок вышел из меню разговора)
 
 # Летописец: по журналу пишет дневник, факты и цели (модель — diarist.model). Глава кончилась, когда:
@@ -192,7 +195,11 @@ diarist:
 # (передумал), убрать. С описанием характера (prompt.md) не спорит. Хранится по сейву, всегда в промпте.
 soul:
   enabled: true
-  reasoning: medium   # low | medium | high; "" — без рассуждения
+  # Два шага (Sonnet дорог, а в 4 главах из 5 записывать нечего): сперва дешёвый отбор (screen_model); решающая
+  # модель (model; пусто — llm.background_model, Sonnet) — только если отбор предлагает сменить текст души.
+  screen_model: z-ai/glm-5.3-flash
+  screen_reasoning: medium
+  reasoning: medium   # решающей модели: low | medium | high; "" — без рассуждения
   max_tokens: 6000
 
 # Настроение Гослинга: события игры (бой, ранение, гибель Владоса, находка, подарок, зачистка…) сдвигают напряжение,
@@ -215,11 +222,20 @@ vision:
   silence_gap: 180    # с — в тишине смотреть не чаще
   after_load: 10      # с после загрузки сейва — не смотреть (на экране ещё загрузка)
   revisit: 30         # с — ушли и вернулись раньше — заново не смотреть (граница локации)
+  settle: 2           # с — ждать перед взглядом сам (переход в ячейку: событие приходит, пока на экране загрузка);
+                      # кадр всё равно чёрный — в «глаза» не шлём
   width: 1024         # px
   quality: 80
   frames: 20          # последних кадров в logs/frames; 0 — не хранить
   max_tokens: 400
   # extra_body: {reasoning: {effort: low}}  # для Sonnet: без рассуждения он не работает; Haiku — как llm.extra_body
+
+# Личные реплики: событие задело запись души (поводы «боюсь великанов», вход в место из «прошлого») — мозг получает
+# повод «это задевает тебя лично» и говорит от себя по обычной шкале интереса. Одну запись — не чаще gap, любую — gap_all.
+personal:
+  enabled: true
+  gap: 900       # с — одну запись души не чаще
+  gap_all: 120   # с — любую не чаще
 
 thinker:
   enabled: true
@@ -229,6 +245,11 @@ thinker:
   check_every: 3         # секунд — как часто смотреть, не поменялось ли что (проверка дешёвая, без модели)
   max_ideas: 3
   dialogue_lines: 20     # последних реплик в запрос — что уже предлагал и что ответил Владос
+  # GLM 5.3 flash вместо Sonnet (по 4 запросам из трассы — мысли по делу, в ~25 раз дешевле; мысли заменяются каждый раз,
+  # ошибка живёт недолго). Пусто — llm.background_model.
+  model: z-ai/glm-5.3-flash
+  reasoning: medium
+  max_tokens: 4000
   revisit: 30           # с — ушли и вернулись раньше — заново не думать (граница локации); запуск и загрузка —
                         # мысли из памяти, тоже без раздумья
 
