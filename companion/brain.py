@@ -57,6 +57,11 @@ IDLE_BANDS = ("0–4 — сейчас не до разговоров: бой, н
               "7–8 — долгая тишина сама по себе повод: есть хоть что-то к месту — байка или воспоминание о том, где "
               "вы были, вопрос Владосу, мысль о том, что вокруг;\n")
 EVENT_PROMPT = "Игрок ничего не говорил. Только что: {what}.\n"
+OUTING_HINT = """Ты — Гослинг, картограф и спутник Владоса в Скайриме; сейчас ты в вылазке (куда идти, решаешь не здесь).
+Рядом только что говорили — ты слышал. Выбери из этого то, что важно для вылазки: кто этот человек и чем занят, слух,
+место, задание, кого стоит расспросить или куда сходить. Только из услышанного, без догадок. Дежурные фразы
+(приветствия, «не создавай проблем», насмешки, болтовня о погоде) — не важное. О неважном не пиши; ничего важного — пусто.
+Отвечай строго одним JSON-объектом: {"hint": "<одна-две фразы или пусто>"}"""
 OVERHEARD_PROMPT = ("Рядом только что говорили (ты слышал):\n{lines}\n"
                     "Оценивай именно эти реплики, а не обстановку в целом; не пересказывай услышанное — "
                     "игрок слышал то же самое.\n")
@@ -89,6 +94,24 @@ ORDER_FAILED_PROMPT = ("Ты только что пообещал это Вла�
 PERSONAL_TOUCH = ("Это задевает тебя лично — так написано в твоей душе, ты сам это о себе решил. Если правда зацепило, "
                   "скажи от себя, как своё (страх, радость, воспоминание), а не как справку о событии, и оцени interest "
                   "не ниже 7; не к месту — оцени ниже.\n")
+# Переписка (companion/letters.py): Гослинг далеко — сказать не может, но может написать. Пишет по своим важным событиям
+# и когда долго ждёт (brain.letter_idle); всё остальное вдали — молча.
+LETTER_KINDS = {"arrived", "own_fight", "own_fight_end", "own_unknown", "hurt_self", "order_failed"}
+LETTER_EVENT_PROMPT = ("Владос далеко, вы переписываетесь — вслух ты ему не скажешь, можешь только написать. Только что "
+                       "с тобой: {what}.\nЕсли это стоит письма — напиши Владосу коротко, от себя, как записку: 1–2 "
+                       "предложения. Не стоит — оставь text пустым.")
+LETTER_IDLE_PROMPT = ("Владос далеко уже {minutes} мин, вы переписываетесь — вслух ты ему не скажешь. Можешь написать ему "
+                      "короткую записку от себя (1–2 предложения): как ты, где ты, что вокруг, спросить, как он. Нечего "
+                      "писать — оставь text пустым.")
+# Идёт вылазка (companion/explorer.py) — об этом говорит исследователь: мозг молчит, иначе говорят двое (21.10: в
+# «Веди» оба комментировали «новая локация», «мародёр впереди»). «Веди» — место, вход, открытие; мысли и тишина в
+# пути — мозгу: исследователь говорит только при решениях, и между ними Гослинг шёл молча (21.10); что решил —
+# мозг видит в блоке «Вылазка». Один — письма «отбился» и «ранен»: на них исследователь решает заново и пишет сам.
+# Мысли в вылазке — исследователю (companion/explorer.py, _thought): мозг говорил «спрошу её», а исследователь шёл к
+# другому (24.10); за мысль берётся тот, кто решает, — и говорит о ней сам.
+# Бой, рана Владоса — мозгу.
+EXPLORER_TALKS = {"lead": {"location", "wilderness", "interior", "discovered", "thought"},
+                  "explore": {"own_fight_end", "hurt_self", "thought"}}
 THOUGHT = "мысль: "  # Change.subject мысли — «мысль: <текст>»
 LOADED = {"loaded", "died"}  # загрузка сейва (died — после гибели Владоса): всё, что было до неё, — другое прошлое
 TICK = 0.25           # с — как часто мозг смотрит, не пора ли (раньше 1 с — до секунды лишней задержки)
@@ -114,6 +137,9 @@ class Brain:
         self.jokes = None  # companion.jokes.Jokes — заготовки шуток к обстановке (нет базы — без них)
         self.musings = None  # companion.musings.Musings — темы для размышлений в тишине (нет — без них)
         self._mused_at = 0.0  # когда последний раз пробовали размышление
+        self._letter_at = 0.0  # когда Гослинг вдали последний раз писал сам
+        self.exploring: Callable[[], str] = lambda: ""  # вылазка: "lead" | "explore" | "" (ставит сервер)
+        self.outing_hint: Callable[[str], None] = lambda text: None  # важное из услышанного — исследователю
 
     def start(self) -> None:
         self._thread.start()
@@ -168,14 +194,21 @@ class Brain:
             self._maybe_overheard(now)
 
     def _free(self, now: float) -> bool:
-        """Можно спросить модель: Владос жив, Гослинг не говорит и не отвечает, и с прошлого вопроса прошло ask_gap."""
-        return not self.game.dead and not self.voice.busy() and now - self.last_ask >= self.cfg.ask_gap
+        """Можно спросить модель: Владос жив, Гослинг не говорит и не отвечает, его услышат (он рядом), и с прошлого
+        вопроса прошло ask_gap. Далеко — не готовим и повод (шутки к нему, размышления): сказать всё равно не сможет."""
+        return (not self.game.dead and not self.voice.busy() and now - self.last_ask >= self.cfg.ask_gap
+                and self.voice.can_speak())
 
     def _on_changes(self, changes: list[Change], now: float) -> bool:
         """False — Гослинг занят, события стоит придержать."""
         loaded = max((i for i, c in enumerate(changes) if c.kind in LOADED), default=0)
         if loaded:  # загрузили сейв: что копилось до этого (и мысли), уже про другое прошлое
             del changes[:loaded]
+        if muted := EXPLORER_TALKS.get(self.exploring(), set()):
+            quiet = [c for c in changes if c.kind in muted]
+            if quiet:
+                self._silent(quiet, "идёт вылазка — об этом скажет исследователь")
+                changes = [c for c in changes if c not in quiet]
         shown = [c for c in changes if c.kind in self.cfg.events]
         # Одно и то же место недавно уже показывали — не повторяемся.
         fresh = [c for c in shown if now - self._commented.get(c.subject or c.text, 0) > self.cfg.repeat_after]
@@ -183,6 +216,8 @@ class Brain:
             if shown:
                 self._silent(shown, "об этом уже думал недавно")
             return True
+        if not self.voice.can_speak():  # Гослинг далеко: вслух нельзя — важное своё пишет письмом, остальное молча
+            return self._letter(fresh, now)
         thoughts = [c for c in fresh if c.subject.startswith(THOUGHT)]
         if thoughts and self.game.in_combat:  # в бою не до мыслей — подождут тишины (Thinker.unsaid)
             self._silent(thoughts, "идёт бой — мысль подождёт тишины")
@@ -219,6 +254,32 @@ class Brain:
         self._ask(EVENT_PROMPT.format(what=what) + touch, now, EVENT_BANDS, changes=events)
         return True
 
+    def _letter(self, changes: list[Change], now: float) -> bool:
+        """Гослинг далеко: о своём важном (LETTER_KINDS) — письмо Владосу. False — занят, событие придержать."""
+        events = [c for c in changes if c.kind in LETTER_KINDS]
+        if not events or not self.voice.can_write():
+            self._silent(changes, "Гослинг далеко — вслух не скажет, а писать не о чем")
+            return True
+        if self.game.dead or self.voice.busy():
+            return False
+        for c in events:
+            self._commented[c.subject or c.text] = now
+        self.last_ask = self._letter_at = now
+        what = "; ".join(c.text for c in events)
+        log.info("Мозг: письмо Владосу -> %s", what)
+        self.voice.initiate(LETTER_EVENT_PROMPT.format(what=what), letter=True)
+        return True
+
+    def _maybe_letter_idle(self, now: float) -> None:
+        """Гослинг далеко и давно молчит (brain.letter_idle с расставания или прошлого письма) — записка Владосу."""
+        apart = self.game.apart_since
+        if (apart is None or self.game.dead or self.voice.busy() or not self.voice.can_write()
+                or now - max(apart, self._letter_at) < self.cfg.letter_idle):
+            return
+        self._letter_at = self.last_ask = now
+        log.info("Мозг: долго порознь — записка Владосу")
+        self.voice.initiate(LETTER_IDLE_PROMPT.format(minutes=round((now - apart) / 60)), letter=True)
+
     def _maybe_overheard(self, now: float) -> None:
         with self._heard_lock:
             if not self._heard or now - self._heard_at < self.cfg.overheard_quiet:
@@ -231,12 +292,30 @@ class Brain:
             if not self._free(now):
                 return  # Гослинг говорит или только что спрашивали — решим чуть позже
             lines, self._heard = self._heard, []
+        if self.exploring():
+            # В вылазке не встревает в разговоры (24.10: комментировал каждую фразу и объявлял, куда идти), а отбирает
+            # из них важное для вылазки — исследователю, выжимкой.
+            threading.Thread(target=self._outing_hint, args=(lines,), daemon=True, name="outing-hint").start()
+            return
         log.info("Мозг: подслушал %d реплик — встрять ли?", len(lines))
         self._ask(OVERHEARD_PROMPT.format(lines="\n".join(c.text for c in lines)), now, OVERHEARD_BANDS)
+
+    def _outing_hint(self, lines: list) -> None:
+        """Что важного для вылазки в услышанном — одной-двумя фразами исследователю (companion/explorer.py, hint)."""
+        llm = getattr(self.voice, "llm", None)
+        if not llm:
+            return
+        result = llm.complete_json(OUTING_HINT, f"Вылазка: {self.game.outing or 'идёт'}\nУслышанное:\n"
+                                   + "\n".join(c.text for c in lines), title="Мозг: важное для вылазки")
+        if isinstance(result, dict) and (hint := str(result.get("hint") or "").strip()):
+            self.outing_hint(hint)
 
     def _maybe_idle(self, now: float) -> None:
         # Тишина — с последней реплики (его или игрока), а не с последнего вопроса «заговорить ли»: в городе мозг
         # спрашивает модель о болтовне стражников каждые несколько секунд, и тишина иначе не наступала никогда.
+        if not self.voice.can_speak():  # далеко — не тишина, а разлука: изредка записка
+            self._maybe_letter_idle(now)
+            return
         anchor = max(self.voice.last_activity, self._idle_checked)
         if now - anchor < self.cfg.idle_after or not self._free(now):
             return

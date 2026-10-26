@@ -1,6 +1,7 @@
 #include "Events.h"
 
 #include "Net.h"
+#include "Orders.h"
 #include "Player.h"
 #include "Profile.h"
 #include "Quests.h"
@@ -22,6 +23,11 @@ namespace events
 		constexpr std::size_t kNearbyMax = 10;
 		constexpr float       kThreatRadius = 10000.0f;  // ~140 м: враги дальше «рядом» — дракон в небе, великан в поле
 		constexpr std::size_t kThreatMax = 3;
+		constexpr float       kGoslingApart = 2100.0f;   // ~30 м: дальше Гослинг не слышит игрока — шлём, кто вокруг него
+		constexpr float       kLootRadius = 700.0f;      // ~10 м: вещи и сундуки рядом с Гослингом — что он может взять
+		constexpr std::size_t kLootMax = 12;
+		constexpr float       kDoorRadius = 10000.0f;    // ~140 м: двери в здания вокруг Гослинга — поселение целиком
+		constexpr std::size_t kDoorMax = 100;  // все здания поселения: видеть надо всё
 		constexpr float       kHearRadius = 1750.0f;     // ~25 м: реплики NPC дальше Гослинг не слышит
 		constexpr float       kTouchRadius = 300.0f;     // ~4 м: замок открылся рядом с игроком — это он открыл
 		constexpr float       kUnitsPerMeter = 70.0f;
@@ -85,9 +91,14 @@ namespace events
 		{
 			std::map<RE::FormID, int> given;  // базовый предмет -> сколько игрок отдал Гослингу
 			std::map<RE::FormID, int> taken;  // и сколько забрал у него
+			std::map<RE::FormID, int> handed;  // сколько Гослинг отдал сам — находки вылазки (приказ give)
 			Clock::time_point         lastAt{};
 		} exchange;
 		constexpr auto kExchangeQuiet = 2s;
+		// Гослинг отдаёт находки (ExpectHandover): что придёт от него игроку до этого момента — «отдал сам», а не
+		// «Владос забрал» (то огорчает). Оба — в игровом потоке.
+		Clock::time_point handoverUntil{};
+		constexpr auto    kHandoverFor = 10s;
 
 		void Post(std::string_view a_type, json a_data = json::object())
 		{
@@ -166,12 +177,14 @@ namespace events
 		}
 
 		// Все маркеры карты мира: что из них можно показывать Гослингу, решает сервис.
+		// Выключенные пропускаем: их места пока нет в мире (участок HearthFire до покупки земли, место квеста до его
+		// начала) — пути туда игра не строит. Включит игра — придут со следующей рассылкой.
 		void SendMarkers(RE::TESWorldSpace* a_world)
 		{
 			json markers = json::array();
 			if (const auto cell = a_world->persistentCell) {
 				cell->ForEachReference([&](RE::TESObjectREFR* a_ref) {
-					const auto extra = a_ref ? a_ref->extraList.GetByType<RE::ExtraMapMarker>() : nullptr;
+					const auto extra = a_ref && !a_ref->IsDisabled() ? a_ref->extraList.GetByType<RE::ExtraMapMarker>() : nullptr;
 					const auto data = extra ? extra->mapData : nullptr;
 					if (data && data->type.get() < RE::MARKER_TYPE::kTotalLocationTypes) {
 						if (auto name = net::ToUtf8(data->locationName.GetFullName()); !name.empty()) {
@@ -271,6 +284,38 @@ namespace events
 			return Name(race);
 		}
 
+		// Тип голоса NPC (номер формы): разговор с Гослингом — реплика NPC его голосом (папка звуков — по типу голоса).
+		// Поле voiceType записи NPC, а у кого его нет — у шаблона (Use Traits). GetObjectVoiceType() отдаёт не тип голоса
+		// (у Гослинга — E000007F вместо 00013AD1, лог 21.10): по нему голос NPC не находился (24.10).
+		RE::FormID VoiceOf(RE::Actor* a_actor)
+		{
+			int depth = 0;
+			for (auto npc = a_actor ? a_actor->GetActorBase() : nullptr; npc && depth < 8; ++depth,
+					  npc = npc->baseTemplateForm ? npc->baseTemplateForm->As<RE::TESNPC>() : nullptr) {
+				if (npc->voiceType) {
+					return npc->voiceType->GetFormID();
+				}
+			}
+			return 0;
+		}
+
+		// По позициям, в одном мире или одной ячейке (24.10: Гослинг в 64 м, а в списке — «~3 м от тебя»: расстояния не
+		// было, и бралось расстояние от игрока).
+		json GoslingDistance(RE::Actor* a_actor)
+		{
+			const auto gosling = voice::Gosling();
+			if (!gosling || gosling->IsDisabled()) {
+				return nullptr;
+			}
+			const auto world = gosling->GetWorldspace();
+			const bool together = world ? world == a_actor->GetWorldspace() :
+			                              gosling->GetParentCell() && gosling->GetParentCell() == a_actor->GetParentCell();
+			if (!together) {
+				return nullptr;
+			}
+			return std::round(gosling->GetPosition().GetDistance(a_actor->GetPosition()) / kUnitsPerMeter);
+		}
+
 		json ActorJson(RE::PlayerCharacter* a_player, const Near& a_near)
 		{
 			return { { "name", Name(a_near.actor) },
@@ -280,7 +325,197 @@ namespace events
 				{ "unique", IsUnique(a_near.actor) },
 				{ "race", RaceOf(a_near.actor) },
 				{ "level", a_near.actor->GetLevel() },  // насколько опасен — сравнивают с уровнем игрока
-				{ "distance", std::round(a_near.distance / kUnitsPerMeter) } };
+				{ "distance", std::round(a_near.distance / kUnitsPerMeter) },
+				{ "form", a_near.actor->GetFormID() },  // к нему можно подойти (исследователь: «послушать»)
+				{ "voice", VoiceOf(a_near.actor) },
+				// от Гослинга (м): заговорить можно, когда ОН рядом с человеком, а игрок может стоять поодаль (24.10)
+				{ "gosling_distance", GoslingDistance(a_near.actor) } };
+		}
+
+		// Чужое: у ссылки или у ячейки есть владелец (не игрок) — взять значит украсть. Только чтение данных.
+		bool Owned(RE::TESObjectREFR* a_ref, RE::TESObjectCELL* a_cell)
+		{
+			for (const auto* list : { &a_ref->extraList, a_cell ? &a_cell->extraList : nullptr }) {
+				const auto own = list ? list->GetByType<RE::ExtraOwnership>() : nullptr;
+				if (own && own->owner && own->owner->GetFormID() != 0x7) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		// Квестовый предмет: его держит алиас задания с флагом «квестовый предмет» — не трогаем, Владос возьмёт сам.
+		bool QuestObject(RE::TESObjectREFR* a_ref)
+		{
+			const auto aliases = a_ref->extraList.GetByType<RE::ExtraAliasInstanceArray>();
+			if (!aliases) {
+				return false;
+			}
+			for (const auto* data : aliases->aliases) {
+				if (data && data->alias && data->alias->flags.any(RE::BGSBaseAlias::FLAGS::kQuestObject)) {
+					return true;
+				}
+			}
+			return false;
+		}
+
+		bool Locked(RE::TESObjectREFR* a_ref)
+		{
+			const auto lock = a_ref->extraList.GetByType<RE::ExtraLock>();
+			return lock && lock->lock && lock->lock->IsLocked();
+		}
+
+		// Что можно взять рядом с Гослингом (исследователь решает, companion/explorer.py): предметы и контейнеры в его
+		// ячейке ближе kLootRadius — с ценой, «чужое», «по заданию», «заперто». Сундук — сколько в нём вещей.
+		json ItemsAround(RE::Actor* a_actor)
+		{
+			json items = json::array();
+			const auto cell = a_actor->GetParentCell();
+			if (!cell) {
+				return items;
+			}
+			std::vector<RE::TESObjectREFR*> refs;
+			cell->ForEachReferenceInRange(a_actor->GetPosition(), kLootRadius, [&](RE::TESObjectREFR* a_ref) {
+				const auto base = a_ref ? a_ref->GetBaseObject() : nullptr;
+				if (base && a_ref != a_actor && !a_ref->IsDisabled() && !a_ref->IsDeleted() &&
+					base->Is(RE::FormType::Weapon, RE::FormType::Armor, RE::FormType::Book, RE::FormType::Misc,
+						RE::FormType::AlchemyItem, RE::FormType::Ingredient, RE::FormType::SoulGem, RE::FormType::Scroll,
+						RE::FormType::KeyMaster, RE::FormType::Container)) {
+					refs.push_back(a_ref);
+				}
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+			std::ranges::sort(refs, {}, [&](RE::TESObjectREFR* a_ref) { return a_actor->GetDistance(a_ref); });
+			for (const auto ref : refs) {
+				if (items.size() >= kLootMax || Name(ref).empty()) {
+					continue;
+				}
+				const auto base = ref->GetBaseObject();
+				const auto value = base->As<RE::TESValueForm>();
+				json item = { { "name", Name(ref) }, { "form", ref->GetFormID() },
+					{ "kind", base->Is(RE::FormType::Container) ? "container" : "item" },
+					{ "value", value ? value->value : 0 }, { "owned", Owned(ref, cell) }, { "quest", QuestObject(ref) },
+					{ "distance", std::round(a_actor->GetDistance(ref) / kUnitsPerMeter) } };
+				if (base->Is(RE::FormType::Container)) {
+					std::int32_t count = 0;
+					for (const auto& [object, data] : ref->GetInventory([](RE::TESBoundObject&) { return true; }, true)) {
+						count += data.first > 0 ? data.first : 0;
+					}
+					item["locked"] = Locked(ref);
+					item["count"] = count;  // пустой сундук — незачем
+				}
+				items.push_back(std::move(item));
+			}
+			return items;
+		}
+
+		// Двери вокруг Гослинга, ведущие в другие локации (здания поселения): куда (локация по ту сторону), заперта ли и
+		// ближайшая дверь (form — к ней можно послать: «у входа», снаружи, где Владос рядом и мир живой). Исследователь
+		// (companion/explorer.py) по ним не ведёт в запертое: пакет в запертую дверь не пройдёт, а взламывать Гослинг не
+		// умеет. Одна локация — несколько дверей: открыта хоть одна — открыто. inside — та же дверь изнутри (куда ведёт):
+		// «зайти внутрь» — к ней, встать сразу за дверью и ждать Владоса (середина здания — где попало внутри, 24.10).
+		struct Door
+		{
+			bool         locked;
+			float        distance;
+			RE::FormID   form;
+			RE::FormID   inside;
+		};
+
+		json DoorsAround(RE::Actor* a_actor)
+		{
+			std::map<std::string, Door> doors;  // локация -> её дверь (ближайшая)
+			RE::TES::GetSingleton()->ForEachReferenceInRange(a_actor, kDoorRadius, [&](RE::TESObjectREFR* a_ref) {
+				const auto base = a_ref ? a_ref->GetBaseObject() : nullptr;
+				const auto teleport = base && base->Is(RE::FormType::Door) && !a_ref->IsDisabled() ?
+				                          a_ref->extraList.GetByType<RE::ExtraTeleport>() :
+				                          nullptr;
+				const auto other = teleport && teleport->teleportData ? teleport->teleportData->linkedDoor.get() : nullptr;
+				const auto cell = other ? (other->GetParentCell() ? other->GetParentCell() : other->GetSaveParentCell()) : nullptr;
+				const auto loc = cell ? cell->GetLocation() : nullptr;
+				if (loc && loc != a_actor->GetCurrentLocation()) {
+					const bool  locked = Locked(a_ref);
+					const float distance = a_actor->GetDistance(a_ref) / kUnitsPerMeter;
+					auto [it, added] = doors.try_emplace(Name(loc), Door{ locked, distance, a_ref->GetFormID(), other->GetFormID() });
+					if (!added) {
+						const bool closer = distance < it->second.distance;
+						it->second = { it->second.locked && locked, closer ? distance : it->second.distance,
+							closer ? a_ref->GetFormID() : it->second.form, closer ? other->GetFormID() : it->second.inside };
+					}
+				}
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+			json out = json::array();
+			for (const auto& [name, door] : doors) {
+				if (!name.empty() && out.size() < kDoorMax) {
+					out.push_back({ { "to", name }, { "locked", door.locked }, { "distance", std::round(door.distance) },
+						{ "form", door.form }, { "inside", door.inside } });
+				}
+			}
+			return out;
+		}
+
+		// «Глаза Гослинга» — к его статусу: где он (место, ячейка, позиция на карте) и, когда он загружен, но не рядом с
+		// игроком (послали, ждёт, отстал), — кто вокруг него и дерётся ли он. Рядом с игроком его окружение — то же, что
+		// у игрока (nearby). Вне загруженной области игра его только двигает: место и позиция есть, людей и боёв нет.
+		void GoslingView(RE::PlayerCharacter* a_player, json& a_out)
+		{
+			const auto actor = voice::Gosling();
+			if (!actor || actor->IsDisabled()) {
+				return;
+			}
+			// Выгруженный (вдали от игрока) бывает без ячейки — тогда ячейка «из сохранения», как в GetWorldspace:
+			// игра двигает его и там. Без этого в переписке он не знал, где он (21.10).
+			const auto cell = actor->GetParentCell() ? actor->GetParentCell() : actor->GetSaveParentCell();
+			const auto loc = actor->GetCurrentLocation();
+			if (loc || actor->Is3DLoaded()) {  // выгруженный без локации — неизвестно, а не «дикие земли»
+				const auto hold = FindHold(loc);
+				a_out["location"] = (!loc || loc == hold) ? std::string{} : Name(loc);
+			}
+			if (cell) {
+				a_out["cell"] = Name(cell);
+				a_out["interior"] = cell->IsInteriorCell();
+			}
+			if (actor->GetWorldspace() && actor->GetWorldspace() == a_player->GetWorldspace()) {
+				const auto pos = actor->GetPosition();
+				a_out["pos"] = { pos.x, pos.y };
+			}
+			if (!actor->Is3DLoaded()) {
+				return;
+			}
+			a_out["items"] = ItemsAround(actor);  // и рядом с игроком: в «Веди» он берёт вещи, пока Владос рядом
+			a_out["doors"] = DoorsAround(actor);
+			if (a_player->GetDistance(actor) < kGoslingApart) {
+				return;
+			}
+			std::vector<Near> others;
+			RE::ProcessLists::GetSingleton()->ForEachHighActor([&](RE::Actor* a_actor) {
+				if (a_actor && a_actor != actor && a_actor != a_player) {
+					if (const float distance = actor->GetDistance(a_actor); distance < kNearbyRadius) {
+						others.push_back({ distance, a_actor });
+					}
+				}
+				return RE::BSContainer::ForEachResult::kContinue;
+			});
+			std::ranges::sort(others, {}, &Near::distance);
+			json people = json::array();
+			for (const auto& [distance, other] : others) {
+				if (people.size() >= kNearbyMax || Name(other).empty()) {
+					continue;
+				}
+				const auto target = other->GetActorRuntimeData().currentCombatTarget.get();
+				people.push_back({ { "name", Name(other) },
+					{ "hostile", Hostile(other, a_player) || (other->IsInCombat() && target && target.get() == actor) },
+					{ "dead", other->IsDead() },
+					{ "unique", IsUnique(other) },
+					{ "race", RaceOf(other) },
+					{ "level", other->GetLevel() },
+					{ "distance", std::round(distance / kUnitsPerMeter) },
+					{ "form", other->GetFormID() },
+					{ "voice", VoiceOf(other) } });
+			}
+			a_out["in_combat"] = actor->IsInCombat();
+			a_out["nearby"] = std::move(people);
 		}
 
 		// Собеседник для status: где он и что с ним; заодно — не убегает ли (событие npc_flees).
@@ -369,12 +604,16 @@ namespace events
 				forceStatus = true;
 			}
 
-			if ((!exchange.given.empty() || !exchange.taken.empty()) && Clock::now() - exchange.lastAt >= kExchangeQuiet) {
+			if ((!exchange.given.empty() || !exchange.taken.empty() || !exchange.handed.empty()) &&
+				Clock::now() - exchange.lastAt >= kExchangeQuiet) {
 				auto given = ItemsJson(exchange.given);
 				auto taken = ItemsJson(exchange.taken);
-				logs::info("Обмен с Гослингом: отдал {}, забрал {}", given.size(), taken.size());
+				auto handed = ItemsJson(exchange.handed);
+				logs::info("Обмен с Гослингом: отдал {}, забрал {}, Гослинг отдал сам {}", given.size(), taken.size(),
+					handed.size());
 				exchange = {};
-				Post("gosling_items", { { "given", std::move(given) }, { "taken", std::move(taken) } });
+				Post("gosling_items", { { "given", std::move(given) }, { "taken", std::move(taken) },
+										  { "handed", std::move(handed) } });
 			}
 
 			if (questsDirty) {
@@ -497,6 +736,7 @@ namespace events
 					data["partner"] = partnerNow;
 				}
 				if (auto gosling = voice::Status(player); !gosling.is_null()) {
+					GoslingView(player, gosling);
 					data["gosling"] = std::move(gosling);
 				}
 
@@ -586,7 +826,7 @@ namespace events
 						exchange.given[a_event->baseObj] += a_event->itemCount;
 						exchange.lastAt = Clock::now();
 					} else if (a_event->newContainer == kPlayerRef && IsGoslingId(a_event->oldContainer)) {
-						exchange.taken[a_event->baseObj] += a_event->itemCount;
+						(Clock::now() < handoverUntil ? exchange.handed : exchange.taken)[a_event->baseObj] += a_event->itemCount;
 						exchange.lastAt = Clock::now();
 					}
 				}
@@ -875,6 +1115,7 @@ namespace events
 				{ "player_name", player ? Name(player->GetActorBase()) : std::string{} },
 				{ "days_passed", DaysPassed() } });
 			voice::LogQuestState();
+			orders::StopTravel();
 		}
 
 		// «Autosave1_02CCEDA2_1_…» -> «02CCEDA2»: второе поле имени сейва — ID персонажа.
@@ -893,6 +1134,11 @@ namespace events
 			           std::string(id) :
 			           std::string{};
 		}
+	}
+
+	void ExpectHandover()
+	{
+		handoverUntil = Clock::now() + kHandoverFor;
 	}
 
 	void OnMessage(SKSE::MessagingInterface::Message* a_msg)

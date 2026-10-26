@@ -11,7 +11,10 @@ namespace voice
 		constexpr RE::FormID                kNpcRef = 0x802;
 		constexpr RE::FormID                kVoiceQuest = 0x803;
 		constexpr RE::FormID                kVoiceType = 0x814;
+		constexpr RE::FormID                kTravelQuest = 0x815;  // квест похода (go_to, «Веди»): запущен — в пути
 		constexpr std::array<RE::FormID, 2> kTopics = { 0x810, 0x812 };
+		// Реплики других NPC (разговоры с Гослингом): свои темы — звук по типу голоса говорящего.
+		constexpr std::array<RE::FormID, 2> kNpcTopics = { 0x818, 0x81A };
 		constexpr float                     kUnitsPerMeter = 70.0f;
 		constexpr double                    kStaleCommand = 2.0;  // с в очереди игрового потока — игра была на паузе
 	}
@@ -24,6 +27,12 @@ namespace voice
 
 	namespace
 	{
+		// Кто говорит реплику: 0 — Гослинг, иначе NPC (номер ссылки в игре).
+		RE::Actor* SpeakerOf(RE::FormID a_speaker)
+		{
+			return a_speaker ? RE::TESForm::LookupByID<RE::Actor>(a_speaker) : Gosling();
+		}
+
 		// Сколько ждать, что реплика зазвучала, и как часто проверять. Say() идёт через Papyrus (не сразу),
 		// звук стартует ещё чуть позже (~0,13 с). Сразу после прошлой фразы игра Say() молча отбрасывает
 		// (Гослинг для неё ещё «говорит») — тогда повторяем Say(), пока не зазвучит.
@@ -67,6 +76,7 @@ namespace voice
 
 		struct Subtitle
 		{
+			RE::FormID                            speaker;  // кто говорит: 0 — Гослинг
 			std::string                           text;     // фраза
 			std::string                           shown;    // как в HUD: «Гослинг: фраза»
 			std::chrono::steady_clock::time_point until;
@@ -102,7 +112,7 @@ namespace voice
 		// Игровой поток. Поле subtitle записей SubtitleManager — под его же блокировкой.
 		void PatchSubtitle(std::shared_ptr<Subtitle> a_subtitle)
 		{
-			const auto actor = Gosling();
+			const auto actor = SpeakerOf(a_subtitle->speaker);
 			const auto manager = RE::SubtitleManager::GetSingleton();
 			bool       speaking = false;
 			if (actor && manager) {
@@ -119,7 +129,7 @@ namespace voice
 			}
 			if (speaking) {
 				if (!a_subtitle->seen) {
-					logs::info("Субтитр Гослинга: «{}»", a_subtitle->text);
+					logs::info("Субтитр {}: «{}»", a_subtitle->speaker ? "NPC" : "Гослинга", a_subtitle->text);
 				}
 				a_subtitle->seen = true;
 				ShowInHud(a_subtitle->shown);
@@ -139,6 +149,7 @@ namespace voice
 		// Реплика, которую сказали, но ещё не знаем, зазвучала ли.
 		struct PendingLine
 		{
+			RE::FormID                            speaker;  // кто говорит: 0 — Гослинг, иначе NPC
 			std::size_t                           line;
 			std::string                           id;
 			std::string                           subtitle;  // текст фразы для субтитра
@@ -149,17 +160,19 @@ namespace voice
 			int                                   attempts = 0;
 		};
 
-		// GoslingVoice.SayLine(Гослинг, тема) через Papyrus. Пустая строка — вызвали, иначе причина отказа.
+		// GoslingVoice.SayLine(Гослинг, тема) — или SayAs(NPC, тема NPC) — через Papyrus. Пустая строка — вызвали, иначе
+		// причина отказа.
 		std::string DispatchSay(PendingLine& a_line)
 		{
-			const auto actor = Gosling();
-			const auto handler = RE::TESDataHandler::GetSingleton();
-			const auto topic = a_line.line < kTopics.size() ? handler->LookupForm<RE::TESTopic>(kTopics[a_line.line], kPlugin) : nullptr;
+			const auto  actor = SpeakerOf(a_line.speaker);
+			const auto  handler = RE::TESDataHandler::GetSingleton();
+			const auto& topics = a_line.speaker ? kNpcTopics : kTopics;
+			const auto  topic = a_line.line < topics.size() ? handler->LookupForm<RE::TESTopic>(topics[a_line.line], kPlugin) : nullptr;
 			if (!actor || !topic) {
-				return "нет Gosling.esp или его тем";
+				return a_line.speaker ? "нет этого NPC или тем Gosling.esp" : "нет Gosling.esp или его тем";
 			}
-			if (actor->IsDisabled() || !actor->Is3DLoaded()) {
-				return "Гослинг не рядом (не загружен)";
+			if (actor->IsDisabled() || !actor->Is3DLoaded() || actor->IsDead()) {
+				return a_line.speaker ? "NPC не рядом (не загружен)" : "Гослинг не рядом (не загружен)";
 			}
 			if (a_line.attempts == 0) {
 				a_line.before = VoiceSounds(actor);
@@ -167,7 +180,7 @@ namespace voice
 			const auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
 			RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> callback;
 			const auto args = RE::MakeFunctionArguments(static_cast<RE::Actor*>(actor), static_cast<RE::TESTopic*>(topic));
-			if (!vm || !vm->DispatchStaticCall("GoslingVoice", "SayLine", args, callback)) {
+			if (!vm || !vm->DispatchStaticCall("GoslingVoice", a_line.speaker ? "SayAs" : "SayLine", args, callback)) {
 				return "Papyrus: не удалось вызвать GoslingVoice.SayLine";
 			}
 			logs::info("Реплика {}: Say() №{}, voiceTimer {:.2f}", a_line.id, a_line.attempts + 1, VoiceTimer(actor));
@@ -199,7 +212,7 @@ namespace voice
 		// после Say() — повторяем; через kStartTimeout отказ, и сервис договорит фразу через колонки.
 		void CheckStarted(std::shared_ptr<PendingLine> a_line)
 		{
-			const auto actor = Gosling();
+			const auto actor = SpeakerOf(a_line->speaker);
 			const auto now = VoiceSounds(actor);
 			const auto clock = std::chrono::steady_clock::now();
 			const auto waited = clock - a_line->started;
@@ -212,7 +225,7 @@ namespace voice
 						const auto name = actor ? net::ToUtf8(actor->GetDisplayFullName()) : std::string{};
 						const auto length = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
 							std::chrono::duration<double>(a_line->duration));
-						PatchSubtitle(std::make_shared<Subtitle>(a_line->subtitle,
+						PatchSubtitle(std::make_shared<Subtitle>(a_line->speaker, a_line->subtitle,
 							EscapeHtml(name.empty() ? a_line->subtitle : name + ": " + a_line->subtitle),
 							clock + length + kSubtitleTail));
 					}
@@ -234,10 +247,12 @@ namespace voice
 			WatchStart(std::move(a_line));
 		}
 
-		void Say(std::size_t a_line, const std::string& a_id, const std::string& a_subtitle, double a_duration)
+		void Say(RE::FormID a_speaker, std::size_t a_line, const std::string& a_id, const std::string& a_subtitle,
+			double a_duration)
 		{
 			const auto now = std::chrono::steady_clock::now();
-			auto       pending = std::make_shared<PendingLine>(a_line, a_id, a_subtitle, a_duration, SoundIds{}, now, now);
+			auto       pending = std::make_shared<PendingLine>(a_speaker, a_line, a_id, a_subtitle, a_duration, SoundIds{},
+				now, now);
 			if (const auto reason = DispatchSay(*pending); !reason.empty()) {
 				Report(*pending, reason);
 				return;
@@ -323,23 +338,36 @@ namespace voice
 	{
 		// Что надето на Гослинге и что у него в руках: как у игрока (Player.cpp) — готовый инвентарь с noInit, флаг
 		// «надето» у записи. Иначе модель выдумывает его снаряжение («ношу кожаную броню»), а душа это закрепляет.
+		// И что у него в сумке (не надето): по разнице «до и после» сервис узнаёт, что он нашёл в вылазке, и отдаёт
+		// Владосу при встрече именно это (companion/explorer.py) — не его собственное снаряжение.
+		constexpr std::size_t kBagMax = 60;
+
 		void Equipment(RE::Actor* a_actor, json& a_out)
 		{
 			json worn = json::array();
 			json hands = json::array();
+			json bag = json::array();
 			const auto inventory = a_actor->GetInventory([](RE::TESBoundObject&) { return true; }, true);
 			for (const auto& [object, data] : inventory) {
 				const auto& [count, entry] = data;
-				if (!object || count <= 0 || !entry || !entry->IsWorn() || object->IsAmmo()) {
+				if (!object || count <= 0 || !entry || object->IsAmmo()) {
 					continue;
 				}
 				auto name = net::ToUtf8(object->GetName());
-				if (!name.empty()) {
+				if (name.empty()) {
+					continue;
+				}
+				if (!entry->IsWorn()) {
+					if (bag.size() < kBagMax) {
+						bag.push_back({ { "name", std::move(name) }, { "form", object->GetFormID() }, { "count", count } });
+					}
+				} else {
 					(object->IsWeapon() ? hands : worn).push_back(std::move(name));
 				}
 			}
 			a_out["worn"] = std::move(worn);
 			a_out["hands"] = std::move(hands);
+			a_out["bag"] = std::move(bag);
 		}
 	}
 
@@ -360,6 +388,10 @@ namespace voice
 			{ "follower", actor->IsPlayerTeammate() },
 			// Ждёт, где велели (приказ голосом или диалог «Жди здесь»): значение актёра, как у ванильных спутников.
 			{ "waiting", actor->AsActorValueOwner()->GetActorValue(RE::ActorValue::kWaitingForPlayer) > 0.0f } };
+		// В пути: квест похода запущен (флаг записи). Так сервис знает о походе и после загрузки сохранения, сделанного
+		// посреди него: игра продолжает GoTo из сохранения, а сервис о нём не знал (21.10).
+		const auto travel = RE::TESDataHandler::GetSingleton()->LookupForm<RE::TESQuest>(kTravelQuest, kPlugin);
+		out["traveling"] = travel && travel->IsEnabled();
 		// Своё здоровье: как у игрока (значение и максимум), «упал без сил» — состояние спутника, которого почти добили
 		// (поле состояния актёра, не функция по адресу), мёртв.
 		if (loaded) {
@@ -374,6 +406,22 @@ namespace voice
 		return out;
 	}
 
+	void Notify(const json& a_command)
+	{
+		auto text = a_command.value("text", "");
+		SKSE::GetTaskInterface()->AddTask([text = std::move(text)] {
+			// Ванильная Debug.Notification через Papyrus (как SayLine): функции игры по адресу не зовём.
+			const auto vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+			RE::BSTSmartPointer<RE::BSScript::IStackCallbackFunctor> callback;
+			const auto args = RE::MakeFunctionArguments(std::string(text));
+			if (!vm || !vm->DispatchStaticCall("Debug", "Notification", args, callback)) {
+				logs::warn("Papyrus: не удалось вызвать Debug.Notification");
+				return;
+			}
+			logs::info("Письмо на экране: «{}»", text);
+		});
+	}
+
 	void HandleCommand(const json& a_command)
 	{
 		if (a_command.value("type", "") != "say") {
@@ -384,9 +432,10 @@ namespace voice
 		auto       id = a_command.value("id", "");
 		auto       text = a_command.value("text", "");  // фраза — для субтитра
 		const auto duration = a_command.value("duration", 3.0);  // её длина, с — столько держим субтитр
-		logs::info("Команда say {} (тема {}) получена", id, line);
+		const auto speaker = a_command.value("speaker", RE::FormID{ 0 });  // NPC (разговор с Гослингом); 0 — Гослинг
+		logs::info("Команда say {} (тема {}{}) получена", id, line, speaker ? std::format(", NPC {:08X}", speaker) : "");
 		const auto received = std::chrono::steady_clock::now();
-		SKSE::GetTaskInterface()->AddTask([line, id = std::move(id), text = std::move(text), duration, received] {
+		SKSE::GetTaskInterface()->AddTask([line, id = std::move(id), text = std::move(text), duration, received, speaker] {
 			const auto waited = std::chrono::duration<double>(std::chrono::steady_clock::now() - received).count();
 			logs::info("Команда say {}: выполняется в игровом потоке (ждала {:.2f} с)", id, waited);
 			// Игра стояла на паузе (меню, свёрнута): сервис эту фразу уже пустил или вот-вот пустит в колонки —
@@ -396,7 +445,7 @@ namespace voice
 					{ "data", { { "id", id }, { "ok", false }, { "reason", "игра стояла на паузе" } } } });
 				return;
 			}
-			Say(static_cast<std::size_t>(line), id, text, duration);
+			Say(speaker, static_cast<std::size_t>(line), id, text, duration);
 		});
 	}
 }

@@ -87,7 +87,8 @@ def verify_facts(facts: list[tuple[str, str]], knowledge, complete: Callable[...
 
 class Diarist:
     def __init__(self, store: MemoryStore, complete: Callable[..., dict | None], cfg: DiaristConfig | None = None,
-                 player_name: Callable[[], str] = lambda: "Владос", knowledge=None, soul=None):
+                 player_name: Callable[[], str] = lambda: "Владос", knowledge=None, soul=None,
+                 paused: Callable[[], bool] = lambda: False):
         self.cfg = cfg or DiaristConfig()
         self.store = store
         c = self.cfg  # своя модель и рассуждение летописца (diarist.model, diarist.reasoning) — и для сверки фактов
@@ -97,6 +98,9 @@ class Diarist:
         self.player_name = player_name
         self.knowledge = knowledge  # companion.knowledge.Knowledge — новые факты сверяем с данными игры
         self.soul = soul  # companion.memory.soul.Soul — после главы: что из сказанного о себе запомнить
+        # Гослинг не рядом с Владосом: главу не пишем — допишется, когда вы снова вместе (переходы Владоса без него —
+        # не конец его главы).
+        self.paused = paused
         self._wake = threading.Event()
         self._place_changed = False
         self._pending_since: float | None = None  # когда заметили первую неописанную запись
@@ -123,7 +127,7 @@ class Diarist:
 
     def check(self, force: bool = False) -> bool:
         """Записать главу, если пора. True — записали."""
-        if not self.store.is_open or not self._busy.acquire(blocking=False):
+        if not self.store.is_open or (self.paused() and not force) or not self._busy.acquire(blocking=False):
             return False
         try:
             place_changed, self._place_changed = self._place_changed, False
@@ -197,5 +201,6 @@ class Diarist:
     @staticmethod
     def _line(row: tuple, name: str) -> str:
         _id, days, kind, text, place = row
-        who = {"player": f"{name}:", "gosling": "Ты (Гослинг):", "event": "Событие:", "heard": "Слышал рядом —"}
+        who = {"player": f"{name}:", "gosling": "Ты (Гослинг):", "event": "Событие:", "heard": "Слышал рядом —",
+               "own": "Ты сам, без Владоса:"}
         return f"[{game_time(days)}, {place or '?'}] {who.get(kind, kind)} {text}"

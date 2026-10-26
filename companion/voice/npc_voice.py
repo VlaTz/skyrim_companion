@@ -47,6 +47,7 @@ class NpcVoice:
         self.plugin_connected = plugin_connected
         self.voice_dir = cfg.voice_dir
         self.next_line = 0
+        self.next_npc_line = 0  # темы реплик NPC (разговор с Гослингом) — чередуются отдельно
         self._waiting: dict[str, tuple[threading.Event, dict]] = {}
         self._lock = threading.Lock()
         game.on_say_result = self._on_result
@@ -63,13 +64,15 @@ class NpcVoice:
                 and self.game.gosling_near(self.cfg.max_distance) and not self.game.status.paused)
 
     def speak(self, pieces: list[str], synth: Synth,
-              should_stop: Callable[[], bool] = lambda: False
+              should_stop: Callable[[], bool] = lambda: False, speaker: tuple[int, str] | None = None
               ) -> tuple[int, float | None, tuple[np.ndarray, int] | None]:
         """Произносит фразы по очереди. Возвращает (сколько фраз сказано, через сколько секунд
         прозвучала первая, звук несказанной фразы). Сказано меньше, чем фраз: либо Гослинг не смог (остаток — в
         колонки; фраза, на которой не смог, уже синтезирована — её звук третьим, чтобы не платить за синтез дважды),
         либо should_stop() — игрок заговорил, остаток не нужен (это решает вызывающий). Фразу, которая уже
-        звучит в игре, не оборвать — но следующих не будет и ход разговора освобождается сразу."""
+        звучит в игре, не оборвать — но следующих не будет и ход разговора освобождается сразу.
+        speaker — говорит не Гослинг, а NPC (разговор с Гослингом, companion/talk.py): (номер ссылки в игре, тип
+        голоса — папка звуков); его темы и его папка, звук — по его типу голоса."""
         t0 = time.perf_counter()
         first: float | None = None
         free_at = 0.0  # когда доиграет предыдущая фраза (time.monotonic)
@@ -77,24 +80,28 @@ class NpcVoice:
             if should_stop():
                 return i, first, None
             audio, sr = synth(piece)
-            line = self.next_line
+            line = self.next_npc_line if speaker else self.next_line
             # Пишем в файл другой темы, пока звучит предыдущая: её файл не трогаем.
             # Частота — как у звуков игры (44,1 кГц), а не XTTS (24 кГц).
             game_audio = soxr.resample(audio, sr, GAME_SAMPLE_RATE) if sr != GAME_SAMPLE_RATE else audio
             if self.lip_generator and len(game_audio) < LIP_MIN_SECONDS * GAME_SAMPLE_RATE:
                 game_audio = np.pad(game_audio, (0, int(LIP_MIN_SECONDS * GAME_SAMPLE_RATE) - len(game_audio)))
-            wav = self.voice_dir / mod.voice_file(line)
+            wav = (self.voice_dir.parent / speaker[1] / mod.voice_file(line, mod.NPC_LINES) if speaker
+                   else self.voice_dir / mod.voice_file(line))
             sf.write(wav, np.clip(game_audio, -1, 1), GAME_SAMPLE_RATE, subtype="PCM_16")
             self._make_lip(wav)
             if not self._wait_until(free_at, should_stop):
                 return i, first, None
             duration = len(game_audio) / GAME_SAMPLE_RATE
-            result = self._say(line, piece, duration)
+            result = self._say(line, piece, duration, speaker[0] if speaker else 0)
             if not result.get("ok"):
-                log.warning("Гослинг не сказал фразу %d: %s — дальше через колонки",
+                log.warning("%s не сказал фразу %d: %s", "NPC" if speaker else "Гослинг",
                             i + 1, result.get("reason") or "плагин не ответил")
                 return i, first, (audio, sr)
-            self.next_line ^= 1
+            if speaker:
+                self.next_npc_line ^= 1
+            else:
+                self.next_line ^= 1
             if first is None:
                 first = time.perf_counter() - t0
             free_at = time.monotonic() + duration + self.cfg.gap
@@ -129,7 +136,7 @@ class NpcVoice:
             return
         log.debug(".lip за %.2f с", time.perf_counter() - t)
 
-    def _say(self, line: int, text: str, duration: float) -> dict:
+    def _say(self, line: int, text: str, duration: float, speaker: int = 0) -> dict:
         """«Скажи тему line»; text — субтитр (у реплики-заглушки в моде текст «...», плагин подменяет),
         duration — длина фразы, с: столько плагин держит субтитр с этим текстом."""
         command_id = uuid.uuid4().hex[:8]
@@ -139,7 +146,7 @@ class NpcVoice:
             self._waiting[command_id] = (done, result)
         t = time.perf_counter()
         self.send_command({"type": "say", "line": line, "id": command_id, "text": text,
-                           "duration": round(duration, 2)})
+                           "duration": round(duration, 2)} | ({"speaker": speaker} if speaker else {}))
         answered = done.wait(self.cfg.result_timeout)
         with self._lock:
             self._waiting.pop(command_id, None)

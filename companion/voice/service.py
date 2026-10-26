@@ -21,6 +21,7 @@ import soxr
 from companion import trace
 from companion.config import Config
 from companion.emotions import DEFAULT_EMOTION
+from companion.letters import FROM_GOSLING, FROM_PLAYER, Letters
 from companion.voice.audio_io import PushToTalkRecorder, play, play_stream
 from companion.voice.npc_voice import NpcVoice
 from companion.voice.stt import WHISPER_SR, SpeechToText
@@ -53,6 +54,7 @@ class VoiceService:
         self.in_combat = in_combat or (lambda: False)  # идёт бой — отвечать в пару слов
         self.mood_emotion = mood_emotion or (lambda: None)  # эмоция настроения — голосу, если модель нейтральна
         self.on_felt = on_felt or (lambda feeling, strength, said: None)  # реплика игрока задела — настроению
+        self.letters: Letters | None = None  # переписка, когда Гослинг далеко (ставит сервер); None — нет
         models = cfg.models_path
 
         self.stt = SpeechToText(cfg.stt, models)
@@ -75,6 +77,7 @@ class VoiceService:
         self._tts_lock = threading.Lock()
         self._play_lock = threading.Lock()
         self._turn = threading.Lock()        # один ход разговора (ответ + озвучка) за раз
+        self._npc_presets: dict = {}           # тип голоса NPC -> условие XTTS (по образцам; считается раз)
         # Игрок заговорил (нажал F8) — у его речи приоритет: Гослинг бросает свою реплику (следующие фразы,
         # звук в колонках, ещё не сказанный ответ модели). Снимается, когда начинается ход игрока.
         self._player_speaking = threading.Event()
@@ -190,16 +193,73 @@ class VoiceService:
         """Идёт ход разговора (Гослинг думает или говорит) или игрок сейчас говорит."""
         return self._turn.locked() or self.interrupted()
 
-    def initiate(self, situation: str, min_interest: int | None = None,
-                 still_fresh: Callable[[], bool] | None = None, quip_chance: float = 0.0,
-                 reasoning: str = "", max_tokens: int | None = None) -> bool:
-        """Реплика по своей инициативе (событие в игре, долгая тишина). Не перебивает:
-        если сейчас идёт разговор — сразу False. False и если модель решила промолчать."""
-        if self.llm is None or self.interrupted() or not self.can_speak() or not self._turn.acquire(blocking=False):
+    def deliver(self, text: str, emotion: str | None = None, letter: bool = False) -> bool:
+        """Сказать вслух (или написать — letter) готовый текст, модель разговора не спрашивая: его решил исследователь
+        (companion/explorer.py). Ждёт, пока кончится текущий ход разговора (до 15 с). True — сказал."""
+        if not text or not (self.can_write() if letter else self.can_speak()) or not self._turn.acquire(timeout=15):
             return False
         try:
-            reply = self.llm.initiate(situation, self.game_context(), self.memory_context(),
-                                      min_interest=min_interest, quip_chance=quip_chance,
+            emotion = self.voiced(emotion)
+            self.on_event({"type": "companion_reply", "text": text, "emotion": emotion, "initiative": True,
+                           "letter": letter})
+            if self.llm:
+                self.llm.note_said(text, emotion or DEFAULT_EMOTION)
+            if letter:
+                self.letters.show(text, FROM_GOSLING)
+            else:
+                self.speak(text, emotion)
+            self.last_activity = time.time()
+            return True
+        finally:
+            self._turn.release()
+
+    def say_as(self, speaker: int, name: str, voice: str, refs: list, text: str) -> bool:
+        """Реплика NPC его голосом (разговор с Гослингом, companion/talk.py): XTTS по образцам его типа голоса, звук —
+        в папку его типа голоса, «скажи» — от его имени. Ждёт свою очередь, как реплика Гослинга. Голоса NPC нет
+        (облачный TTS, нет образцов, его типа голоса нет в игре) — текст сообщением на экране. True — прозвучало
+        или показано."""
+        if not text or not self._turn.acquire(timeout=15):
+            return False
+        try:
+            self.on_event({"type": "npc_speech", "speaker": name, "text": text})
+            if voice and refs and self.npc_voice and hasattr(self.tts, "preset_from") and self.npc_voice.available():
+                if voice not in self._npc_presets:
+                    with self._tts_lock:
+                        self._npc_presets[voice] = self.tts.preset_from(refs)
+                preset = self._npc_presets[voice]
+
+                def synth(piece: str):
+                    with self._tts_lock:
+                        return self.tts.synthesize(piece, preset=preset)
+
+                pieces = split_text(text, min(self.tts.char_limit, self.cfg.npc_voice.max_chars))
+                said, _first, _ready = self.npc_voice.speak(pieces, synth, speaker=(speaker, voice))
+                trace.event(f"Озвучка NPC {name} ({voice}): {said} из {len(pieces)} фраз")
+                if said == len(pieces):
+                    self.last_activity = time.time()
+                    return True
+            if self.letters:  # голоса нет — хоть текстом
+                self.letters.show(text, name)
+            return True
+        finally:
+            self._turn.release()
+
+    def can_write(self) -> bool:
+        """Гослинг далеко, но с ним можно переписываться (companion/letters.py)."""
+        return bool(self.letters and self.letters.available())
+
+    def initiate(self, situation: str, min_interest: int | None = None,
+                 still_fresh: Callable[[], bool] | None = None, quip_chance: float = 0.0,
+                 reasoning: str = "", max_tokens: int | None = None, letter: bool = False) -> bool:
+        """Реплика по своей инициативе (событие в игре, долгая тишина). Не перебивает:
+        если сейчас идёт разговор — сразу False. False и если модель решила промолчать.
+        letter — Гослинг далеко: не говорит, а пишет Владосу (текст на экране игры) из своей обстановки."""
+        reachable = self.can_write() if letter else self.can_speak()
+        if self.llm is None or self.interrupted() or not reachable or not self._turn.acquire(blocking=False):
+            return False
+        try:
+            reply = self.llm.initiate(situation, self.letters.context() if letter else self.game_context(),
+                                      self.memory_context(), min_interest=min_interest, quip_chance=quip_chance,
                                       reasoning=reasoning, max_tokens=max_tokens)
             if not reply.text:
                 return False
@@ -214,9 +274,12 @@ class VoiceService:
                 trace.event("Не сказано: пока думал, заговорил игрок")
                 return False
             emotion = self.voiced(reply.emotion)
-            self.on_event({"type": "companion_reply", "text": reply.text, "emotion": emotion,
-                           "initiative": True, "remember": reply.remember, "joke": reply.joke, "idea": reply.idea})
-            self.speak(reply.text, emotion)
+            self.on_event({"type": "companion_reply", "text": reply.text, "emotion": emotion, "initiative": True,
+                           "remember": reply.remember, "joke": reply.joke, "idea": reply.idea, "letter": letter})
+            if letter:
+                self.letters.show(reply.text, FROM_GOSLING)
+            else:
+                self.speak(reply.text, emotion)
             self.last_activity = time.time()  # только если сказал: промолчал — тишина продолжается
             if reply.joke or reply.quip:
                 self.last_joke_at = self.last_activity
@@ -243,6 +306,9 @@ class VoiceService:
 
     def _on_utterance(self, audio: np.ndarray) -> None:
         if not self.can_speak():  # Гослинг далеко (или игра не на связи): не слышит и не ответит
+            if self.can_write():  # но он спутник — сказанное уходит письмом, ответ — текстом на экране
+                self._letter(audio)
+                return
             log.info("Гослинг не рядом — не слышит Владоса")
             trace.event("Не услышал: Гослинг не рядом или игра не на связи")
             self._player_speaking.clear()
@@ -281,4 +347,33 @@ class VoiceService:
         except Exception:
             log.exception("Ошибка обработки фразы")
         finally:
+            self.last_activity = time.time()
+
+    def _letter(self, audio: np.ndarray) -> None:
+        """Гослинг далеко: сказанное — письмом ему (на экране — что ушло), ответ — письмом на экран, без голоса.
+        Приказ в ответе ("do") работает, как голосом: «иди ко мне» — придёт сам."""
+        try:
+            text = self.transcribe(audio, self.cfg.audio.sample_rate)
+            if not text:
+                return
+            self.on_event({"type": "player_speech", "text": text, "letter": True})
+            self.last_activity = time.time()
+            self.letters.show(text, FROM_PLAYER)
+            with self._turn:
+                self._player_speaking.clear()
+                if self.llm is None:
+                    return
+                reply = self.llm.reply(text, self.letters.context(), self.memory_context(), letter=True)
+                if reply.felt:
+                    self.on_felt(reply.felt[0], reply.felt[1], text)
+                if not reply.text:
+                    return
+                self.on_event({"type": "companion_reply", "text": reply.text, "emotion": reply.emotion,
+                               "remember": reply.remember, "idea": reply.idea, "do": reply.do,
+                               "place": reply.place, "back": reply.back, "letter": True})
+                self.letters.show(reply.text, FROM_GOSLING)
+        except Exception:
+            log.exception("Ошибка письма")
+        finally:
+            self._player_speaking.clear()
             self.last_activity = time.time()

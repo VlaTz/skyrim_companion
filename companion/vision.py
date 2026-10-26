@@ -31,6 +31,7 @@ from typing import Callable
 
 from companion import trace
 from companion.config import VisionConfig
+from companion.overlay import hidden_from_capture
 from companion.game.state import Change, GameState
 
 log = logging.getLogger(__name__)
@@ -93,7 +94,8 @@ def grab(width: int, quality: int) -> bytes | None:
         user32.GetClientRect(hwnd, ctypes.byref(rect))
         user32.ClientToScreen(hwnd, ctypes.byref(origin))
         vx, vy = user32.GetSystemMetrics(SM_XVIRTUALSCREEN), user32.GetSystemMetrics(SM_YVIRTUALSCREEN)
-        screen = ImageGrab.grab(all_screens=True)  # весь рабочий стол — с левого верхнего угла (vx, vy)
+        with hidden_from_capture():  # окно лога поверх игры — не в кадр (видно в OBS — overlay.capture)
+            screen = ImageGrab.grab(all_screens=True)  # весь рабочий стол — с левого верхнего угла (vx, vy)
     finally:
         user32.SetThreadDpiAwarenessContext(old)
     if rect.right <= 0 or rect.bottom <= 0:
@@ -201,6 +203,14 @@ class Vision:
         text = self._see("по просьбе", task, self._frame())
         self._last_glance = time.time()
         return text or "Сейчас не видно: на экране не мир (меню, загрузка или игра свёрнута)."
+
+    def peek(self, question: str) -> str:
+        """Исследователь дошёл до места: ответ по кадру или "" (Гослинг не рядом — камера Владоса, мира не видно)."""
+        if self.blind():
+            return ""
+        text = self._see("исследователь", LOOK.format(question=question), self._frame())
+        self._last_glance = time.time()
+        return text or ""
 
     def glance(self, reason: str) -> None:
         """Взглянуть самому, в фоне: описание — в обстановку."""

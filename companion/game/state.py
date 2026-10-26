@@ -45,8 +45,9 @@
     shout           — {"name"}: игрок применил Крик
     book_read       — {"name", "file", "form"}: Владос открыл книгу (из сумки или с полки) — Гослинг знает её
                       («читал Владос», companion/knowledge.py); повод мозгу reading
-    gosling_items   — {"given": [{"name", "count", "book", "file", "form"}], "taken": [...]}: Владос отдал Гослингу
-                      или забрал у него; отданную книгу Гослинг читает сам; поводы мозгу gift и taken (важные)
+    gosling_items   — {"given": [{"name", "count", "book", "file", "form"}], "taken": [...], "handed": [...]}: Владос
+                      отдал Гослингу или забрал у него; отданную книгу Гослинг читает сам; поводы мозгу gift и taken
+                      (важные); handed — Гослинг сам отдал находки вылазки (событие handed, не «забрал»)
     player_died     — {"killer", "race", "unique"}: Владос погиб (killer "" — упал, утонул, ловушка). Гослинг
                       говорит об этом после загрузки сейва: событие died вместо loaded
 
@@ -74,9 +75,9 @@
 «Недавно» в {game_context}: события с давностью; бой — одной строкой; важное (Change.important) держится дольше.
 
 Гослинг не рядом (далеко или не загружен — ждёт, где велели, или Владос ушёл сам): что происходит с Владосом, он
-не видит и не слышит. Такие события помечены unseen: их нет в «Недавно», они не трогают настроение и не повод
-мозгу, в журнал памяти — с пометкой «без тебя»; подслушанное не слышит, встреч не засчитывает. Разошлись и снова
-вместе — события parted и rejoined.
+не видит и не слышит. Такие события помечены unseen: их нет в «Недавно» и в журнале памяти, они не трогают
+настроение и не повод мозгу; встреч не засчитывает. Реплики NPC не слышит сразу дальше hear_distance (как и самого
+Владоса). Разошлись и снова вместе — события parted и rejoined; пока порознь, мозг, мыслитель и летописец молчат.
 """
 
 from __future__ import annotations
@@ -96,7 +97,7 @@ from companion.config import MapConfig
 from companion.game.books import BookLibrary
 from companion.game.dialogue import DialogueTexts
 from companion.game.profile import PlayerProfile
-from companion.game.geo import Marker, describe_surroundings, find_places
+from companion.game.geo import Marker, describe_surroundings, distance_m, find_places
 from companion.game.quests import QuestLog
 
 log = logging.getLogger(__name__)
@@ -110,8 +111,16 @@ WILD_CONFIRM = 8      # секунд вне локации, чтобы засч�
 APART_DISTANCE = 60
 APART_CONFIRM = 20
 BACK_DISTANCE = 25
-# Что Гослинг знает и не видя: своё (ранен, приказ), загрузку сейва и гибель Владоса, само расставание.
-WITNESS_ALWAYS = {"loaded", "died", "player_died", "hurt_self", "order_failed", "arrived", "parted", "rejoined"}
+# «Глаза Гослинга» — его собственные события, пока он не рядом с Владосом (_own_events).
+OWN_ROUTE = 300     # м: место с карты Владоса ближе — «по дороге прошёл мимо»
+OWN_UNKNOWN = 150   # м: неоткрытое место ближе — «видел место, которого нет на карте»
+# own_found, own_note, own_loot — от исследователя (companion/explorer.py): нанёс место на карту, запись в путевом
+# дневнике, взял находку.
+OWN_KINDS = {"own_place", "own_route", "own_unknown", "own_met", "own_fight", "own_fight_end",
+             "own_found", "own_note", "own_loot"}
+# Что Гослинг знает и не видя: своё (ранен, приказ, что видел сам), загрузку сейва и гибель Владоса, само расставание.
+WITNESS_ALWAYS = {"loaded", "died", "player_died", "hurt_self", "order_failed", "arrived", "parted", "rejoined",
+                  *OWN_KINDS}
 HEARD_SECONDS = 300   # реплики NPC рядом помним 5 минут (для ответа на «что он сказал?»)
 HEARD_REPEAT = 10     # та же реплика того же NPC за 10 с — повтор события, не новая
 
@@ -187,6 +196,7 @@ class Change:
     brief: str = ""  # суть без подробностей и подсказок модели (причина настроения); пусто — text
     weight: float = 1.0  # во сколько раз сильнее обычного трогает настроение (опасность врага — danger)
     unseen: bool = False  # было без Гослинга (он не рядом) — он этого не видел
+    where: str = ""       # где было, если не там, где Владос (события Гослинга вдали) — для журнала памяти
 
     @property
     def gist(self) -> str:
@@ -207,6 +217,9 @@ class Nearby(BaseModel):
     race: str = ""              # раса, если не людская («Дракон», «Драугр»)
     level: int | None = None    # уровень — насколько опасен (против уровня игрока, danger)
     distance: float | None = None  # метров
+    form: int = 0               # ссылка в игре — к нему можно подойти (исследователь: «послушать»)
+    voice: int = 0              # тип голоса (номер формы) — разговор с Гослингом: реплика его голосом
+    gosling_distance: float | None = None  # м от Гослинга (distance — от Владоса): заговорить — когда он рядом
 
     @property
     def title(self) -> str:
@@ -234,11 +247,45 @@ class Heard:
         return cls(at, m[1], m[3], bool(m[2]))
 
 
+class ItemNear(BaseModel):
+    """Вещь или сундук рядом с Гослингом (плагин, «глаза»): что исследователь может взять."""
+    name: str
+    form: int                    # ссылка в игре — цель приказа take
+    kind: str = "item"           # item | container
+    value: int = 0               # цена (у сундука — 0)
+    owned: bool = False          # чужое — взять значит украсть
+    quest: bool = False          # по заданию — не трогает, Владос возьмёт сам
+    locked: bool | None = None   # сундук заперт — вскрывать замки он не умеет
+    count: int | None = None     # сундук: сколько в нём вещей
+    distance: float | None = None
+
+
+class DoorNear(BaseModel):
+    """Дверь в другую локацию рядом с Гослингом (плагин, «глаза»): здание поселения — куда ведёт, заперта ли."""
+    to: str                      # локация по ту сторону (Таверна Верески)
+    locked: bool = False         # заперта — внутрь не пройти (взламывать он не умеет)
+    distance: float | None = None
+    form: int = 0                # ближайшая дверь (ссылка в игре) — «у входа»: к ней можно послать
+    inside: int = 0              # та же дверь изнутри — «зайти внутрь»: встать сразу за дверью
+
+
 class GoslingStatus(BaseModel):
     loaded: bool = False
     distance: float = -1  # метров до игрока; -1 — не загружен
     follower: bool = False
     waiting: bool = False        # ждёт, где велели (приказ голосом или диалог «Жди здесь»)
+    traveling: bool = False      # в пути: квест похода идёт (go_to, «Веди») — и после загрузки сохранения посреди похода
+    # «Глаза Гослинга»: где он сам — всегда (и выгруженный: игра его двигает); кто вокруг и бой — только когда он
+    # загружен и не рядом с Владосом (рядом его окружение — то же, что nearby Владоса).
+    location: str | None = None  # место ("" — дикие земли)
+    cell: str | None = None
+    interior: bool | None = None
+    pos: list[float] | None = None  # [x, y] на карте мира (под открытым небом)
+    in_combat: bool | None = None
+    nearby: list[Nearby] | None = None
+    items: list[ItemNear] | None = None  # вещи и сундуки рядом с ним (только загруженный)
+    doors: list[DoorNear] | None = None  # двери в здания вокруг него (только загруженный)
+    bag: list[dict] | None = None        # что у него в сумке (не надето): {"name", "form", "count"} — находки вылазки
     health: float | None = None  # своё здоровье 0..1 (только когда загружен)
     bleedout: bool = False       # упал без сил — спутника почти добили
     dead: bool = False
@@ -340,7 +387,15 @@ class GameState:
         self.on_order_result: Callable[[dict], list[Change]] = lambda data: []
         self.task: str | None = None  # дело по приказу («идёшь к месту «…»») — ставит companion/orders.py
         self.task_done = False        # дело сделано (дошёл) — при встрече с Владосом забыть
+        # Блок «Вылазка» (companion/explorer.py: что решил исследователь) и до каких пор показывать «Последнюю вылазку».
+        self.outing: str | None = None
+        self._outing_who = ""
+        self._outing_ended: float | None = None
+        self._outing_keep = 0.0
         self.apart_since: float | None = None  # с какого момента Гослинг не рядом; None — вместе
+        self.hear_distance = 30.0  # м — дальше не слышит Владоса и NPC рядом с ним (ставит сервер: npc_voice.max_distance)
+        self._passed: str | None = None  # мимо какого места с карты Гослинг проходил последним (вдали от Владоса)
+        self._sighted: set[str] = set()  # неоткрытые места, которые он уже видел сам
         self._far_since: float | None = None   # далеко — с этого момента, но ещё не засчитано (APART_CONFIRM)
         self.dialogue = dialogue  # тексты реплик игры; None — реплики NPC не слышим
         self.books = books  # тексты книг игры: отданную книгу Гослинг читает — мозгу её начало
@@ -408,6 +463,8 @@ class GameState:
                     self.in_dialogue = False
                     self.apart_since = self._far_since = None  # вместе ли — узнаем из следующего status
                     self.task = None
+                    self._passed, self._sighted = None, set()
+                    self.outing = None
                 changes = self._describe_event(event)
             if self.apart_since is not None:  # Гослинг не рядом — этого он не видел
                 changes = [c if c.kind in WITNESS_ALWAYS else replace(c, unseen=True) for c in changes]
@@ -469,7 +526,10 @@ class GameState:
             if self.updated - self._far_since < APART_CONFIRM:
                 return []
             self.apart_since, self._far_since = self._far_since, None
-            text = ("Владос ушёл, а ты ждёшь его, где он велел" if g.waiting
+            # В пути — прежде «ждёт»: флаг ожидания остаётся от прошлого «жди», пакет похода его лишь перебивает (21.10).
+            text = ("вы с Владосом разошлись — ты в пути" + (f": {self.task}" if self.task else "")
+                    if g.traveling or (self.task and not self.task_done)
+                    else "Владос ушёл, а ты ждёшь его, где он велел" if g.waiting
                     else "вы с Владосом разошлись — он далеко от тебя" if g.follower
                     else "Владос ушёл без тебя — ты не его спутник")
             log.info("Гослинг не рядом: %s", text)
@@ -486,6 +546,57 @@ class GameState:
                                    "тебя, ты не видел — можешь спросить",
                        subject="снова вместе", important=True, brief=f"снова вместе после {minutes} мин порознь")]
 
+    def _own_events(self, og: GoslingStatus | None, ng: GoslingStatus) -> list[Change]:
+        """«Глаза Гослинга»: пока он не рядом с Владосом (дальше слышимости), — что с ним самим, по данным игры о нём:
+        куда пришёл, мимо чего прошёл, что видел нового, кто рядом, напали ли. Это он видел сам: в «Недавно», в
+        настроение и в журнал — с его местом (Change.where). Вдали от Владоса (выгружен) игра его только двигает: тогда
+        событий — только место и дорога. Рядом с Владосом его окружение — Владосово: своих событий не нужно."""
+        if ng.loaded and 0 <= ng.distance <= self.hear_distance:
+            self._passed = None
+            return []
+        place = ", ".join(dict.fromkeys(x for x in (ng.location or ("дикие земли" if ng.location == "" else ""),
+                                                    ng.cell) if x))
+        out: list[Change] = []
+
+        def own(kind: str, text: str, subject: str, important: bool = False) -> None:
+            out.append(Change(kind, text, subject=subject, important=important, where=place))
+
+        if og and og.location is not None and ng.location and ng.location != og.location:
+            own("own_place", f"ты, Гослинг, пришёл в место: {ng.location}", f"ты пришёл: {ng.location}")
+        elif og and ng.interior and not og.interior and ng.cell:
+            own("own_place", f"ты, Гослинг, вошёл в помещение: {ng.cell}", f"ты вошёл: {ng.cell}")
+        if ng.pos and not ng.interior and self.markers:
+            by_distance = sorted(((distance_m(ng.pos[0], ng.pos[1], m), m) for m in self.markers), key=lambda x: x[0])
+            known = next((m for d, m in by_distance if m.visible and d <= OWN_ROUTE), None)
+            if known and known.name != self._passed and known.name != ng.location:
+                own("own_route", f"по дороге ты прошёл мимо места: {known.name} ({known.kind})", f"мимо: {known.name}")
+            self._passed = known.name if known else self._passed
+            for d, m in by_distance:
+                if d > OWN_UNKNOWN:
+                    break
+                if not m.visible and m.name not in self._sighted:
+                    self._sighted.add(m.name)
+                    own("own_unknown", f"по дороге ты сам увидел место, которого нет на карте Владоса: {m.kind}, "
+                                       f"~{round(d)} м от тебя", f"увидел: {m.name}", important=True)
+        others = [n for n in ng.nearby or [] if not n.follower]
+        enemies = [n.title for n in others if n.hostile and not n.dead]
+        if ng.in_combat and not (og and og.in_combat):
+            own("own_fight", "на тебя, Гослинг, напали, ты дерёшься один, без Владоса"
+                + (f": {', '.join(enemies)}" if enemies else ""), "ты дерёшься", important=True)
+        elif ng.in_combat is False and og and og.in_combat:
+            dead = [n.title for n in others if n.hostile and n.dead]
+            own("own_fight_end", "ты отбился сам" + (f" — убиты: {', '.join(dead)}" if dead else "")
+                + (f"; твоё здоровье {round(ng.health * 100)}%" if ng.health is not None else ""),
+                "ты отбился", important=True)
+        if not ng.in_combat:
+            met = {n.name for n in others if n.unique and not n.hostile and not n.dead}
+            known_before = {n.name for n in (og.nearby or [])} if og else set()
+            if new_people := sorted(met - known_before):
+                own("own_met", f"рядом с тобой: {', '.join(new_people)}", f"рядом с тобой: {', '.join(new_people)}")
+        if out:
+            log.info("Глаза Гослинга (%s): %s", place or "?", "; ".join(c.text for c in out))
+        return out
+
     def _known(self, name: str, unique: bool | None = None) -> bool:
         """Знакомый человек, а не «Драугр»: собеседник игрока, единственный в игре, говорил рядом,
         или он из задания журнала."""
@@ -500,7 +611,7 @@ class GameState:
         file, form = str(data.get("file", "")), int(data.get("form", 0))
         text = self.dialogue.text(file, form) if self.dialogue else ""
         speaker = str(data.get("speaker") or "Кто-то")
-        if not text or self.apart_since is not None:  # реплика мода, вздох, крик без текста; Гослинга нет рядом
+        if not text or not self.hears():  # реплика мода, вздох, крик без текста; Гослинг далеко — не слышал
             return []
         if any(h.speaker == speaker and h.text == text and self.updated - h.at < HEARD_REPEAT for h in self.heard):
             return []
@@ -520,6 +631,7 @@ class GameState:
         old, changes = self.status, []
         if new.gosling is not None:  # первым: что ещё в этом снимке, Гослинг видел, только если вы вместе
             changes.extend(self._track_apart(new.gosling))
+            changes.extend(self._own_events(old.gosling, new.gosling))
         if new.hold == "":
             new.hold = None  # в диких землях владение не всегда известно — помним прежнее
         if new.location is not None and new.location != old.location:
@@ -690,7 +802,11 @@ class GameState:
 
         given = [r for r in d.get("given") or [] if r.get("name")]
         taken = [r for r in d.get("taken") or [] if r.get("name")]
+        handed = [r for r in d.get("handed") or [] if r.get("name")]
         changes = []
+        if handed:  # сам отдал находки вылазки (companion/explorer.py) — не «Владос забрал»
+            text = f"ты отдал Владосу свои находки: {items(handed)}"
+            changes.append(Change("handed", text, subject=text[:80], important=True))
         if given:
             text = brief = f"Владос отдал тебе — теперь это у тебя в сумке: {items(given)}"
             book = next((self.books.get(str(r.get("file", "")), int(r.get("form", 0)))
@@ -716,6 +832,12 @@ class GameState:
         if not found:
             return "Среди открытых игроком мест ничего подходящего. Неоткрытое видно только совсем рядом."
         return "\n".join(found)
+
+    def hears(self) -> bool:
+        """Гослинг слышит, что рядом с Владосом: ближе hear_distance (или Гослинга-NPC нет — говорит из колонок).
+        Сразу по расстоянию, без APART_CONFIRM: подслушанное дальше слышимости — только лишние строки памяти."""
+        g = self.status.gosling
+        return g is None or (g.loaded and 0 <= g.distance <= self.hear_distance)
 
     def gosling_near(self, max_distance: float) -> bool:
         """Гослинг-NPC загружен и рядом с игроком — можно говорить его голосом из игры."""
@@ -793,17 +915,9 @@ class GameState:
             if player:
                 lines.append("Игрок: " + ", ".join(player) + ".")
             if (g := s.gosling) and g.loaded and g.health is not None:  # своё — чтобы знал, что ранен и он
-                me = ["упал без сил — тебя почти добили" if g.bleedout else f"здоровье {round(g.health * 100)}%"]
-                # Что делаешь — по данным игры, а не по тому, что обещал: приказ мог не выйти, а «Жди здесь» —
-                # выбран в обычном диалоге.
-                me.append(self.task or ("ждёшь на месте, где Владос велел" if g.waiting
-                                        else "идёшь с Владосом — ты его спутник" if g.follower
-                                        else "ты не спутник Владоса — с ним не ходишь, пока он не позовёт"))
-                if g.hands:  # своё снаряжение — из игры, а не выдуманное
-                    me.append("в руках: " + ", ".join(g.hands))
-                if g.worn:
-                    me.append("на тебе: " + ", ".join(g.worn))
-                lines.append("Ты сам (Гослинг): " + "; ".join(me) + ".")
+                lines.append("Ты сам (Гослинг): " + "; ".join(self._myself(g)) + ".")
+            if outing := self._outing_line():
+                lines.append(outing)
             if s.in_combat is not None:
                 lines.append("Сейчас идёт бой!" if s.in_combat else "Боя нет.")
             if s.nearby:
@@ -838,6 +952,78 @@ class GameState:
             heard = [str(h) for h in self.heard if time.time() - h.at < HEARD_SECONDS]
             if heard:
                 lines.append("Ты слышал рядом (реплики NPC и что Владос выбирал в разговоре с ними): " + " ".join(heard[-8:]))
+            return "\n".join(lines)
+
+    def set_outing(self, who: str, text: str, ended: bool, keep: float) -> None:
+        """Блок «Вылазка» — от исследователя: who — один или с Владосом, text — что сейчас, решения, итоги. ended —
+        кончилась: показывать «Последнюю вылазку» ещё keep секунд."""
+        self.outing, self._outing_who = text, who
+        self._outing_ended, self._outing_keep = (time.time() if ended else None), keep
+
+    def _outing_line(self) -> str:
+        if not self.outing:
+            return ""
+        if self._outing_ended is None:
+            return f"Вылазка ({self._outing_who}): {self.outing}."
+        if time.time() - self._outing_ended > self._outing_keep:
+            return ""
+        return f"Последняя вылазка ({ago(time.time() - self._outing_ended)}, {self._outing_who}): {self.outing}."
+
+    def _myself(self, g: GoslingStatus) -> list[str]:
+        """Строка «Ты сам»: здоровье, что делаешь, снаряжение — по данным игры."""
+        me = []
+        if g.health is not None:
+            me.append("упал без сил — тебя почти добили" if g.bleedout else f"здоровье {round(g.health * 100)}%")
+        # Что делаешь — по данным игры, а не по тому, что обещал: приказ мог не выйти, а «Жди здесь» — выбран в обычном
+        # диалоге.
+        # В пути без дела в сервисе — поход начат до перерыва (загрузили сохранение посреди него): куда — не знаем.
+        me.append(self.task or ("ты в пути — идёшь к месту, куда шёл до перерыва" if g.traveling
+                                else "ждёшь на месте, где Владос велел" if g.waiting
+                                else "идёшь с Владосом — ты его спутник" if g.follower
+                                else "ты не спутник Владоса — с ним не ходишь, пока он не позовёт"))
+        if g.hands:  # своё снаряжение — из игры, а не выдуманное
+            me.append("в руках: " + ", ".join(g.hands))
+        if g.worn:
+            me.append("на тебе: " + ", ".join(g.worn))
+        return me
+
+    def describe_apart(self) -> str:
+        """«Сейчас в игре» для переписки (companion/letters.py): Гослинг далеко от Владоса — обстановка его, а не
+        Владоса: где он сам, что с ним, кто рядом с ним; «Недавно» — то, что видел он (без событий Владоса)."""
+        with self._lock:
+            g, s = self.status.gosling, self.status
+            lines = ["Вы с Владосом далеко друг от друга и переписываетесь. Что вокруг Владоса и что он делает, ты не "
+                     "видишь — знаешь только то, что он пишет."]
+            if g:
+                place = g.location or ("дикие земли" if g.location == "" else "")
+                if g.cell and g.cell != g.location:
+                    place = f"{place}, {g.cell}" if place else g.cell
+                if not g.location and g.pos and self.markers:
+                    # Выгруженному игра локацию не всегда знает — тогда по позиции: ближайшее место карты.
+                    d, m = min(((distance_m(g.pos[0], g.pos[1], m), m) for m in self.markers), key=lambda x: x[0])
+                    near = f"около места «{m.name}» ({m.kind}), ~{round(d)} м" if m.visible else (
+                        f"около неизвестного места ({m.kind}), ~{round(d)} м")
+                    place = f"{place}; {near}" if place else near
+                lines.append(f"Где ты сам: {place or 'неизвестно — места не называй'}"
+                             + (", в помещении" if g.interior else "") + ".")
+                if s.hour is not None:
+                    lines.append(f"Время: {time_of_day(s.hour)}.")
+                lines.append("Ты сам (Гослинг): " + "; ".join(self._myself(g)) + ".")
+                if outing := self._outing_line():
+                    lines.append(outing)
+                if g.in_combat:
+                    lines.append("Ты сейчас дерёшься!")
+                alive = [n for n in g.nearby or [] if not n.dead]
+                if enemies := [n.title for n in alive if n.hostile]:
+                    lines.append("Враги рядом с тобой: " + ", ".join(enemies) + ".")
+                if others := [n.title for n in alive if not n.hostile]:
+                    # «Кто», но не «что делают»: реплик NPC рядом с ним плагин не шлёт (только у Владоса) — иначе модель
+                    # придумывала разговоры («Свен всё про свою сестру рассказывает», 21.10).
+                    lines.append("Рядом с тобой (известно только, кто; что они делают и говорят — не знаешь, не "
+                                 "выдумывай): " + ", ".join(others) + ".")
+            if recent := self._recent():
+                lines.append("Недавно (что было с тобой; сверху — раньше, внизу — последнее):\n"
+                             + "\n".join(f"- {r}" for r in recent))
             return "\n".join(lines)
 
     def _recent(self, now: float | None = None, since: float | None = None) -> list[str]:

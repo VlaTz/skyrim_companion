@@ -9,8 +9,10 @@ SKSE_PLUGIN_LOAD(const SKSE::LoadInterface* a_skse)
 
 	net::Start();
 	net::StartCommands([](const json& a_command) {
-		if (a_command.value("type", "") == "order") {
+		if (const auto type = a_command.value("type", ""); type == "order") {
 			orders::HandleCommand(a_command);
+		} else if (type == "notify") {
+			voice::Notify(a_command);
 		} else {
 			voice::HandleCommand(a_command);
 		}

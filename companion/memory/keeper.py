@@ -2,7 +2,7 @@
 из памяти текст для модели.
 
 - game_loaded / status с ID персонажа -> открыть его память (и убрать в архив записи «из будущего»);
-- изменения в игре (события, подслушанное у NPC) -> журнал; без Гослинга (Change.unseen) — «без тебя: …»;
+- изменения в игре (события, подслушанное у NPC) -> журнал; без Гослинга (Change.unseen) — не пишем;
 - реплики игрока и Гослинга (события голосового сервиса) -> журнал;
 - открыли память персонажа -> подслушанное за последние минуты обратно в обстановку и on_open (сервис
   восстанавливает историю разговора LLM);
@@ -121,24 +121,39 @@ class MemoryKeeper:
             self._area_now = area or self._area_now
 
     def record_changes(self, changes: list[Change]) -> None:
-        """Изменения в игре — в журнал."""
+        """Изменения в игре — в журнал. Без Гослинга (Change.unseen) — нет: он этого не видел, значит, и не помнит;
+        иначе летописец писал бы в его дневник чужие приключения (что разошлись и снова вместе — в журнале есть)."""
         where = self.where()
+        apart = not self.game.hears()
         for change in changes:
-            # Без Гослинга (он не рядом) — с пометкой: летописец пишет дневник от его лица, а он этого не видел.
-            text = f"без тебя: {change.text}" if change.unseen else change.text
-            self.store.record("heard" if change.kind == "overheard" else "event", text, where)
+            if change.unseen:
+                continue
+            # Событие Гослинга вдали — с его местом (Change.where) и видом own: это он был там сам, не «вы вместе».
+            kind = "heard" if change.kind == "overheard" else "own" if change.where and apart else "event"
+            self.store.record(kind, change.text, Where(change.where, self._days) if change.where else where)
 
     def on_voice_event(self, event: dict) -> None:
         """События голосового сервиса: player_speech, companion_reply."""
-        if event.get("type") == "player_speech":
-            self.store.record("player", str(event.get("text", "")), self.where())
+        mark = "(письмом) " if event.get("letter") else ""  # переписка, когда Гослинг далеко (companion/letters.py)
+        if event.get("type") == "npc_speech":
+            # Разговор Гослинга с NPC (companion/talk.py): его слова — «X сказал» (слышал), а не факт о мире.
+            self.store.record("heard", f"{event.get('speaker')} (тебе): «{event.get('text')}»", self.where())
+        elif event.get("type") == "player_speech":
+            self.store.record("player", mark + str(event.get("text", "")), self.where())
         elif event.get("type") == "companion_reply":
             where = self.where()
-            self.store.record("gosling", str(event.get("text", "")), where,
+            self.store.record("gosling", mark + str(event.get("text", "")), where,
                               emotion=event.get("emotion"), initiative=bool(event.get("initiative")))
             if remember := str(event.get("remember") or "").strip():
                 self.store.add_fact(self._area_now or "разное", remember, "запомнил в разговоре", where)
                 log.info("Память: запомнил — %s", remember)
+
+    def learn(self, subject: str, text: str) -> None:
+        """Исследователь узнал о месте (справка, увиденное, услышанное на месте) — в факты, о месте subject: «что ты
+        там узнал?» — по ним, и когда «Недавно» уже забыло."""
+        if self.store.is_open and text.strip():
+            self.store.add_fact(subject, text, "узнал сам, в вылазке", self.where())
+            log.info("Память: узнал о «%s» — %s", subject, text)
 
     def meet(self, category: str, key: str) -> tuple[int, str] | None:
         """Встреча (category «раса» | «крик», key «дракон»): записать. -> (сколько раз встречали раньше, где и когда
@@ -195,10 +210,11 @@ class MemoryKeeper:
         town = self.places.settlement_of(place) if place else None
         return town.name if town else name
 
-    def visits(self) -> list[tuple[str, float, float]]:
-        """Где бывали — по поселениям: (место, первая и последняя игровая дата), свежие первыми."""
+    def visits(self, own: bool = False) -> list[tuple[str, float, float]]:
+        """Где бывали вместе (own — где он был сам) — по поселениям: (место, первая и последняя игровая дата),
+        свежие первыми."""
         merged: dict[str, tuple[float, float]] = {}
-        for name, first, last in self.store.visits():
+        for name, first, last in self.store.visits(own):
             area = self._area(name)
             was = merged.get(area)
             merged[area] = (min(first, was[0]), max(last, was[1])) if was else (first, last)
@@ -236,6 +252,24 @@ class MemoryKeeper:
                          "высказал — метку в \"idea\"):\n"
                          + "\n".join(f"- [{key}] {idea}" for key, idea in self.shown_ideas.items()))
         return "\n".join(p for p in parts if p)
+
+    def letter_context(self) -> str:
+        """«Сейчас в игре» для переписки: Гослинг далеко — его обстановка, настроение, справка о месте, где он сам."""
+        parts = [self.game.describe_apart()]
+        if self.mood:
+            parts.append(self.mood.describe())
+        g = self.game.status.gosling
+        if g and g.location and self.places and (card := self.places.card(g.location)):
+            parts.append("Справка о месте, где ты сам (ты знаешь это как местный): " + card)
+        return "\n".join(p for p in parts if p)
+
+    def place_facts(self) -> list[str]:
+        """Что Гослинг уже знает о месте, где он сейчас (и о людях рядом): для исследователя — чтобы не «узнавать»
+        заново узнанное в прошлых вылазках. Те же, что видит разговор, не больше MAX_FACTS."""
+        if not self.store.is_open:
+            return []
+        g = self.game.status.gosling
+        return self._facts_here((g.location if g and g.location else None) or self.game.status.location)
 
     def _facts_here(self, location: str | None) -> list[str]:
         """Факты о текущем поселении (и местах в нём) и о людях рядом — свежие, не больше MAX_FACTS."""
@@ -290,7 +324,7 @@ class MemoryKeeper:
                 # Свои реплики — не факт: Гослинг мог ошибиться («Лукан работает в «Товарах Белетора»»), а найденное
                 # модель повторяет. Помечаем и ставим ниже остального при равных совпадениях.
                 who = {"player": f"{self.game.player_name}: «{text}»", "gosling": f"ты говорил (мог ошибаться): «{text}»",
-                       "heard": f"слышал: {text}"}.get(kind, text)
+                       "heard": f"слышал: {text}", "own": f"ты сам, без Владоса: {text}"}.get(kind, text)
                 found.append((n - 0.5 * (kind == "gosling"), days or 0, "журнал",
                               f"[{when(days, place)}] {who[:RECALL_LINE]}"))
         if not found:
@@ -316,6 +350,25 @@ class MemoryKeeper:
             if place and days is not None and self._days - days > NOW_DAYS and self._area(place.split(", ")[0]) == area:
                 return f"Что было здесь в прошлый раз ({days_ago(self._days - days)}, твой дневник): {text}"
         return ""
+
+    def explorer_memory(self) -> str:
+        """Память для решений исследователя (companion/explorer.py) — только то, что нужно, чтобы выбрать, куда идти и
+        что взять: душа (мечта, страхи), цели и договорённости, где бывали вместе и где был сам. Без профиля Владоса,
+        знаний о нём и дневника: полный {memory} в каждом решении — лишний шум, от которого решения «глючат»."""
+        if self._days is None:
+            return ""
+        parts = []
+        if soul := soul_block(self.store):
+            parts.append(soul)
+        goals = self.store.active_goals()
+        for kind in ("goal", "promise"):
+            if items := [text for _gid, k, text in goals if k == kind]:
+                parts.append(f"{GOAL_TITLES[kind]}: " + "; ".join(items) + ".")
+        if together := [name for name, _first, _last in self.visits()][:MAX_VISITS + MAX_VISIT_NAMES]:
+            parts.append("Где вы уже бывали вместе: " + ", ".join(together) + ".")
+        if alone := [name for name, _first, _last in self.visits(own=True) if name not in together][:MAX_VISITS]:
+            parts.append("Где ты был сам: " + ", ".join(alone) + ".")
+        return "\n".join(parts)
 
     def memory_context(self) -> str:
         """{memory} системного промпта. Пусто — память ещё не открыта или вспомнить нечего."""
@@ -344,6 +397,11 @@ class MemoryKeeper:
             parts.append("Где вы бывали вместе (по игровому времени): " + "; ".join(recent)
                          + (f"; раньше: {', '.join(older)}" if older else "")
                          + (f" и ещё {more} мест (что там было — справка recall)" if more > 0 else "") + ".")
+        together = {name for name, _first, _last in visits}
+        alone = [f"{name} — {days_ago(self._days - last)}" for name, _first, last in self.visits(own=True)
+                 if name not in together][:MAX_VISITS]
+        if alone:  # вылазки без Владоса: он там не был — не «вместе»
+            parts.append("Где ты был сам, без Владоса (последние): " + "; ".join(alone) + ".")
         if parts:
             parts.append("Чего нет в памяти и дневнике, ты не помнишь — подробностей не выдумывай.")
         return "\n".join(parts)

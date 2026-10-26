@@ -26,7 +26,15 @@ from companion.game.gamefiles import load_strings
 log = logging.getLogger(__name__)
 
 PLUGINS = ["skyrim", "update", "dawnguard", "hearthfires", "dragonborn"]  # порядок: поздний переопределяет
-WANT = {b"LCTN", b"KYWD", b"NPC_", b"FACT"}
+WANT = {b"LCTN", b"KYWD", b"NPC_", b"FACT", b"LCRT"}
+FILES = {"skyrim": "Skyrim.esm", "update": "Update.esm", "dawnguard": "Dawnguard.esm", "hearthfires": "HearthFires.esm",
+         "dragonborn": "Dragonborn.esm"}  # плагин -> файл: так плагин игры находит ссылку (LookupForm(номер, файл))
+# Особые точки локации (LCSR: тип ссылки, ссылка, ячейка, сетка) — куда исследователь может повести внутрь. Только
+# постоянные ссылки: к обычной (сундук босса) в незагруженном подземелье не повести — её нет в памяти игры; проверено
+# на Ветреном пике: сокровищница, середина и вход изнутри — постоянные, сундук босса — нет (он рядом с сокровищницей).
+SPOTS = {"BossTreasureMarker": "сокровищница — у сундука босса", "LocationCenterMarker": "глубь — середина подземелья",
+         "InsideEntranceMarker": "сразу за входом"}
+MAP_MARKER_REF = "MapMarkerRefType"  # LCSR: маркер карты этой локации — по нему место с карты -> локация
 FLAG_COMPRESSED = 0x00040000
 
 Key = tuple[str, int]  # (плагин, где запись создана; номер без индекса мода)
@@ -49,6 +57,13 @@ KINDS = {
     "LocTypeDungeon": "подземелье", "LocTypeHouse": "дом", "LocTypeHabitation": "поселение",
 }
 SETTLEMENT = {"LocTypeCity", "LocTypeTown", "LocTypeSettlement"}
+# Куда в поселении заходят без приглашения — и чужие дома (зайти можно, но хозяева не звали).
+PUBLIC = {"LocTypeCastle", "LocTypeStore", "LocTypeInn", "LocTypeTemple", "LocTypeGuild", "LocTypeJail"}
+PRIVATE = {"LocTypeHouse", "LocTypePlayerHouse"}
+CENTER = "LocationCenterMarker"
+# Порядок зданий поселения для исследователя: главное — первым (24.10: в Вайтране 23 здания, брали 12 ближайших —
+# Драконий Предел на холме не попал, а дома соседей попали).
+IMPORTANCE = ["LocTypeCastle", "LocTypeTemple", "LocTypeInn", "LocTypeGuild", "LocTypeStore", "LocTypeJail"]
 # Что перечислять в карточке поселения: (ключевое слово, подпись группы)
 CARD_GROUPS = [("LocTypeCastle", "замок"), ("LocTypeStore", "лавки"), ("LocTypeInn", "таверна"),
                ("LocTypeTemple", "храмы"), ("LocTypeGuild", "гильдии"),
@@ -79,6 +94,14 @@ TRAINERS = {
 MAX_CASTLE_RESIDENTS = 12  # в замке живёт ярл — не прятать его в «и ещё N»
 
 
+@dataclass(frozen=True)
+class Spot:
+    """Точка внутри локации, куда можно повести: что это и какая ссылка (плагин-файл, номер без индекса мода)."""
+    kind: str
+    file: str
+    local: int
+
+
 @dataclass
 class Place:
     key: Key
@@ -88,6 +111,23 @@ class Place:
     keywords: list[str] = field(default_factory=list)
     residents: list[str] = field(default_factory=list)  # с профессией — первыми
     staff: int = 0  # сколько первых из residents — с профессией
+    marker: Key | None = None  # маркер карты локации (LCSR MapMarkerRefType)
+    spots: list[Spot] = field(default_factory=list)  # точки внутри (SPOTS)
+
+    @property
+    def private(self) -> bool:
+        """Чужой дом: зайти можно, но без приглашения (не лавка, не таверна при доме)."""
+        return any(self.has(k) for k in PRIVATE) and not any(self.has(k) for k in PUBLIC)
+
+    @property
+    def importance(self) -> int:
+        """Меньше — главнее: замок, храм, таверна, гильдия, лавка, тюрьма; потом прочее; чужие дома — последними."""
+        return next((i for i, k in enumerate(IMPORTANCE) if self.has(k)),
+                    len(IMPORTANCE) + 1 if self.private else len(IMPORTANCE))
+
+    def center(self) -> Spot | None:
+        """Середина локации (LocationCenterMarker), иначе первая точка внутри."""
+        return next((s for s in self.spots if s.kind == SPOTS[CENTER]), self.spots[0] if self.spots else None)
 
     def kinds(self) -> list[str]:
         labels = [KINDS[k] for k in KINDS if k in self.keywords]
@@ -108,6 +148,7 @@ class PlaceBook:
         self._places: dict[Key, Place] | None = None
         self._by_name: dict[str, list[Place]] = {}
         self._children: dict[Key, list[Place]] = {}
+        self._by_marker: dict[int, list[Place]] = {}  # номер маркера карты без индекса мода -> локации
 
     # ------------------------------------------------------------ поиск
 
@@ -124,6 +165,13 @@ class PlaceBook:
         places, _ = self._index()
         return [p for p in places.values() if part and part in p.name.casefold()][:limit]
 
+    def of_marker(self, form: int, name: str) -> Place | None:
+        """Локация маркера карты: form — номер в игре (индекс мода у DLC в игре свой — сверяем младшие байты и
+        название). None — маркер не связан с локацией (или это не тот же)."""
+        self._index()
+        found = self._by_marker.get(form & 0xFFFFFF, [])
+        return next((p for p in found if p.name.casefold() == name.casefold()), found[0] if len(found) == 1 else None)
+
     def parent(self, place: Place) -> Place | None:
         return self._index()[0].get(place.parent) if place.parent else None
 
@@ -133,6 +181,15 @@ class PlaceBook:
             if any(p.has(k) for k in SETTLEMENT):
                 return p
         return None
+
+    def buildings(self, town: Place) -> list[Place]:
+        """Здания поселения — все, и чужие дома (Place.private): видеть надо всё, а заходить ли — решает исследователь.
+        Только с точкой внутри (туда ведёт пакет, сквозь двери); одноимённые (Йоррваскр — зал и жилые комнаты) — одно."""
+        found: dict[str, Place] = {}
+        for c in self._inside(town):
+            if c.spots:
+                found.setdefault(c.name, c)
+        return list(found.values())
 
     def hold_of(self, place: Place) -> Place | None:
         return next((p for p in self._chain(place) if p.has("LocTypeHold")), None)
@@ -219,12 +276,14 @@ class PlaceBook:
                     self._by_name.setdefault(p.name.casefold(), []).append(p)
                     if p.parent:
                         self._children.setdefault(p.parent, []).append(p)
+                    if p.marker:
+                        self._by_marker.setdefault(p.marker[1], []).append(p)
                 log.info("Справка о местах: %d мест", len(self._places))
             return self._places, self._by_name
 
     def _load(self) -> None:
         strings = load_strings(self.data_dir / "Skyrim - Interface.bsa", "strings")
-        records: dict[bytes, dict] = {t: {} for t in WANT} | {b"__people__": {}}
+        records: dict[bytes, dict] = {t: {} for t in WANT} | {b"__people__": {}, b"__refs__": {}}
         for plugin in PLUGINS:
             path = self.data_dir / f"{plugin}.esm"
             if path.is_file():
@@ -238,6 +297,7 @@ class PlaceBook:
             return strings.get(plugin, {}).get(sid) or strings.get("skyrim", {}).get(sid, "")
 
         keywords = {key: _edid(subs) for key, (_, subs) in records[b"KYWD"].items()}
+        ref_types = {key: _edid(subs) for key, (_, subs) in records[b"LCRT"].items()}
         factions = {key: _edid(subs) for key, (_, subs) in records[b"FACT"].items()}
 
         def person(key: Key) -> tuple[str, bool]:
@@ -269,11 +329,22 @@ class PlaceBook:
             if not title:
                 continue
             resolve = subs[b"__resolve__"][0]
+            # Особые ссылки — из всех версий записи: LCSR — из мастера, ACSR — добавленные плагином, игра их
+            # объединяет (Dawnguard переопределяет Ветреный пик только с ACSR — без этого точек не было).
+            marker, spots = None, []
+            for ref_resolve, blob in records[b"__refs__"].get(key, []):
+                for typ, ref, _cell, _x, _y in struct.iter_unpack("<IIIhh", blob[:len(blob) // 16 * 16]):
+                    kind, where = ref_types.get(ref_resolve(typ), ""), ref_resolve(ref)
+                    if kind == MAP_MARKER_REF:
+                        marker = where
+                    elif kind in SPOTS and where[0] in FILES:
+                        spots.append(Spot(SPOTS[kind], FILES[where[0]], where[1]))
             self._places[key] = Place(
                 key=key, edid=_edid(subs), name=title,
                 parent=resolve(struct.unpack_from("<I", subs[b"PNAM"][0])[0]) if b"PNAM" in subs else None,
                 keywords=[keywords.get(resolve(k), "") for blob in subs.get(b"KWDA", [])
-                          for (k,) in struct.iter_unpack("<I", blob)])
+                          for (k,) in struct.iter_unpack("<I", blob)],
+                marker=marker, spots=sorted(set(spots), key=lambda s: list(SPOTS.values()).index(s.kind)))
         # Жители: LCUN/ACUN поселения (во всех версиях записи) — (NPC, ссылка, локация NPC).
         # С профессией — первыми: в карточку попадают первые несколько.
         people: dict[Key, dict[str, bool]] = {}
@@ -328,6 +399,8 @@ def _read_plugin(path: Path, plugin: str, records: dict[bytes, dict[Key, tuple[s
             if typ == b"LCTN":
                 people = b"".join(subs.get(b"LCUN", []) + subs.get(b"ACUN", []))
                 records.setdefault(b"__people__", {}).setdefault(resolve(form), []).append((resolve, people))
+                refs = b"".join(subs.get(b"LCSR", []) + subs.get(b"ACSR", []))
+                records.setdefault(b"__refs__", {}).setdefault(resolve(form), []).append((resolve, refs))
             pos += 24 + size
 
     walk(header_size, len(data))

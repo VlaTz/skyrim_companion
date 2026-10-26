@@ -10,6 +10,20 @@ Function Log(string asMessage) global native
 ; and back - like Mantella's SetVoiceType. His normal lines keep Erik's MaleYoungEager voice.
 Function UseOwnVoice(Actor akActor, bool abOwn) global native
 
+; Another NPC says a placeholder topic in his own voice type (a talk with Gosling): the service wrote the .wav into
+; Sound\Voice\Gosling.esp\<his voice type>\ right before the call. No voice swap - his own voice type is the point.
+Function SayAs(Actor akSpeaker, Topic akTopic) global
+	If !akSpeaker || !akTopic
+		Log("ERROR: SayAs - speaker or topic is None")
+		Return
+	EndIf
+	Quest voiceQuest = Game.GetFormFromFile(0x803, "Gosling.esp") as Quest
+	If voiceQuest && !voiceQuest.IsRunning()
+		voiceQuest.Start()
+	EndIf
+	akSpeaker.Say(akTopic)
+EndFunction
+
 Function SayLine(Actor akSpeaker, Topic akTopic) global
 	Log("SayLine: speaker=" + akSpeaker + " topic=" + akTopic)
 	If !akSpeaker || !akTopic

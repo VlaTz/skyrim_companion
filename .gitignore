@@ -14,3 +14,6 @@ config.local.yaml
 # Память компаньона — твоё прохождение, не код
 /memory/
 /logs/
+
+# Образцы голосов NPC (из BSA игры, companion/game/voices.py) — кэш
+/data/npc_voices/

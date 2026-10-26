@@ -147,6 +147,7 @@ class BrainConfig(BaseModel):
     settle: float = 1.5          # подождать, пока соберутся связанные события (вошли в город + помещение)
     repeat_after: float = 600    # одно и то же событие повторно показывать модели не раньше
     idle_after: float = 90       # столько тишины (никто ничего не сказал) — и спросить модель, не заговорить ли
+    letter_idle: float = 900     # Гослинг далеко: столько секунд с расставания или прошлого письма — записка Владосу
     # Пока Гослинг говорит или отвечает, поводы ждут; старше этого — уже не про то, что сейчас (не спрашиваем).
     fresh_for: float = 15        # секунд — обычный повод (вошли в помещение, сундук)
     fresh_important: float = 45  # секунд — важный (задание, знакомый, впервые увиденное, Крик, тяжело ранен)
@@ -155,7 +156,7 @@ class BrainConfig(BaseModel):
         "loaded", "location", "wilderness", "interior", "combat_started", "combat_ended", "low_health", "item",
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
         "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "taken",
-        "hurt_self", "personal", "order_failed", "rejoined", "arrived",
+        "hurt_self", "personal", "order_failed", "rejoined", "arrived", "own_fight", "own_fight_end", "own_unknown",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
@@ -220,6 +221,38 @@ class SoulConfig(BaseModel):
     screen_reasoning: str = "medium"
 
 
+class ExplorerConfig(BaseModel):
+    """Исследователь (companion/explorer.py): «отпусти исследовать» и «веди» — Гослинг сам решает, куда идти."""
+    enabled: bool = True
+    model: str = ""              # модель решений «куда дальше»; пусто — llm.background_model
+    radius: float = 2000         # м — один: места не дальше от Гослинга
+    lead_radius: float = 700     # м — «веди»: Владос идёт пешком рядом, места поближе
+    candidates: int = 8          # мест на выбор модели — ближайших
+    max_places: int = 4          # мест за вылазку — потом домой (к Владосу)
+    max_minutes: float = 20      # минут вылазки — потом к Владосу (уйдёт и с концами — нет)
+    town_places: int = 20        # в поселении — целей больше: там очень много всего (здания, улицы)
+    town_minutes: float = 60     # и минут
+    remember_minutes: float = 60  # минут «Последняя вылазка» видна в разговоре — итоги, когда вы снова вместе
+    reasoning: str = "low"       # рассуждение перед решением «куда дальше»: low | medium | high; "" — без
+    alone_reasoning: str = "medium"  # то же, когда он один («исследуй»): Владос не ждёт ответа — можно думать дольше
+    max_tokens: int = 0          # лимит ответа вместе с рассуждением; 0 — llm.background_max_tokens
+    lead_pause: float = 8        # с — «Веди»: дошли, Владос подошёл — столько осмотреться, потом дальше (20 — долго)
+    look_around: float = 8       # с — дошёл (Владос рядом): осмотреться и послушать, кто о чём говорит, потом решать
+    listen: float = 10           # с — подошёл к человеку: послушать, что он говорит (дальше — заговорить)
+    linger: float = 90           # с — «побыть здесь»: постоять, посидеть, послушать разговоры вокруг (таверна, площадь)
+
+
+class TalkConfig(BaseModel):
+    """Разговоры Гослинга с NPC (companion/talk.py): ответ NPC — модель в его роли по данным игры, голос — его."""
+    enabled: bool = True
+    model: str = ""              # модель реплик (NPC и Гослинга в разговоре); пусто — explorer.model
+    turns: int = 3               # обменов репликами за разговор (Гослинг — NPC), не больше
+    distance: float = 6          # м от Гослинга до NPC — дальше заговорить нельзя (не услышит; сначала подойти)
+    voices_bsa: str = "Skyrim - Voices_ru0.bsa"  # реплики игры — образцы голосов NPC
+    refs: int = 3                # образцов голоса на тип голоса
+    quotes: int = 8              # его реплик из игры — в роль (как он говорит и что знает)
+
+
 class ThinkerConfig(BaseModel):
     """Мысли Гослинга (companion/memory/thinker.py): что держать в голове и предложить Владосу."""
     enabled: bool = True
@@ -256,6 +289,7 @@ class OverlayConfig(BaseModel):
     margin: int = 20             # отступ от края экрана, пикселей
     alpha: float = 0.8           # непрозрачность 0..1
     font_size: int = 10
+    capture: bool = False        # видно в записи экрана (OBS); от снимков зрения прячется только на их время
     lines: int = 300             # сколько последних строк держать
 
 
@@ -278,6 +312,8 @@ class Config(BaseModel):
     brain: BrainConfig = BrainConfig()
     diarist: DiaristConfig = DiaristConfig()
     thinker: ThinkerConfig = ThinkerConfig()
+    explorer: ExplorerConfig = ExplorerConfig()
+    talk: TalkConfig = TalkConfig()
     soul: SoulConfig = SoulConfig()
     mood: MoodConfig = MoodConfig()
     personal: PersonalConfig = PersonalConfig()

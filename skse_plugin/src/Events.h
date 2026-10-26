@@ -6,4 +6,7 @@
 namespace events
 {
 	void OnMessage(SKSE::MessagingInterface::Message* a_msg);
+
+	// Гослинг сейчас отдаст игроку находки (приказ give): что придёт от него — «отдал сам» (handed), а не «забрал».
+	void ExpectHandover();
 }

@@ -26,8 +26,13 @@ from fastapi.responses import Response
 from pydantic import BaseModel, ValidationError
 
 from companion.brain import Brain
-from companion.config import Config
+from companion.config import ROOT, Config
 from companion.emotions import EMOTIONS
+from companion.explorer import Explorer
+from companion.game.voices import VoiceSamples
+from companion.memory.soul import soul_block
+from companion.persona import manner
+from companion.talk import Talk
 from companion.game.books import BookLibrary
 from companion.game.dialogue import DialogueTexts
 from companion.game.places import PlaceBook
@@ -36,6 +41,7 @@ from companion.game.state import Change, GameEvent, GameState
 from companion.jokes import JokeBook, Jokes, JokeWriter
 from companion.game.items import ItemBook
 from companion.knowledge import Knowledge
+from companion.letters import Letters
 from companion.memory.soul import Soul
 from companion.mood import Mood
 from companion.orders import Orders
@@ -124,6 +130,7 @@ def create_app(cfg: Config) -> FastAPI:
     books = BookLibrary(cfg.game.data_dir)  # тексты книг игры: прочитанное Владосом и Гослингом
     game = GameState(cfg.map, cfg.game.interface_bsa, dialogue=DialogueTexts(cfg.game.data_dir),
                      profile=PlayerProfile(cfg.game.data_dir), books=books)
+    game.hear_distance = cfg.npc_voice.max_distance  # дальше — не слышит, как и Владоса
     commands = CommandQueue()
     places = PlaceBook(cfg.game.data_dir)
     knowledge = Knowledge(cfg.game.data_dir, places, books)  # что Гослинг знает о мире — из файлов игры
@@ -137,14 +144,18 @@ def create_app(cfg: Config) -> FastAPI:
     npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
                          lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
     orders = Orders(commands.send, commands.connected, game)  # «жди», «пошли» — поле "do" ответа -> игре
+    letters = Letters(commands.send, commands.connected, game, memory.letter_context)  # переписка, когда он далеко
     state: dict = {}
 
     def publish(event: dict) -> None:
         """События голосового сервиса — в журнал WebSocket и в память (реплики игрока и Гослинга)."""
         hub.publish(event)
         memory.on_voice_event(event)
+        if event.get("type") == "player_speech" and "explorer" in state:  # слова Владоса — в решения вылазки
+            state["explorer"].heard(str(event.get("text") or ""))
         if event.get("type") == "companion_reply" and event.get("do"):  # согласился — делает, пока говорит
-            orders.give(str(event["do"]), place=str(event.get("place") or ""), back=bool(event.get("back")))
+            orders.give(str(event["do"]), place=str(event.get("place") or ""), back=bool(event.get("back")),
+                        said=str(event.get("text") or ""))
         if event.get("joke") and "brain" in state and state["brain"].jokes:  # обыграл заготовку — помним, что сказано
             state["brain"].jokes.said(str(event["joke"]))
         if event.get("type") == "companion_reply" and "thinker" in state:
@@ -153,9 +164,14 @@ def create_app(cfg: Config) -> FastAPI:
                 state["thinker"].said(idea)
 
     def order_changes(changes: list[Change]) -> None:
-        """Приказ не вышел ещё до игры (места нет на карте) — как событие игры: в «Недавно», в память, мозгу."""
+        """События не из игры — приказ не вышел ещё до неё (места нет на карте), записи исследователя: как события
+        игры — в «Недавно», в память, в настроение, мозгу."""
         game.note(changes)
         memory.record_changes(changes)
+        if mood:
+            mood.notify(changes)
+        # Задело запись души (нашёл неизведанное — мечта картографа) — как и событие игры: повод сказать от себя.
+        changes = changes + (personal.notify(changes) if personal else [])
         if "brain" in state:
             state["brain"].notify(changes)
 
@@ -170,6 +186,7 @@ def create_app(cfg: Config) -> FastAPI:
                                  memory_context=memory.memory_context, in_combat=lambda: game.in_combat,
                                  mood_emotion=mood.emotion if mood and cfg.mood.voice_default else None,
                                  on_felt=mood.felt if mood else None))
+        service.letters = letters
         service.start_push_to_talk()
         state["voice"] = service
         if service.llm:
@@ -188,7 +205,8 @@ def create_app(cfg: Config) -> FastAPI:
                          items=ItemBook(cfg.game.data_dir))
                     if cfg.soul.enabled else None)  # что Гослинг решил о себе — после каждой главы; предметы — из игры
             diarist = Diarist(memory.store, llm.complete_json, cfg.diarist,
-                              player_name=lambda: memory.store.player_name, knowledge=knowledge, soul=soul)
+                              player_name=lambda: memory.store.player_name, knowledge=knowledge, soul=soul,
+                              paused=lambda: game.apart_since is not None)
             memory.on_place_changed = diarist.place_changed
             diarist.start()
         if cfg.brain.enabled and service.llm:
@@ -202,12 +220,49 @@ def create_app(cfg: Config) -> FastAPI:
             state["brain"].start()
         if cfg.thinker.enabled and service.llm:  # мысли Гослинга: что держать в голове и предложить
             thinker = Thinker(memory, game, service.llm.complete_json,
-                              on_thought=state["brain"].notify if "brain" in state else lambda changes: None,
+                              # и исследователю: мысль в вылазке — его решение (companion/explorer.py, _thought)
+                              on_thought=lambda changes: [sink(changes) for sink in (
+                                  state["brain"].notify if "brain" in state else None,
+                                  state["explorer"].notify if "explorer" in state else None) if sink],
                               cfg=cfg.thinker)
             if "brain" in state:  # мысли «при случае» — мозгу на долгую тишину
                 state["brain"].unsaid_thought, state["brain"].thought_said = thinker.unsaid, thinker.said
             state["thinker"] = thinker
             thinker.start()
+        prompt_file = cfg.character_path / "prompt.md"
+
+        def npc_said(name: str, text: str) -> str:
+            """Слова NPC Гослингу — как событие: в настроение и в проверку «задело лично» (душа). В журнал — нет: там
+            они уже «X сказал» (MemoryKeeper, npc_speech). -> что задело ("" — ничего)."""
+            change = Change("npc_talk", f"{name} сказал тебе: «{text}»", subject=f"{name}: {text[:40]}")
+            if mood:
+                mood.notify([change])
+            return "; ".join(c.text for c in (personal.notify([change]) if personal else []))
+
+        talk = None
+        if cfg.talk.enabled and service.llm:  # разговоры Гослинга с NPC: ответ NPC — его роль по данным игры, его голос
+            samples = VoiceSamples(cfg.game.data_dir, cfg.talk.voices_bsa, ROOT / "data" / "npc_voices", cfg.talk.refs)
+            talk = Talk(cfg.talk, game, service.llm.complete_json, deliver=service.deliver, say_as=service.say_as,
+                        samples=samples, quotes_path=ROOT / "datasets" / "game_quotes.tsv",
+                        people=lambda name: "; ".join(text for kind, text in knowledge.search(name, 4)
+                                                      if kind == "person" and name.split()[0] in text),
+                        model=cfg.explorer.model, manner=manner(prompt_file, without=("Игрока зовут",)),
+                        me=lambda: "\n".join(x for x in (
+                            soul_block(memory.store) if memory.store.is_open else "", mood.describe() if mood else "")
+                            if x),
+                        feel=npc_said)
+        if cfg.explorer.enabled and service.llm:  # «отпусти исследовать» и «веди» — сам решает, куда идти
+            explorer = Explorer(cfg.explorer, game, orders, service.llm.complete_json, places, memory.explorer_memory,
+                                deliver=lambda text: service.deliver(text, letter=not service.can_speak()),
+                                record=order_changes, mood=mood.describe if mood else lambda: "",
+                                thoughts=lambda: memory.store.ideas() if memory.store.is_open else [],
+                                learn=memory.learn, talk=talk, manner=manner(prompt_file),
+                                facts=memory.place_facts)
+            state["explorer"] = explorer
+            if "brain" in state:  # идёт вылазка — о месте и тишине говорит исследователь, не мозг
+                state["brain"].exploring = lambda: explorer.outing.mode if explorer.outing else ""
+                state["brain"].outing_hint = explorer.hint  # важное из услышанного — исследователю
+            explorer.run()
         log.info("Сервис готов: http://%s:%d", cfg.server.host, cfg.server.port)
         yield
         if "brain" in state:
@@ -293,6 +348,8 @@ def create_app(cfg: Config) -> FastAPI:
             hub.publish({"type": "game_event", "event": event.type, "changes": texts})
         if "brain" in state and seen:
             state["brain"].notify(seen)
+        if "explorer" in state and seen:  # его драка, рана в вылазке; встреча — рассказать и отдать находки
+            state["explorer"].notify(seen)
         return {"changes": texts}
 
     @app.get("/game/state")

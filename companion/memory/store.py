@@ -171,15 +171,17 @@ class MemoryStore:
                 (time.time(), where.game_days, kind, text, emotion, int(initiative), where.place or None))
             self._db.commit()
 
-    def visits(self) -> list[tuple[str, float, float]]:
-        """Где бывали: (место, первая и последняя игровая дата), свежие первыми. Место — локация
-        (первая часть «Вайтран, Гарцующая кобыла»); дикие земли не считаем."""
+    def visits(self, own: bool = False) -> list[tuple[str, float, float]]:
+        """Где бывали вместе: (место, первая и последняя игровая дата), свежие первыми. Место — локация
+        (первая часть «Вайтран, Гарцующая кобыла»); дикие земли не считаем. own — где Гослинг был сам, без Владоса
+        (записи вида own): без этого места одиночной вылазки попадали в «где вы бывали вместе» (21.10)."""
         with self._lock:
             if not self._db:
                 return []
             rows = self._db.execute(
                 "SELECT place, min(game_days), max(game_days) FROM journal "
-                "WHERE archived = 0 AND place IS NOT NULL AND game_days IS NOT NULL GROUP BY place").fetchall()
+                "WHERE archived = 0 AND place IS NOT NULL AND game_days IS NOT NULL AND (kind = 'own') = ? "
+                "GROUP BY place", (own,)).fetchall()
         merged: dict[str, tuple[float, float]] = {}
         for place, first, last in rows:
             name = place.split(", ")[0]

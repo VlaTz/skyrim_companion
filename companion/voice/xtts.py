@@ -123,14 +123,20 @@ class XttsTTS:
     def _preset(self, emotion: str | None) -> tuple[torch.Tensor, torch.Tensor]:
         return self.presets.get(emotion or DEFAULT_EMOTION, self.presets[DEFAULT_EMOTION])
 
+    @torch.inference_mode()
+    def preset_from(self, refs: list[Path]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Голос по образцам (реплики NPC из игры, companion/game/voices.py): условие для synthesize(preset=)."""
+        return self.model.get_conditioning_latents(audio_path=[str(p) for p in refs])
+
     def _params(self) -> dict:
         return dict(temperature=self.cfg.temperature, speed=self.cfg.speed, enable_text_splitting=False)
 
     @torch.inference_mode()
-    def synthesize(self, text: str, emotion: str | None = None) -> tuple[np.ndarray, int]:
-        """Возвращает float32 моно и частоту дискретизации."""
+    def synthesize(self, text: str, emotion: str | None = None,
+                   preset: tuple[torch.Tensor, torch.Tensor] | None = None) -> tuple[np.ndarray, int]:
+        """Возвращает float32 моно и частоту дискретизации. preset — чужой голос (preset_from), иначе — Гослинга."""
         t = time.perf_counter()
-        gpt_latent, speaker = self._preset(emotion)
+        gpt_latent, speaker = preset or self._preset(emotion)
         audio = np.concatenate([
             np.asarray(self.model.inference(piece, self.cfg.language, gpt_latent, speaker, **self._params())["wav"],
                        dtype=np.float32)

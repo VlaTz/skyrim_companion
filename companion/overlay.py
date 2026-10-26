@@ -6,6 +6,10 @@
 
 Видно только поверх игры в окне без рамки (SkyrimPrefs.ini: bFull Screen=0, bBorderless=1) — поверх
 эксклюзивного полного экрана Windows ничего не рисует.
+
+Захват экрана: зрение Гослинга снимает экран — лог поверх игры в кадре модель читала бы как то, что видно в игре.
+overlay.capture: false — окно спрятано от любого захвата (и от OBS: Windows не различает, кто снимает); true — видно в
+OBS, а на время снимка зрения (hidden_from_capture) прячется и сразу возвращается.
 """
 
 from __future__ import annotations
@@ -14,6 +18,8 @@ import ctypes
 import logging
 import queue
 import threading
+import time
+from contextlib import contextmanager
 
 from companion.config import OverlayConfig
 
@@ -24,7 +30,8 @@ GWL_EXSTYLE = -20
 WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_TOOLWINDOW = 0x8, 0x20, 0x80
 WS_EX_LAYERED, WS_EX_NOACTIVATE = 0x80000, 0x8000000
 HWND_TOPMOST = -1
-WDA_EXCLUDEFROMCAPTURE = 0x11  # Windows 10 2004+
+WDA_NONE, WDA_EXCLUDEFROMCAPTURE = 0x0, 0x11  # Windows 10 2004+
+CAPTURE_SETTLE = 0.05  # с — исключение из захвата DWM применяет со следующего кадра: подождать перед снимком
 SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x1, 0x2, 0x10
 TOPMOST_EVERY = 2000  # мс — заново поднять поверх (игра в окне без рамки иногда перекрывает)
 POLL_EVERY = 150      # мс — забрать новые строки лога
@@ -42,6 +49,27 @@ COLORS = {  # по началу имени логгера — цвет стро�
 }
 WARN_COLOR = "#ff8700"
 TEXT_COLOR = "#e4e4e4"
+
+# Окно лога, когда его видно в захвате (overlay.capture: true): прятать на время снимка зрения. None — прятать нечего.
+_capturable: int | None = None
+_capture_lock = threading.Lock()
+
+
+@contextmanager
+def hidden_from_capture():
+    """На время снимка экрана для зрения Гослинга окно лога в кадр не попадает (видно в OBS — overlay.capture)."""
+    hwnd = _capturable
+    if not hwnd:
+        yield
+        return
+    user32 = ctypes.windll.user32
+    with _capture_lock:
+        user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        time.sleep(CAPTURE_SETTLE)
+        try:
+            yield
+        finally:
+            user32.SetWindowDisplayAffinity(hwnd, WDA_NONE)
 
 
 class _QueueHandler(logging.Handler):
@@ -110,8 +138,13 @@ class Overlay:
         style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW
                               | WS_EX_NOACTIVATE | WS_EX_TOPMOST)
-        # Окно видно игроку, но не в снимках экрана: зрение Гослинга снимает кадр игры — без лога поверх.
-        user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
+        # Окно видно игроку, но не в снимках экрана: зрение Гослинга снимает кадр игры — без лога поверх. capture — видно
+        # и в захвате (OBS), а от снимка зрения прячется только на его время (hidden_from_capture).
+        global _capturable
+        if c.capture:
+            _capturable = hwnd
+        else:
+            user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
         root.attributes("-alpha", c.alpha)  # после смены стиля: прозрачность ставится заново
         root.attributes("-topmost", True)
         visible = c.visible
