@@ -71,6 +71,7 @@ class MemoryKeeper:
         self.shown_ideas: dict[str, str] = {}  # метка -> мысль, как показаны модели в «Твоих мыслях» последний раз
         self.mood = None  # companion.mood.Mood — настроение в обстановку (ставит сервер)
         self.vision = None  # companion.vision.Vision — что вы видите вокруг (ставит сервер)
+        self.mysteries = None  # companion.mysteries.Mysteries — загадки мира в память промпта (ставит сервер)
 
     @property
     def area(self) -> str | None:
@@ -379,6 +380,8 @@ class MemoryKeeper:
             parts.append(profile)
         if soul := soul_block(self.store):  # что Гослинг решил о себе — о себе говорит в согласии с этим
             parts.append(soul)
+        if self.mysteries and (mysteries := self.mysteries.describe()):  # странности мира: что видел, что разгадано
+            parts.append(mysteries)
         goals = self.store.active_goals()
         for kind, title in GOAL_TITLES.items():
             items = [text for _gid, k, text in goals if k == kind]

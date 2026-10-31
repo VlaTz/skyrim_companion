@@ -262,7 +262,10 @@ class Explorer:
         self._last_words: tuple[str, float] = ("", 0.0)  # что Владос сказал последним и когда
         self._events: queue.Queue[tuple] = queue.Queue()
         self._lock = threading.Lock()
+        # «Поговори с ним» без вылазки: (номер похода к нему, кто, что сказать первым) — пока идёт к нему.
+        self._errand: tuple[str, int, str] | None = None
         orders.on_explore = self.start
+        orders.on_talk = self.talk_to
         orders.on_order = lambda: self.stop("Владос решил иначе")
         orders.on_explorer_result = self._on_result
         orders.on_redirect = self.redirect
@@ -300,6 +303,10 @@ class Explorer:
                 self.outing.hints = (self.outing.hints + [text])[-HINTS:]
                 trace.event(f"Исследователь: подсказка из услышанного — {text}")
 
+    def talk_to(self, who: str, opener: str) -> None:
+        """Владос просит поговорить с человеком рядом: подойти, поговорить, вернуться рассказать."""
+        self._events.put(("talk_to", who, opener))
+
     def redirect(self, marker: Marker) -> bool:
         """Владос просит сходить к месту, а вылазка идёт: это её следующая цель, а не конец (False — вылазки нет)."""
         with self._lock:
@@ -311,6 +318,7 @@ class Explorer:
     def stop(self, why: str) -> None:
         with self._lock:
             outing, self.outing = self.outing, None
+            self._errand = None  # шёл поговорить по просьбе — новый приказ Владоса важнее
         if outing:
             log.info("Исследователь: вылазка кончилась — %s", why)
             trace.event(f"Исследователь: вылазка кончилась — {why}")
@@ -363,6 +371,8 @@ class Explorer:
             self._unstuck(*event[1:])
         elif kind == "redirect":
             self._redirect(event[1])
+        elif kind == "talk_to":
+            self._talk_to(event[1], event[2])
 
     def _redirect(self, marker: Marker) -> None:
         with self._lock:
@@ -379,6 +389,12 @@ class Explorer:
     def _arrived(self, command_id: str, data: dict, order: Order) -> None:
         with self._lock:
             outing = self.outing
+            errand = self._errand if self._errand and self._errand[0] == command_id else None
+            if errand:
+                self._errand = None
+        if errand:
+            self._errand_arrived(errand, data)
+            return
         if not outing or outing.goal is None or command_id != outing.goal_id:
             return  # вылазка кончилась (или это ответ на прошлый поход) — Владос уже решил иначе
         goal, outing.goal, outing.goal_id = outing.goal, None, ""
@@ -688,23 +704,29 @@ class Explorer:
         else:
             self._then(outing, then)
 
-    def _talk(self, outing: Outing, talk: str, why: str, near: bool = False) -> bool:
+    def _person(self, name: str):
+        """Кто рядом с этим именем. Модель пишет имя, как в списке: «Мила Валентия (имперец)» — с видом в скобках
+        (24.10: «нет рядом»)."""
+        bare = name.split("(")[0].strip().strip("«»\"'").casefold()
+        crowd = self._crowd()
+        return next((n for n in crowd if bare in (n.name.casefold(), n.title.casefold())), None) or next(
+            (n for n in crowd if bare and n.name.casefold().startswith(bare)), None)
+
+    def _talk(self, outing: Outing, talk: str, why: str, near: bool = False, asked: bool = False) -> bool:
         """Заговорить с человеком рядом («Имя: фраза»), а после разговора — решить заново. False — не с кем или нельзя
-        (решение идёт дальше как обычно). near — только что подошёл к нему (игра подтвердила)."""
+        (решение идёт дальше как обычно). near — только что подошёл к нему (игра подтвердила); asked — попросил
+        Владос: пределы вылазки на разговоры (тот же человек, подряд, всего) — не для его просьб."""
         name, _, opener = talk.partition(":")
         name, opener = name.strip().strip("«»\"'"), opener.strip().strip("«»\"'")
-        # Модель пишет имя, как в списке: «Мила Валентия (имперец)» — с видом в скобках (24.10: «нет рядом»).
-        bare = name.split("(")[0].strip().casefold()
-        npc = next((n for n in self._crowd() if bare in (n.name.casefold(), n.title.casefold())), None) or next(
-            (n for n in self._crowd() if bare and n.name.casefold().startswith(bare)), None)
+        npc = self._person(name)
         # С одним человеком — один разговор за вылазку, всего — не больше TALKS_MAX: иначе модель заводит разговор
         # снова и снова (разговор -> решение -> разговор…).
         blocked = ("разговоры выключены" if not self.talk else f"«{name}» нет рядом" if not npc or not npc.form
-                   else "с ним ты уже говорил" if npc.form in outing.talked
+                   else "" if asked else "с ним ты уже говорил" if npc.form in outing.talked
                    else f"за вылазку уже {TALKS_MAX} разговоров" if len(outing.talked) >= TALKS_MAX
                    else f"ты поговорил уже с {outing.streak} подряд — сначала место или побудь и послушай"
                    if outing.streak >= TALKS_IN_ROW
-                   else self.talk.unavailable(npc, near=True))
+                   else "") or self.talk.unavailable(npc, near=True)
         problem = blocked or self.talk.unavailable(npc, near)
         # Подойти — только когда мешает одно расстояние: «уже говорил», «два подряд» — не повод идти к нему (24.10).
         if problem and not blocked and opener and (
@@ -730,6 +752,68 @@ class Explorer:
         self._next(outing, f"ты поговорил с {npc.title}: {' / '.join(lines)}. Его слова — его мнение и знание, не "
                            "проверенный факт")
         return True
+
+    # ------------------------------------------------------------ «поговори с ним» — по просьбе Владоса
+
+    def _talk_to(self, who: str, opener: str) -> None:
+        """Владос попросил поговорить с человеком рядом. Идёт вылазка — разговор в её ходе (потом она решает дальше);
+        нет — подойти (поход к человеку: идёт за ним, если тот идёт), поговорить и вернуться к Владосу рассказать."""
+        with self._lock:
+            outing = self.outing
+        if outing:
+            if not self._talk(outing, f"{who}: {opener}", "Владос попросил поговорить", asked=True):
+                self._talk_failed(who, f"«{who}» нет рядом или с ним сейчас не заговорить")
+            return
+        npc = self._person(who)
+        problem = ("разговоры выключены" if not self.talk else f"«{who}» нет рядом" if not npc or not npc.form
+                   else "не знаешь, что ему сказать" if not opener else self.talk.unavailable(npc, near=True))
+        if problem:
+            self._talk_failed(who, problem)
+            return
+        if not self.talk.too_far(npc):
+            self._converse_errand(npc, opener, went=False)
+            return
+        self.game.task = f"идёшь к {npc.title} — поговорить, как просил Владос"
+        trace.event(f"Разговор по просьбе: иду к {npc.title}")
+        command_id = self.orders.go_ref(npc.form, f"к человеку: {npc.title}", False, arrive=PERSON_NEAR)
+        with self._lock:
+            self._errand = (command_id, npc.form, opener)
+
+    def _errand_arrived(self, errand: tuple[str, int, str], data: dict) -> None:
+        _command_id, form, opener = errand
+        npc = next((n for n in self._crowd() if n.form == form), None)
+        if not data.get("ok"):
+            if data.get("reason") != "cancelled":  # отменил новый приказ — он и решает, что дальше
+                self.game.task = None
+                self._talk_failed(npc.title if npc else "ним", REASONS.get(str(data.get("reason")), "не дошёл до него"))
+            return
+        if not npc:
+            self.game.task = None
+            self.orders.command("follow")
+            self._talk_failed("ним", "пока ты шёл, он ушёл — его больше нет рядом")
+            return
+        self._converse_errand(npc, opener, went=True)
+
+    def _converse_errand(self, npc, opener: str, went: bool) -> None:
+        """Поговорить по просьбе Владоса, вернуться к нему (если ходил) и — событием — рассказать, что узнал."""
+        self.game.task = f"разговариваешь с {npc.title}, как просил Владос"
+        trace.event(f"Разговор по просьбе: заговариваю с {npc.title} — «{opener}»")
+        lines = self.talk.converse(npc, opener, "Владос попросил поговорить")
+        self.game.task = None
+        if went:
+            self.orders.command("follow")  # назад к Владосу (и снять «держаться рядом с человеком»)
+        if not lines:
+            self._talk_failed(npc.title, "заговорить не вышло")
+            return
+        self.record([Change("talked", f"ты поговорил с {npc.title}, как просил Владос: {' / '.join(lines)}. Его "
+                                      "слова — его мнение и знание, не проверенный факт",
+                            subject=f"разговор: {npc.name}", important=True, brief=f"поговорил с {npc.title}",
+                            where=self._here())])
+
+    def _talk_failed(self, who: str, why: str) -> None:
+        trace.event(f"Разговор по просьбе: с «{who}» не вышло — {why}")
+        self.record([Change("order_failed", f"ты пообещал Владосу поговорить с {who}, но не вышло: {why}",
+                            subject=f"не вышло поговорить: {who}", important=True)])
 
     def _release(self, outing: Outing) -> None:
         """Держался рядом с человеком (подошёл, говорил) — отойти от него и ждать на месте."""

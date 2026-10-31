@@ -340,7 +340,8 @@ class VoiceService:
                     # "do" — только в ответе Владосу: по своей инициативе Гослинг приказов себе не отдаёт.
                     self.on_event({"type": "companion_reply", "text": reply_text, "emotion": emotion,
                                    "remember": remember, "idea": reply.idea, "do": reply.do,
-                                   "place": reply.place, "back": reply.back})
+                                   "place": reply.place, "back": reply.back,
+                                   "who": reply.who, "opener": reply.opener, "solved": reply.solved})
                 before_tts = time.perf_counter() - t
                 speech = self.speak(reply_text, emotion)
             log.info("от конца фразы до начала ответа: %.2f с", before_tts + speech.first_audio)
@@ -370,7 +371,9 @@ class VoiceService:
                     return
                 self.on_event({"type": "companion_reply", "text": reply.text, "emotion": reply.emotion,
                                "remember": reply.remember, "idea": reply.idea, "do": reply.do,
-                               "place": reply.place, "back": reply.back, "letter": True})
+                               "place": reply.place, "back": reply.back,
+                               "who": reply.who, "opener": reply.opener, "solved": reply.solved,
+                               "letter": True})
                 self.letters.show(reply.text, FROM_GOSLING)
         except Exception:
             log.exception("Ошибка письма")

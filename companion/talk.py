@@ -34,14 +34,29 @@ NPC_SYSTEM = """Ты — {name}, житель Скайрима. К тебе об
 спутник путника Владоса. Ответь ему вслух, от себя, 1–2 короткими фразами, в своей манере — как в твоих репликах ниже.
 Говори только то, что есть в данных о тебе ниже, и простое житейское (погода, работа, усталость, настроение).
 Не выдумывай имён, мест, событий, заданий и слухов, которых нет в данных: не знаешь — так и скажи, отмахнись или
-смени тему. Ты не обязан быть любезным: занят, не любишь чужаков — так и ответь.
+смени тему. Места и люди вокруг — только из справки о месте ниже: другие таверны, лавки и жителей не называй. Ты не обязан быть любезным: занят, не любишь чужаков — так и ответь.
 Отвечай строго одним JSON-объектом: {{"say": "<что ты говоришь>", "end": <true — ты закончил разговор>}}"""
 GOSLING_SYSTEM = """Ты — Гослинг, молодой норд, бывший картограф из Солитьюда, спутник Владоса. Ты исследуешь и
 разговариваешь с {name}; зачем: {goal}. Продолжи разговор одной короткой фразой — спроси то, что хочешь узнать,
 отзовись на его слова, — или поблагодари и закончи. Говоришь с ним, а не с Владосом. Не выдумывай фактов о мире.
 Ты — это ты: держись того, что решил о себе, и своего настроения; задели его слова лично — пусть это слышно.
+Его слова — не факт. Пометка «ты знаешь иначе» — сказанное им не сходится с тем, что знаешь ты: на слово не верь —
+переспроси или скажи по-своему, что знаешь иначе.
 {manner}
 Отвечай строго одним JSON-объектом: {{"say": "<что ты говоришь; пусто — молчишь>", "end": <true — заканчиваешь>}}"""
+
+# Сверка слов NPC: роль NPC — модель, и она выдумывает (29.10: «таверна Драконий Камень» в Вайтране, «Назим даёт советы
+# ярлу»). Запретом это не убрать — Гослинг не верит на слово: что не сходится с данными игры, он знает иначе.
+DOUBT_SYSTEM = """Ты — Гослинг, спутник Владоса в Скайриме. {name} только что сказал тебе это. Сверь его слова о мире с тем,
+что ты знаешь: данные игры ниже верны, но неполны.
+Не сходится — только когда данные прямо говорят иное о том же самом: он называет место, заведение или человека,
+которых нет там, где справка перечисляет всё (таверны, лавки, жители поселения), или говорит о ком-то или чём-то
+иначе, чем данные (кто он, чем занят, где живёт, что это за место).
+Сходится (не пиши): его мнения, чувства, советы, житейское; слухи и события, о которых данные молчат; другие слова, а
+суть та же. Сомневаешься — сходится.
+Отвечай строго одним JSON-объектом без пояснений и markdown:
+{{"doubts": ["<что он сказал — и что ты знаешь иначе, коротко>"]}} — обычно пустой список."""
+DOUBT_CHARS = 900  # знаков справки на одну запись
 
 
 class Talk:
@@ -49,7 +64,9 @@ class Talk:
                  deliver: Callable[[str], bool], say_as: Callable[[int, str, str, list, str], bool],
                  samples: VoiceSamples, quotes_path: Path, people: Callable[[str], str] = lambda name: "",
                  model: str = "", me: Callable[[], str] = lambda: "", manner: str = "",
-                 feel: Callable[[str, str], str] = lambda name, text: ""):
+                 feel: Callable[[str, str], str] = lambda name, text: "",
+                 place_card: Callable[[], str] = lambda: "",
+                 evidence: Callable[[str], list[str]] = lambda text: []):
         self.cfg = cfg
         self.game = game
         self.complete = lambda system, user, **kw: complete(system, user, model=cfg.model or model or None, **kw)
@@ -61,6 +78,10 @@ class Talk:
         self.me = me            # он сам: душа и настроение — чтобы и с NPC оставался собой
         self.manner = manner    # характер и манера речи (companion/persona.py)
         self.feel = feel        # слова NPC — в душу и настроение: задело лично — что именно ("" — нет)
+        # Что есть там, где вы (справка о месте), и что Гослинг знает о сказанном (база знаний): NPC — меньше поводов
+        # выдумывать, Гослингу — с чем сверить его слова (29.10: стражник послал в «таверну Драконий Камень»).
+        self.place_card = place_card
+        self.evidence = evidence
         self._quotes: dict[str, list[str]] | None = None
         self._lock = threading.Lock()
 
@@ -105,6 +126,8 @@ class Talk:
                 break
             self.say_as(npc.form, npc.name, voice, refs, text)
             lines.append(f"{npc.name}: «{text}»")
+            if doubts := self._doubts(npc, text):  # и в его ответ, и в рассказ Владосу, и в память
+                lines.append(f"(Ты знаешь иначе: {'; '.join(doubts)})")
             touched = self.feel(npc.name, text)  # и настроение сдвигается, как от любого события
             if reply.get("end") or turn == self.cfg.turns - 1:
                 break
@@ -124,11 +147,28 @@ class Talk:
         log.info("Разговор с %s: %d реплик", npc.name, len(lines))
         return lines
 
+    def _doubts(self, npc: Nearby, text: str) -> list[str]:
+        """Что в словах NPC не сходится с тем, что Гослинг знает (справка о месте, база знаний). [] — нечему не верить
+        или сверить не с чем."""
+        known = [x for x in [self.place_card(), *self.evidence(text)] if x]
+        if not known:
+            return []
+        result = self.complete(DOUBT_SYSTEM.format(name=npc.name),
+                               "Что ты знаешь (данные игры):\n" + "\n".join(f"- {k[:DOUBT_CHARS]}" for k in known)
+                               + f"\n\n{npc.name} сказал тебе: «{text}»", title=f"Разговор: сверяю слова {npc.name}")
+        doubts = result.get("doubts") if isinstance(result, dict) else None
+        found = [str(d).strip() for d in doubts or [] if str(d).strip()] if isinstance(doubts, list) else []
+        if found:
+            trace.event(f"Разговор: {npc.name} — не сходится: {'; '.join(found)}")
+        return found
+
     def _about(self, npc: Nearby) -> str:
         """Данные о нём для роли: кто он, где сейчас, как говорит в игре, что говорил только что."""
         parts = [f"Кто ты (из данных игры): {self.people(npc.name) or npc.title}"]
         if here := self.game.status.location:
             parts.append(f"Где ты сейчас: {here}")
+        if card := self.place_card():
+            parts.append(f"Что здесь есть (справка о месте): {card}")
         if quotes := self._quotes_of(npc.name):
             parts.append("Так ты говоришь в игре (твои реплики — по ним твоя манера и что ты знаешь):\n"
                          + "\n".join(f"- «{q}»" for q in quotes))

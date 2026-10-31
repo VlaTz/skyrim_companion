@@ -157,6 +157,7 @@ class BrainConfig(BaseModel):
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
         "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "taken",
         "hurt_self", "personal", "order_failed", "rejoined", "arrived", "own_fight", "own_fight_end", "own_unknown",
+        "talked", "oddity",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
@@ -208,6 +209,16 @@ class PersonalConfig(BaseModel):
     enabled: bool = True
     gap: float = 900      # с — одну запись души не чаще
     gap_all: float = 120  # с — любую не чаще
+
+
+class MysteriesConfig(BaseModel):
+    """Загадки (companion/mysteries.py): «швы» игры, которые Гослинг видит изнутри мира, — удивляется, гадает, спрашивает."""
+    enabled: bool = True
+    gap: float = 7200            # с — неразгаданную загадку после догадки поднимать не чаще (в остальное время — молча)
+    time_jump_hours: float = 2   # ч игрового времени сверх обычного хода — «провал во времени» (сон, ожидание, перемещение)
+    repeat_lines: int = 3        # раз слово в слово одну реплику NPC (в разное время) — «одинаковые слова»
+    bag_items: int = 60          # вещей в сумке Владоса — «столько не унести»
+    bag_more: int = 40           # и снова — когда прибавилось ещё столько
 
 
 class SoulConfig(BaseModel):
@@ -317,6 +328,7 @@ class Config(BaseModel):
     soul: SoulConfig = SoulConfig()
     mood: MoodConfig = MoodConfig()
     personal: PersonalConfig = PersonalConfig()
+    mysteries: MysteriesConfig = MysteriesConfig()
     vision: VisionConfig = VisionConfig()
     jokes: JokesConfig = JokesConfig()
     overlay: OverlayConfig = OverlayConfig()

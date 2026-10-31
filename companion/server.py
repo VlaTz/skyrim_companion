@@ -44,6 +44,7 @@ from companion.knowledge import Knowledge
 from companion.letters import Letters
 from companion.memory.soul import Soul
 from companion.mood import Mood
+from companion.mysteries import Mysteries
 from companion.orders import Orders
 from companion.personal import Personal
 from companion.musings import Musings
@@ -140,6 +141,8 @@ def create_app(cfg: Config) -> FastAPI:
     mood = Mood(soul=lambda: memory.store.soul_feel() if memory.store.is_open else []) if cfg.mood.enabled else None
     memory.mood = mood
     personal = Personal(mood, cfg.personal) if mood and cfg.personal.enabled else None  # событие задело душу — повод
+    # Загадки: «швы» игры глазами Гослинга (Владос погиб — и жив, время провалилось) — удивиться, гадать, спросить.
+    mysteries = memory.mysteries = Mysteries(memory.store, cfg.mysteries)
     game.meet = memory.meet  # встречи (раса врага, Крик) — «впервые» или «уже встречали»
     npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
                          lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
@@ -155,7 +158,10 @@ def create_app(cfg: Config) -> FastAPI:
             state["explorer"].heard(str(event.get("text") or ""))
         if event.get("type") == "companion_reply" and event.get("do"):  # согласился — делает, пока говорит
             orders.give(str(event["do"]), place=str(event.get("place") or ""), back=bool(event.get("back")),
-                        said=str(event.get("text") or ""))
+                        said=str(event.get("text") or ""), who=str(event.get("who") or ""),
+                        opener=str(event.get("opener") or ""))
+        if event.get("solved"):  # Владос объяснил загадку — больше не спрашивать
+            mysteries.solve(*str(event["solved"]).partition(":")[::2])
         if event.get("joke") and "brain" in state and state["brain"].jokes:  # обыграл заготовку — помним, что сказано
             state["brain"].jokes.said(str(event["joke"]))
         if event.get("type") == "companion_reply" and "thinker" in state:
@@ -250,7 +256,8 @@ def create_app(cfg: Config) -> FastAPI:
                         me=lambda: "\n".join(x for x in (
                             soul_block(memory.store) if memory.store.is_open else "", mood.describe() if mood else "")
                             if x),
-                        feel=npc_said)
+                        feel=npc_said, place_card=lambda: places.card(game.status.location or ""),
+                        evidence=lambda text: [t for kind, t in knowledge.search(text, 4) if not kind.startswith("book")])
         if cfg.explorer.enabled and service.llm:  # «отпусти исследовать» и «веди» — сам решает, куда идти
             explorer = Explorer(cfg.explorer, game, orders, service.llm.complete_json, places, memory.explorer_memory,
                                 deliver=lambda text: service.deliver(text, letter=not service.can_speak()),
@@ -341,6 +348,10 @@ def create_app(cfg: Config) -> FastAPI:
             mood.notify(seen)
         touched = personal.notify(seen) if personal and seen else []  # задело запись души — повод мозгу: от себя
         seen += touched
+        if odd := mysteries.on_event(event.type, event.data, changes, game.player):  # странность — пора сказать о ней
+            memory.record_changes(odd)
+            seen += odd
+            touched += odd
         if "vision" in state and seen:  # новое место, смена погоды — взглянуть (в фоне)
             state["vision"].notify(seen)
         texts = [c.text for c in changes + touched]

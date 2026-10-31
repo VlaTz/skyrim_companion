@@ -36,9 +36,10 @@ SYSTEM = """Ты — Гослинг, спутник Владоса в Скайр
   (что любишь, что тебе удобно или нет), а не то, что на тебе сейчас.
 Перед ответом проверь каждую запись: говорит ли она, что на тебе или у тебя сейчас (что носишь, надел, держишь, что в
 сумке)? Тогда оставь в ней только вкус, который за этим стоит, без того, что на тебе, — или убери запись совсем.
-key — о чём, коротко, в нижнем регистре. Вкусы — по одному key на тему: «оружие», «броня», «еда», «питьё»; остальное —
-«страх: …», «мечта: …», «привычка: …», «мнение: …», «прошлое: …», «любит: …», «не любит: …».
-text — от первого лица, одной фразой, как ты сам сказал бы о себе. why — что ты сказал и в ответ на что, коротко.
+key — вид записи, один на вид, в нижнем регистре: «оружие», «броня», «еда», «питьё», «страх», «мечта», «привычка»,
+«прошлое», «любит», «не любит». Новое того же вида — не новая запись, а та же (тот же key), дополненная: верни её
+целиком — прежнее и новое вместе. Только мнения — по одному на то, о ком или о чём: «мнение: …».
+text — от первого лица, одной-двумя фразами, как ты сам сказал бы о себе; в записи вида — всё этого вида. why — что ты сказал и в ответ на что, коротко.
 items — каждое блюдо, напиток, оружие и броня, названные в text, — как названы, даже если название описательное
 («суп из …», «… с …»); не перечисляй только совсем общие слова (мясо, горячая еда, топор, лёгкая броня); нет таких —
 пустой список.
@@ -62,6 +63,8 @@ feel — поводы для настроения: что в событиях и
 {"soul": [{"key": "...", "text": "...", "why": "...", "items": [...], "feel": {...}}]} — обычно пустой список."""
 
 FEELINGS = ("радость", "страх", "неприязнь", "грусть")
+# Виды записей, где key — ещё и тема («мнение: аргониане»): разные темы — разные записи, сводить их не надо.
+PER_SUBJECT = {"мнение"}
 
 
 def clean_feel(feel) -> dict[str, list[str]]:
@@ -110,6 +113,15 @@ items — конкретные предметы игры, названные в 
 Отвечай строго одним JSON-объектом без пояснений и markdown: {"text": "...", "items": [...]}"""
 
 
+# Несколько записей души одного вида («страх: великаны», «страх: драконы…») — свести в одну: спросили «чего боишься?» —
+# модель брала одну запись как готовый ответ, а другую забывала (27.10: назвал драконов и волков, а великанов — нет).
+MERGE_SYSTEM = """Ты — Гослинг, спутник Владоса в Скайриме. Ниже — несколько записей твоей души одного вида (что ты решил
+о себе). Сведи их в одну запись: от первого лица, одной-двумя фразами, как ты сам сказал бы о себе. Сохрани всё, что в
+них есть (каждый страх, каждое блюдо, каждую мечту), — ничего не добавляй и не теряй. Противоречат друг другу — бери
+более позднюю (записи по порядку, последняя — новее).
+Отвечай строго одним JSON-объектом без пояснений и markdown: {"text": "..."}"""
+
+
 def persona(prompt_file: Path) -> str:
     text = prompt_file.read_text(encoding="utf-8")
     return text.split(PERSONA_END, 1)[0].strip()
@@ -148,8 +160,9 @@ class Soul:
     def reflect(self, lines: list[str], where: Where) -> int:
         """Глава записана: что из сказанного Гослингом о себе — в душу. lines — записи главы, как у летописца.
         Возвращает, сколько записей души изменено."""
+        merged = self._merge(where)
         if not any("Ты (Гослинг):" in line for line in lines):
-            return 0
+            return merged
         current = self.store.soul_feel()
         user = ("Твой характер (описание):\n" + self.persona
                 + "\n\nТвоя душа сейчас (key — text (поводы)):\n"
@@ -168,7 +181,7 @@ class Soul:
                 proposed = [e for e in screen["soul"] if isinstance(e, dict) and str(e.get("key", "")).strip()
                             and self._changes_text(e, known)]
                 if not proposed:
-                    changed = self._backfill(where)
+                    changed = merged + self._backfill(where)
                     log.info("Душа %.1f с: отбор (%s) — записывать нечего, изменено %d", time.perf_counter() - t,
                              self.cfg.screen_model, changed)
                     return changed
@@ -181,7 +194,7 @@ class Soul:
         if not isinstance(result, dict) or not isinstance(result.get("soul"), list):
             log.warning("Душа: модель не вернула ответ")
             return 0
-        changed = 0
+        changed = merged
         for entry in result["soul"]:
             if not isinstance(entry, dict) or not str(entry.get("key", "")).strip():
                 continue
@@ -207,6 +220,38 @@ class Soul:
         """Запись из ответа меняет текст души: новая, другой текст или «убрать» (пустой text) существующей."""
         key, text = str(entry["key"]).strip().lower(), str(entry.get("text") or "").strip()
         return (text != known[key]) if key in known else bool(text)
+
+    def _merge(self, where: Where) -> int:
+        """Записи одного вида под разными key (раньше key был «вид: тема») — одной записью с key вида: текст сводит
+        модель, поводы для настроения — объединение. Сколько записей изменено."""
+        groups: dict[str, list[tuple[str, str, dict | None]]] = {}
+        for key, text, feel in self.store.soul_feel():
+            kind = key.split(":", 1)[0].strip()
+            if kind not in PER_SUBJECT:
+                groups.setdefault(kind, []).append((key, text, feel))
+        changed = 0
+        for kind, entries in groups.items():
+            if len(entries) < 2:
+                continue
+            listing = "\n".join(f"{i}. {text}" for i, (_key, text, _feel) in enumerate(entries, 1))
+            result = self.complete(MERGE_SYSTEM, f"Вид: {kind}\n{listing}", title=f"Душа: свожу «{kind}»")
+            text = str(result.get("text") or "").strip() if isinstance(result, dict) else ""
+            if not text:
+                log.warning("Душа: свести «%s» не вышло — попробуем в следующий раз", kind)
+                continue
+            feel: dict[str, list[str]] | None = None
+            if any(f is not None for _k, _t, f in entries):
+                feel = {}
+                for _key, _text, f in entries:
+                    for name, words in (f or {}).items():
+                        feel[name] = list(dict.fromkeys(feel.get(name, []) + words))
+            self.store.set_soul(kind, text, f"свёл записи вида «{kind}»", where, feel)
+            for key, _text, _feel in entries:
+                if key != kind:
+                    self.store.set_soul(key, "", f"сведено в «{kind}»", where)
+            log.info("Душа: свёл %d записей «%s» — %s (поводы: %s)", len(entries), kind, text, feel_text(feel))
+            changed += len(entries)
+        return changed
 
     def _backfill(self, where: Where) -> int:
         """Записям души без поводов (сделаны до них) — поводы, одним запросом; нет поводов — пустые, чтобы не

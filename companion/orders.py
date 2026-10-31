@@ -31,7 +31,8 @@ log = logging.getLogger(__name__)
 
 ACTIONS = {"wait": "остаться ждать на месте", "follow": "пойти за Владосом",
            "dismiss": "расстаться с Владосом и уйти к себе", "go_to": "сходить к месту",
-           "explore": "уйти исследовать самому", "lead": "исследовать, ведя Владоса за собой"}
+           "explore": "уйти исследовать самому", "lead": "исследовать, ведя Владоса за собой",
+           "talk": "поговорить с человеком рядом"}
 EXPLORE = ("explore", "lead")  # вылазки исследователя (companion/explorer.py): ходит сам, куда решит
 # Коды отказа -> причина для модели. Прочие (no_quest, papyrus, ...) — сбой мода.
 REASONS = {
@@ -78,15 +79,21 @@ class Orders:
         self.on_explorer_result: Callable[[Order, dict], list[Change]] = lambda order, data: []
         # «Сходи туда», а вылазка идёт: место — её следующая цель (True — исследователь взял), а не конец вылазки.
         self.on_redirect: Callable[[Marker], bool] = lambda marker: False
+        # «Поговори с ним»: подойти, поговорить и вернуться рассказать — делает исследователь (подход и разговор — его).
+        self.on_talk: Callable[[str, str], None] = lambda who, opener: None
         game.on_order_result = self._on_result
 
-    def give(self, action: str, place: str = "", back: bool = False, said: str = "") -> None:
+    def give(self, action: str, place: str = "", back: bool = False, said: str = "", who: str = "",
+             opener: str = "") -> None:
         """Приказ Владоса (action — из ACTIONS). Ответ игры придёт событием order_result. said — что Гослинг ответил,
         соглашаясь: начиная вылазку, исследователь держится сказанного («пойдём к шахте» — первая цель шахта)."""
         if action not in ACTIONS:
             return
         if action in EXPLORE:
             self.on_explore(action, said)
+            return
+        if action == "talk":  # не приказ «вместо» прежнего: идёт вылазка — разговор в её ходе, она не кончается
+            self.on_talk(who, opener)
             return
         if not self.plugin_connected():
             log.warning("Приказ %s: игра не на связи — не отдан", action)
