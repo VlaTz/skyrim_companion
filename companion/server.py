@@ -211,7 +211,7 @@ def create_app(cfg: Config) -> FastAPI:
                          items=ItemBook(cfg.game.data_dir))
                     if cfg.soul.enabled else None)  # что Гослинг решил о себе — после каждой главы; предметы — из игры
             diarist = Diarist(memory.store, llm.complete_json, cfg.diarist,
-                              player_name=lambda: memory.store.player_name, knowledge=knowledge, soul=soul,
+                              knowledge=knowledge, soul=soul,
                               paused=lambda: game.apart_since is not None)
             memory.on_place_changed = diarist.place_changed
             diarist.start()

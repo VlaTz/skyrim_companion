@@ -31,3 +31,5 @@ huggingface_hub>=0.24
 
 # Чтение архивов игры SE (сжаты LZ4): файлы лица для Gosling.esp (tools/build_gosling_esp.py)
 lz4>=4
+# Голоса из архивов игры (.fuz -> wav): референсы голоса Гослинга и образцы голосов NPC
+av>=12

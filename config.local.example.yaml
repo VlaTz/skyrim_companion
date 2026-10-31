@@ -1,0 +1,32 @@
+# Личные настройки поверх config.yaml: скопируйте этот файл в config.local.yaml и впишите своё.
+# config.local.yaml в .gitignore — ключ и пути в git не попадут. Всё, чего здесь нет, берётся из config.yaml.
+
+# Ключ OpenRouter (https://openrouter.ai/keys): ответы Гослинга, память, зрение; и облачный голос, если tts.engine: cloud.
+llm:
+  api_key: sk-or-v1-ВАШ-КЛЮЧ
+
+# Как Гослинг зовёт вас. Падежи мужского имени на согласную выводятся сами; иначе — forms.
+player:
+  name: Владос
+  forms: {}            # например, {gen: Ильи, dat: Илье, ins: Ильёй, pre: Илье}
+
+# Папка Data игры (Steam): оттуда читаются строки, голоса, места — только чтение.
+game:
+  data_dir: C:\Program Files (x86)\Steam\steamapps\common\Skyrim Special Edition\Data
+
+# Папка мода Gosling в Mod Organizer 2 — сюда tools/build_gosling_esp.py --install кладёт мод,
+# а сервис перед каждой фразой пишет туда звук.
+npc_voice:
+  mod_dir: C:\Modding\MO2\mods\Gosling
+
+# Распознавание речи. Видеокарта NVIDIA: large-v3-turbo + cuda. Без неё: small + cpu + int8.
+stt:
+  model: large-v3-turbo
+  device: cuda
+  compute_type: int8_float16
+
+# Голос Гослинга. xtts — локально на видеокарте (голос Эрика по репликам из игры, бесплатно);
+# cloud — ElevenLabs через OpenRouter (тот же ключ, платно за символы), видеокарта не нужна.
+tts:
+  engine: xtts
+  device: cuda

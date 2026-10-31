@@ -25,9 +25,11 @@ import soundfile as sf
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from companion.config import load_config  # noqa: E402
 from companion.game.gamefiles import read_bsa_index, read_file  # noqa: E402
 
-DEFAULT_BSA = Path(r"D:\Games\The Elder Scrolls V Skyrim\Data\Skyrim - Voices_ru0.bsa")
+_cfg = load_config()  # голоса — из папки Data игры (game.data_dir) и архива talk.voices_bsa
+DEFAULT_BSA = _cfg.game.data_dir / _cfg.talk.voices_bsa
 
 
 def fuz_audio(data: bytes) -> bytes:

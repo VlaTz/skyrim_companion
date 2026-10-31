@@ -16,7 +16,8 @@ Gosling.esp:
   ванильного «следуй за…») — подойти к человеку и держаться в паре шагов, пока он ходит; пакет GoslingLingerPackage
   (копия ванильного Sandbox) — побыть на месте: постоять, посидеть, послушать, о чём говорят вокруг.
   Звук реплик сервис кладёт в Sound\\Voice\\Gosling.esp\\MaleYoungEager\\ перед каждой фразой.
-Ещё в моде: Scripts\\GoslingVoice.pex и GoslingOrders.pex (компилируются из mod/Scripts/Source), Seq\\Gosling.seq (без него
+Ещё в моде: Scripts\\GoslingVoice.pex и GoslingOrders.pex (компилируются из mod/Scripts/Source; без компилятора
+Papyrus из Creation Kit берутся готовые из mod/Scripts — их обновляет сборка с компилятором), Seq\\Gosling.seq (без него
 реплики квеста, стартующего с игрой, не звучат), заглушки .wav и .lip для тем
 и файлы лица Гослинга (meshes/textures\\...\\FaceGenData\\...\\Gosling.esp\\00000800.*).
 
@@ -29,6 +30,7 @@ Gosling.esp:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import shutil
 import struct
@@ -50,6 +52,8 @@ from companion.game.voices import voice_types  # noqa: E402
 
 OUT = ROOT / "build" / "mod"
 SCRIPTS_SRC = ROOT / "mod" / "Scripts" / "Source"
+SCRIPTS_PREBUILT = ROOT / "mod" / "Scripts"  # готовые .pex в git: собрать мод можно и без Creation Kit
+BUILT_FROM = SCRIPTS_PREBUILT / "built_from.txt"
 
 NAME = "Гослинг"
 FORM_VERSION = 44  # версия записей Skyrim SE
@@ -454,22 +458,70 @@ def header(num_records: int) -> bytes:
 
 # ------------------------------------------------------------------ остальные файлы мода
 
+def portable_pex(data: bytes) -> bytes:
+    """Заголовок .pex без времени сборки, имени пользователя и компьютера — в git они ни к чему.
+    Строки заголовка читаются подряд, смещений на них нет."""
+    p = 16  # магия 4, версия 2, игра 2, время сборки 8
+    p += 2 + int.from_bytes(data[p:p + 2], "big")  # имя исходника
+    end = p
+    for _ in range(2):  # пользователь, компьютер
+        end += 2 + int.from_bytes(data[end:end + 2], "big")
+    return data[:8] + bytes(8) + data[16:p] + bytes(4) + data[end:]
+
+
+def source_hash(psc: Path) -> str:
+    """Хэш исходника скрипта — без разницы в переводах строк (git на Windows может их менять)."""
+    return hashlib.sha1(psc.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
+def read_built_from() -> dict[str, str]:
+    """Из каких исходников собраны готовые .pex: имя скрипта -> хэш .psc (mod/Scripts/built_from.txt)."""
+    if not BUILT_FROM.is_file():
+        return {}
+    return dict(line.split() for line in BUILT_FROM.read_text(encoding="utf-8").splitlines() if line.strip())
+
+
 def compile_scripts(data_dir: Path, out: Path) -> None:
     game = data_dir.parent
     compiler = game / "Papyrus Compiler" / "PapyrusCompiler.exe"
     vanilla = data_dir / "Source" / "Scripts"
-    if not compiler.is_file() or not (vanilla / "TESV_Papyrus_Flags.flg").is_file():
-        raise SystemExit(f"Нет компилятора Papyrus или исходников скриптов игры ({compiler}, {vanilla}). "
-                         "Их ставит Creation Kit — запусти его один раз, он распакует Scripts.zip.")
     out.mkdir(parents=True, exist_ok=True)
-    for psc in SCRIPTS_SRC.glob("*.psc"):
+    sources = sorted(SCRIPTS_SRC.glob("*.psc"))
+    built_from = read_built_from()
+    if not compiler.is_file() or not (vanilla / "TESV_Papyrus_Flags.flg").is_file():
+        # Компилятора нет (Creation Kit не ставили) — готовые скрипты из git, если они собраны из этих же исходников.
+        for psc in sources:
+            pex = SCRIPTS_PREBUILT / f"{psc.stem}.pex"
+            if not pex.is_file():
+                raise SystemExit(f"Нет компилятора Papyrus или исходников скриптов игры ({compiler}, {vanilla}) "
+                                 f"и нет готового {pex}. Компилятор ставит Creation Kit — запусти его один раз, "
+                                 "он распакует Scripts.zip.")
+            if built_from.get(psc.stem) != source_hash(psc):
+                print(f"ВНИМАНИЕ: готовый {pex.name} собран не из нынешнего {psc.name} — скрипт может работать "
+                      "по-старому. Чтобы пересобрать, нужен Creation Kit.")
+            shutil.copyfile(pex, out / pex.name)
+            print(f"Скрипт: {pex.name} (готовый, без компилятора)")
+        return
+    for psc in sources:
         result = subprocess.run(
             [str(compiler), str(psc), f"-f={vanilla / 'TESV_Papyrus_Flags.flg'}",
              f"-i={vanilla};{SCRIPTS_SRC}", f"-o={out}"],
             capture_output=True, text=True)
         if result.returncode != 0:
             raise SystemExit(f"Papyrus: ошибка компиляции {psc.name}:\n{result.stdout}\n{result.stderr}")
-        print(f"Скрипт: {psc.stem}.pex")
+        pex = out / f"{psc.stem}.pex"
+        data = portable_pex(pex.read_bytes())
+        pex.write_bytes(data)
+        # Готовый в git обновляем, только когда менялся исходник: компилятор пишет таблицу строк каждый раз
+        # в новом порядке, и без этого .pex менялся бы от любой пересборки.
+        prebuilt = SCRIPTS_PREBUILT / pex.name
+        if prebuilt.is_file() and built_from.get(psc.stem) == source_hash(psc):
+            print(f"Скрипт: {pex.name}")
+            continue
+        prebuilt.write_bytes(data)
+        built_from[psc.stem] = source_hash(psc)
+        BUILT_FROM.write_text("".join(f"{k} {v}\n" for k, v in sorted(built_from.items())), encoding="utf-8")
+        print(f"Скрипт: {pex.name} (обновлён готовый в mod/Scripts)")
 
 
 def copy_facegen(data_dir: Path, out: Path) -> None:

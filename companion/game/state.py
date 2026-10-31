@@ -93,6 +93,7 @@ from typing import Any, Callable
 
 from pydantic import BaseModel
 
+from companion import naming
 from companion.config import MapConfig
 from companion.game.books import BookLibrary
 from companion.game.dialogue import DialogueTexts
@@ -402,7 +403,9 @@ class GameState:
         self.heard: deque[Heard] = deque(maxlen=12)
         self.in_dialogue = False  # игрок в меню разговора с NPC
         self.profile = profile or PlayerProfile()  # кто игрок по данным игры: гильдии, розыск, квесты, привычки
-        self.player_name = "Владос"  # имя персонажа в игре (из status / game_loaded)
+        # Как зовут Игрока в текстах — имя-метка; модели уходит имя из конфига (companion/naming.py). Имя персонажа в
+        # сохранении (player_name от плагина) — только ключ памяти (MemoryKeeper): оно бывает и другим.
+        self.player_name = naming.CANON
         # Встреча (категория, ключ) -> (сколько раз встречали раньше, где и когда последний раз) | None (не считаем).
         # Ставит память (MemoryKeeper.meet); без неё встреч не помним.
         self.meet: Callable[[str, str], tuple[int, str] | None] = lambda category, key: None
@@ -416,8 +419,6 @@ class GameState:
         """Учитывает событие; возвращает, что изменилось."""
         with self._lock:
             self.updated = time.time()
-            if event.data.get("player_name"):
-                self.player_name = str(event.data["player_name"])
             if event.type == "status":
                 changes = self._apply_status(Status.model_validate(event.data))
             elif event.type == "map_markers":

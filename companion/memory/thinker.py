@@ -19,6 +19,7 @@ import threading
 import time
 from typing import Callable
 
+from companion import naming
 from companion.config import ThinkerConfig
 from companion.game.items import words
 from companion.game.state import Change, GameState
@@ -186,7 +187,7 @@ class Thinker:
     def _think(self, why: str) -> bool:
         now = time.time()
         old = self.store.ideas()
-        name = self.store.player_name or "Владос"
+        name = naming.CANON  # имя Игрока — из конфига, подставится в запросе (companion/naming.py)
         dialogue = [f"{name}: {text}" if kind == "player" else f"Гослинг: {text}"
                     for kind, text, _emotion, _initiative in self.store.last_dialogue(self.cfg.dialogue_lines)
                     if kind in ("player", "gosling")][-self.cfg.dialogue_lines:]

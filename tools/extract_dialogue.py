@@ -22,10 +22,11 @@ import soundfile as sf
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from companion.game.dialogue import PLUGINS, load_responses  # noqa: E402
+from companion.config import load_config  # noqa: E402
 from companion.game.gamefiles import load_strings  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = Path(r"D:\Games\The Elder Scrolls V Skyrim\Data")
+DATA = load_config().game.data_dir  # папка Data игры — из config.yaml / config.local.yaml
 NAME_RE = re.compile(r"^(?P<plugin>[^_]+)__.*_(?P<form>[0-9a-f]{8})_(?P<resp>\d+)$")
 
 

@@ -65,6 +65,12 @@ class TTSConfig(BaseModel):
     cloud: CloudTTSConfig = CloudTTSConfig()
 
 
+class PlayerConfig(BaseModel):
+    """Игрок: как Гослинг его зовёт — имя уходит во все запросы к моделям и в трассу (companion/naming.py)."""
+    name: str = "Владос"
+    forms: dict[str, str] = {}   # падежи, если не выводятся сами: gen, dat, ins, pre (Ильи, Илье, Ильёй, Илье)
+
+
 class LLMConfig(BaseModel):
     base_url: str = "http://localhost:1234/v1"
     model: str = "local-model"
@@ -310,6 +316,7 @@ class Config(BaseModel):
     logs_dir: Path = Path("logs")      # логи; трасса Гослинга — logs/trace/<дата>.log
     trace: bool = True                 # писать трассу: вопросы, справки и ответы модели, озвучка, летописец
     character: str = "gosling"
+    player: PlayerConfig = PlayerConfig()
     server: ServerConfig = ServerConfig()
     push_to_talk: PushToTalkConfig = PushToTalkConfig()
     echo: bool = True
@@ -366,4 +373,7 @@ def load_config(path: Path | None = None) -> Config:
     local = path.with_name(path.stem + ".local.yaml")
     if local.is_file():
         data = _merge(data or {}, yaml.safe_load(local.read_text(encoding="utf-8")) or {})
-    return Config.model_validate(data or {})
+    cfg = Config.model_validate(data or {})
+    from companion import naming  # имя Игрока — во все запросы к моделям и в трассу (сервер и инструменты разом)
+    naming.setup(cfg.player.name, cfg.player.forms)
+    return cfg

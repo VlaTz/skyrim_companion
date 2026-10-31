@@ -22,7 +22,7 @@ from types import SimpleNamespace
 from typing import Callable
 
 from companion.config import LLMConfig
-from companion import trace
+from companion import naming, trace
 from companion.emotions import DEFAULT_EMOTION, EMOTIONS
 from companion.orders import ACTIONS
 from companion.tools import Tool
@@ -129,7 +129,9 @@ BETWEEN_MAX = 8  # событий между репликами в истори�
 # Обращение к игроку. «Не в каждой реплике» в промпте персонажа модель не держит (131 из 140 реплик в памяти —
 # с обращением, 79 с него начинаются): своим прошлым репликам в истории она подражает сильнее. Поэтому — по факту:
 # было обращение в последних ADDRESS_LOOKBACK репликах — в этой без него (пометка только в этот запрос).
-ADDRESS = re.compile(r"\b(Владос\w*|братан\w*|бро)\b", re.I)
+def address() -> re.Pattern:
+    """Обращение к Игроку: его имя (из конфига, в любом падеже), «братан», «бро»."""
+    return re.compile(rf"\b({naming.pattern()}|братан\w*|бро)\b", re.I)
 ADDRESS_LOOKBACK = 2
 ADDRESS_NOTE = ("(Ты уже обращался к нему в прошлых репликах — в этой говори без обращения: без «Владос», "
                 "«братан», «бро».)")
@@ -272,6 +274,10 @@ class CompanionLLM:
                 f"или переменную окружения {cfg.api_key_env}")
         self.client = OpenAI(base_url=cfg.base_url, api_key=api_key or "not-needed",
                              timeout=cfg.timeout, max_retries=1)
+        # Имя Игрока — из конфига: подставляется в каждый запрос этим клиентом (разговор, фон, зрение), а в коде и
+        # текстах событий он — «Владос» (companion/naming.py).
+        create = self.client.chat.completions.create
+        self.client.chat.completions.create = lambda **kwargs: create(**naming.request(kwargs))
         self.history: deque[dict] = deque(maxlen=cfg.history_turns * 2)
         self._lock = threading.Lock()  # отвечают и на реплики игрока, и на события — по очереди
         self.tools: dict[str, Tool] = {}
@@ -500,7 +506,8 @@ class CompanionLLM:
     def _addressed_lately(self) -> bool:
         """В последних ADDRESS_LOOKBACK репликах Гослинга было обращение к игроку."""
         replies = [m["content"] for m in self.history if m["role"] == "assistant"][-ADDRESS_LOOKBACK:]
-        return any(ADDRESS.search(r) for r in replies)
+        mark = address()
+        return any(mark.search(r) for r in replies)
 
     def complete_json(self, system: str, user: str, max_tokens: int | None = None,
                       title: str = "Фоновый запрос", model: str | None = None, reasoning: str = "") -> dict | None:

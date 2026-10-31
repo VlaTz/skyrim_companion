@@ -14,6 +14,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+from companion import naming
+
 log = logging.getLogger("companion.trace")
 log.propagate = False  # только в свой файл
 log.addHandler(logging.NullHandler())
@@ -33,7 +35,7 @@ def setup(directory: Path) -> Path:
 
 def event(text: str) -> None:
     """Одна строка: «11:52:38 Озвучка: …»."""
-    log.info(f"{datetime.now():%H:%M:%S} {text}")
+    log.info(naming.apply(f"{datetime.now():%H:%M:%S} {text}"))
 
 
 class Block:
@@ -52,4 +54,4 @@ class Block:
 
     def write(self) -> None:
         self.lines.append(f"──── {time.perf_counter() - self.started:.2f} с")
-        log.info("\n".join(self.lines))
+        log.info(naming.apply("\n".join(self.lines)))  # имя Игрока — из конфига, как его видит модель

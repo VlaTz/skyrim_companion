@@ -135,8 +135,11 @@ class Stand:
 
         mem_dir = out / "memory"
         mem_dir.mkdir(parents=True)
-        shutil.copy2(db, mem_dir / db.name)
-        self.days = self._last_day(mem_dir / db.name) + 0.01
+        if db.is_file():
+            shutil.copy2(db, mem_dir / db.name)
+            self.days = self._last_day(mem_dir / db.name) + 0.01
+        else:  # своей памяти ещё нет (новая установка) — Гослинг без прошлого, день 1
+            self.days = 0.5
 
         books = BookLibrary(cfg.game.data_dir)
         game = self.game = GameState(cfg.map, cfg.game.interface_bsa, dialogue=DialogueTexts(cfg.game.data_dir),
