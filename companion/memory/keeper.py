@@ -115,6 +115,8 @@ class MemoryKeeper:
         if event.type == "stat":  # статистика игры — в память персонажа, чтобы привычки пережили перезапуск
             self.store.set_meta("stats", json.dumps(self.game.profile.stats, ensure_ascii=False))
         if event.type == "status":
+            if (g := self.game.status.gosling) and g.follower and self.store.is_open:  # взял в спутники — «вместе»
+                self.store.mark_companion(self._days)
             location = self.game.status.location
             area = None if location is None else (self._area(location) if location else "дикие земли")
             if area and self._area_now and area != self._area_now:
@@ -405,6 +407,9 @@ class MemoryKeeper:
                  if name not in together][:MAX_VISITS]
         if alone:  # вылазки без Владоса: он там не был — не «вместе»
             parts.append("Где ты был сам, без Владоса (последние): " + "; ".join(alone) + ".")
+        if self.store.companion_since is None:  # ещё не нанят: первая встреча, а не «мы же с тобой…»
+            parts.append("Владос ещё ни разу не брал тебя в спутники: вы не путешествовали вместе, общего прошлого у "
+                         "вас нет — что знаешь о нём, видишь сейчас.")
         if parts:
             parts.append("Чего нет в памяти и дневнике, ты не помнишь — подробностей не выдумывай.")
         return "\n".join(parts)

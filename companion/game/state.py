@@ -190,7 +190,8 @@ class Change:
     #            profile (вступил в гильдию, завершил квест, розыск...), quest, quest_misc (задания журнала),
     #            person (знакомый NPC напал или убит), power (слово силы, душа дракона), cleared, crime, talk,
     #            deed (статистика игры), weather (погода сменилась), order_failed (приказ голосом не вышел),
-    #            parted / rejoined (Гослинг и Владос разошлись / снова вместе), other
+    #            parted / rejoined (Гослинг и Владос разошлись / снова вместе),
+    #            hired / dismissed (Владос взял Гослинга в спутники / отпустил), other
     text: str
     subject: str = ""  # о чём событие (место) — чтобы не комментировать одно и то же дважды
     important: bool = False  # дольше держится в «Недавно», не тонет среди убитых злокрысов
@@ -552,6 +553,20 @@ class GameState:
                                    "тебя, ты не видел — можешь спросить",
                        subject="снова вместе", important=True, brief=f"снова вместе после {minutes} мин порознь")]
 
+    def _track_follower(self, og: GoslingStatus | None, ng: GoslingStatus) -> list[Change]:
+        """Наём и расставание: флаг спутника в игре поменялся — «Следуй за мной…» или «Пора нам расстаться.» в
+        обычном диалоге, или приказ голосом. Только между снимками одной загрузки: после загрузки сейва прежнего снимка
+        нет — это не «взял в спутники» заново."""
+        if og is None or not (og.loaded and ng.loaded) or og.follower == ng.follower:
+            return []
+        log.info("Гослинг %s", "взят в спутники" if ng.follower else "больше не спутник")
+        if ng.follower:
+            return [Change("hired", "Владос позвал тебя с собой — теперь ты его спутник и ходишь с ним",
+                           subject="стал спутником", important=True, brief="Владос взял тебя в спутники")]
+        return [Change("dismissed", "Владос тебя отпустил — ты больше не его спутник и с ним не ходишь, пока он "
+                                    "не позовёт снова",
+                       subject="больше не спутник", important=True, brief="Владос тебя отпустил")]
+
     def _own_events(self, og: GoslingStatus | None, ng: GoslingStatus) -> list[Change]:
         """«Глаза Гослинга»: пока он не рядом с Владосом (дальше слышимости), — что с ним самим, по данным игры о нём:
         куда пришёл, мимо чего прошёл, что видел нового, кто рядом, напали ли. Это он видел сам: в «Недавно», в
@@ -637,6 +652,7 @@ class GameState:
         old, changes = self.status, []
         if new.gosling is not None:  # первым: что ещё в этом снимке, Гослинг видел, только если вы вместе
             changes.extend(self._track_apart(new.gosling))
+            changes.extend(self._track_follower(old.gosling, new.gosling))
             changes.extend(self._own_events(old.gosling, new.gosling))
         if new.hold == "":
             new.hold = None  # в диких землях владение не всегда известно — помним прежнее

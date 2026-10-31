@@ -163,7 +163,7 @@ class BrainConfig(BaseModel):
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
         "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "taken",
         "hurt_self", "personal", "order_failed", "rejoined", "arrived", "own_fight", "own_fight_end", "own_unknown",
-        "talked", "oddity",
+        "talked", "oddity", "hired", "dismissed",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился

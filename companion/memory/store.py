@@ -137,8 +137,11 @@ class MemoryStore:
                 if self._db:
                     self._db.close()
                 self.root.mkdir(parents=True, exist_ok=True)
+                fresh = not (self.root / f"{key}.db").is_file()
                 self._db = sqlite3.connect(self.root / f"{key}.db", check_same_thread=False)
                 self._db.executescript(SCHEMA)
+                if fresh:  # новый персонаж: Гослинг ему ещё не спутник (companion_since)
+                    self._db.execute("INSERT OR REPLACE INTO meta VALUES ('companion_since', '')")
                 if "feel" not in {r[1] for r in self._db.execute("PRAGMA table_info(soul)")}:  # база до 2026-10-19
                     self._db.execute("ALTER TABLE soul ADD COLUMN feel TEXT")
                 self.key = key
@@ -171,17 +174,37 @@ class MemoryStore:
                 (time.time(), where.game_days, kind, text, emotion, int(initiative), where.place or None))
             self._db.commit()
 
+    @property
+    def companion_since(self) -> float | None:
+        """С какой игровой даты Гослинг — спутник этого персонажа; None — ещё ни разу не звали. Базы до 2026-10-31
+        отметки не знают — там он спутник с самого начала (0)."""
+        value = self.get_meta("companion_since")
+        return 0.0 if value is None else float(value) if value else None
+
+    def mark_companion(self, game_days: float | None) -> None:
+        """Владос взял Гослинга в спутники: с этой даты — «вместе». Отметка позже game_days (загружен сейв до найма)
+        переносится на эту дату."""
+        since = self.companion_since
+        if game_days is not None and (since is None or since > game_days + FUTURE_EPSILON):
+            self.set_meta("companion_since", str(game_days))
+            log.info("Память: Гослинг — спутник с игрового дня %.2f", game_days)
+
     def visits(self, own: bool = False) -> list[tuple[str, float, float]]:
         """Где бывали вместе: (место, первая и последняя игровая дата), свежие первыми. Место — локация
         (первая часть «Вайтран, Гарцующая кобыла»); дикие земли не считаем. own — где Гослинг был сам, без Владоса
-        (записи вида own): без этого места одиночной вылазки попадали в «где вы бывали вместе» (21.10)."""
+        (записи вида own): без этого места одиночной вылазки попадали в «где вы бывали вместе» (21.10).
+        Вместе — только с найма (companion_since): до него Владос с Гослингом разве что виделись в таверне (31.10:
+        на первой встрече Гослинг «вспоминал», как вы были вместе в Рорикстеде)."""
+        since = None if own else self.companion_since
+        if not own and since is None:
+            return []
         with self._lock:
             if not self._db:
                 return []
             rows = self._db.execute(
                 "SELECT place, min(game_days), max(game_days) FROM journal "
                 "WHERE archived = 0 AND place IS NOT NULL AND game_days IS NOT NULL AND (kind = 'own') = ? "
-                "GROUP BY place", (own,)).fetchall()
+                "AND game_days >= ? GROUP BY place", (own, since or 0.0)).fetchall()
         merged: dict[str, tuple[float, float]] = {}
         for place, first, last in rows:
             name = place.split(", ")[0]

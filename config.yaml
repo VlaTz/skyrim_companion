@@ -175,7 +175,7 @@ brain:
   events: [loaded, location, wilderness, interior, combat_started, combat_ended, low_health, item, discovered, profile,
            power, person, quest, quest_misc, cleared, crime, talk, deed, activated, unlocked, reading, looted, furniture,
            novel, threat, thought, died, gift, taken, hurt_self, personal, order_failed, rejoined, arrived,
-           own_fight, own_fight_end, own_unknown, talked, oddity]
+           own_fight, own_fight_end, own_unknown, talked, oddity, hired, dismissed]
   overheard_quiet: 3  # секунд без новых реплик NPC — разговор закончился, можно решать (и игрок вышел из меню разговора)
 
 # Летописец: по журналу пишет дневник, факты и цели (модель — diarist.model). Глава кончилась, когда:
