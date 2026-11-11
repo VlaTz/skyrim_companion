@@ -16,7 +16,10 @@ CANON = "Владос"
 CASES = {"name": CANON, "gen": "Владоса", "dat": "Владосу", "ins": "Владосом", "pre": "Владосе"}
 # Имя-метка во всех падежах; перед ним — «о» (о Владосе -> об Иване).
 _CANON_RE = re.compile(r"(?:\b([Оо]) )?\b(" + "|".join(sorted(CASES.values(), key=len, reverse=True)) + r")\b")
-_to: dict[str, str] | None = None  # форма-метка -> форма имени из конфига; None — имя то же (ничего не меняем)
+_named: dict[str, str] | None = None  # форма-метка -> форма имени из конфига; None — имя то же (ничего не меняем)
+# До найма Гослинг имени не знает (stranger): «незнакомец» во всех падежах.
+_STRANGER = dict(zip(CASES.values(), ("незнакомец", "незнакомца", "незнакомцу", "незнакомцем", "незнакомце")))
+_to: dict[str, str] | None = None  # что подставляем сейчас: _named или _STRANGER
 
 
 def decline(name: str) -> dict[str, str]:
@@ -35,28 +38,40 @@ def decline(name: str) -> dict[str, str]:
 
 def setup(name: str, forms: dict[str, str] | None = None) -> None:
     """Имя Игрока из конфига; forms — свои падежи (gen, dat, ins, pre) поверх выведенных."""
-    global _to
+    global _named, _to
     name = (name or "").strip()
     if not name or (name == CANON and not forms):
-        _to = None
-        return
-    mine = decline(name) | {k: v for k, v in (forms or {}).items() if k in CASES and v}
-    _to = {CASES[case]: mine[case] for case in CASES}
+        _named = None
+    else:
+        mine = decline(name) | {k: v for k, v in (forms or {}).items() if k in CASES and v}
+        _named = {CASES[case]: mine[case] for case in CASES}
+    _to = _STRANGER if _to is _STRANGER else _named
+
+
+def stranger(unknown: bool) -> None:
+    """Гослинг ещё не нанят — имени Игрока не знает: для модели он «незнакомец» (MemoryKeeper; имя — при найме)."""
+    global _to
+    _to = _STRANGER if unknown else _named
 
 
 def name() -> str:
-    """Как зовут Игрока (имя из конфига)."""
+    """Как зовут Игрока (имя из конфига; до найма — «незнакомец»)."""
     return _to[CANON] if _to else CANON
 
 
+_SENTENCE_START = re.compile(r"(?:^|[.!?\n])[\s«\"(—-]*$")
+
+
 def apply(text: str) -> str:
-    """Имя-метка во всех падежах -> имя из конфига."""
+    """Имя-метка во всех падежах -> имя из конфига (или «незнакомец»)."""
     if not _to or not text:
         return text
     def name_for(m: re.Match) -> str:
         form, before = _to[m.group(2)], m.group(1)
         if before and form[:1].lower() in "аеёиоуыэюя":
             before += "б"
+        if not before and form[:1].islower() and _SENTENCE_START.search(text, 0, m.start()):
+            form = form[:1].upper() + form[1:]  # «Незнакомец ушёл» — в начале фразы с большой
         return f"{before} {form}" if before else form
     return _CANON_RE.sub(name_for, text)
 

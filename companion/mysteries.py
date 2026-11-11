@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
 
 from companion import trace
 from companion.config import MysteriesConfig
+from companion.game.geo import UNITS_PER_METER
 from companion.game.state import Change
 from companion.memory.store import MemoryStore
 
@@ -37,6 +39,8 @@ KINDS = {
                            "прошло {what}, а ты не помнишь, как оно прошло"),
     "одинаковые слова": ("люди слово в слово повторяют одно и то же", "{what}"),
     "сумка Владоса": ("в сумку Владоса влезает невозможное", "{what}"),
+    "переносы": ("тебя вдруг переносит к Владосу", "тебя вдруг перенесло к Владосу: {what} — а теперь стоишь рядом "
+                                                   "с ним, и как ты тут оказался, не понимаешь; дороги не было"),
 }
 FIRST = ("Такое ты видишь впервые и не понимаешь, как это возможно: удивись по-своему и, если к месту, спроси "
          "Владоса. Объяснений как факт не выдумывай — ты не знаешь.")
@@ -62,6 +66,8 @@ class Mysteries:
         self._clock: tuple[float, float] | None = None  # (игровые дни, реальное время) прошлого статуса
         self._down = False                               # Гослинг лежит без сил
         self._bag_said = 0                               # сколько вещей было, когда говорил о сумке
+        self._gosling: tuple[float, dict] | None = None  # (реальное время, gosling) прошлого статуса
+        self.near = 30.0  # м — рядом с Владосом (слышимость; ставит сервер: npc_voice.max_distance)
 
     # ------------------------------------------------------------ данные игры
 
@@ -71,7 +77,8 @@ class Mysteries:
             return []
         found: list[tuple[str, str]] = []  # (загадка, подробности)
         if event_type == "game_loaded":
-            self._clock, self._down = None, False  # загрузка — не «провал во времени»: время в сейве своё
+            # загрузка — не «провал во времени» и не «перенос»: время и места в сейве свои
+            self._clock, self._down, self._gosling = None, False, None
         for c in changes:
             if c.kind == "died":  # загрузились после гибели Владоса
                 found.append(("возвращения Владоса", ""))
@@ -85,6 +92,8 @@ class Mysteries:
                 self._down = bool(gosling["bleedout"])
             if (jump := self._time_jump(data)) is not None:
                 found.append(("провалы во времени", jump))
+            if gosling and (carried := self._carried(gosling)):
+                found.append(("переносы", carried))
         if event_type == "player" and (bag := self._bag(player or {})):
             found.append(("сумка Владоса", bag))
         return [c for key, what in found if (c := self._seen(key, what))]
@@ -104,6 +113,31 @@ class Mysteries:
             return None
         whole = round(hours)
         return f"{whole} ч" if whole < 24 else f"{round(hours / 24, 1)} дн."
+
+    def _carried(self, g: dict) -> str:
+        """Гослинг был не рядом с Владосом, а следующим снимком — рядом, и дойти бы так не успел: игра перенесла
+        спутника к игроку (быстрое перемещение, «догоняние» отставшего). Он-то шёл — и вдруг здесь (04.11: «топал из
+        Вайтрана в Ривервуд», а его перенесло за 12 с). Были вместе — это не его загадка: перенесло обоих («провалы»)."""
+        now, prev = time.time(), self._gosling
+        self._gosling = (now, g)
+        if not prev:
+            return ""
+        at, og = prev
+        near = lambda s: bool(s.get("loaded")) and 0 <= float(s.get("distance", -1)) <= self.near  # noqa: E731
+        if near(og) or not near(g):
+            return ""
+        where = ", ".join(x for x in dict.fromkeys((og.get("location") or "", og.get("cell") or "")) if x)
+        if og.get("pos") and g.get("pos"):  # под открытым небом — по его координатам
+            meters = math.hypot(g["pos"][0] - og["pos"][0], g["pos"][1] - og["pos"][1]) / UNITS_PER_METER
+            if meters < self.cfg.carry_meters or meters / max(now - at, 1.0) < self.cfg.carry_speed:
+                return ""
+            return f"только что ты был {('в месте ' + where) if where else 'на дороге'}, ~{round(meters)} м отсюда"
+        # В помещении координат нет: был в другом месте и далеко (или не виден игре) — а через пару секунд рядом.
+        moved = (og.get("location"), og.get("cell")) != (g.get("location"), g.get("cell"))
+        far = not og.get("loaded") or float(og.get("distance", -1)) > self.cfg.carry_meters
+        if moved and far and now - at <= self.cfg.carry_meters / self.cfg.carry_speed:
+            return f"только что ты был {('в месте ' + where) if where else 'далеко отсюда'}"
+        return ""
 
     def _repeat(self, change: Change) -> str:
         """Реплику NPC слово в слово слышал уже не раз (в разные дни, а не эхом): чья, что, сколько раз."""

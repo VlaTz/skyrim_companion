@@ -160,7 +160,8 @@ class Thinker:
         now = time.time()
         # Гослинг не рядом с Владосом — не думает о месте, где его нет: что поменялось, увидит, когда вы снова вместе.
         if (not self.store.is_open or self.game.updated is None or now - self.game.updated > GAME_STALE
-                or self.game.apart_since is not None or not self._busy.acquire(blocking=False)):
+                or self.game.apart_since is not None or self.game.stranger  # незнакомцу думать не о чем
+                or not self._busy.acquire(blocking=False)):
             return False
         try:
             state = self._state()

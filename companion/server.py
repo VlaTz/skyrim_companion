@@ -52,7 +52,7 @@ from companion.memory.diarist import Diarist
 from companion.memory.keeper import MemoryKeeper
 from companion.memory.thinker import Thinker
 from companion.memory.store import MemoryStore
-from companion.tools import build_tools
+from companion.tools import build_tools, jokes_tool
 from companion.vision import Vision
 from companion.voice.npc_voice import NpcVoice
 from companion.voice.service import VoiceService
@@ -143,6 +143,7 @@ def create_app(cfg: Config) -> FastAPI:
     personal = Personal(mood, cfg.personal) if mood and cfg.personal.enabled else None  # событие задело душу — повод
     # Загадки: «швы» игры глазами Гослинга (Владос погиб — и жив, время провалилось) — удивиться, гадать, спросить.
     mysteries = memory.mysteries = Mysteries(memory.store, cfg.mysteries)
+    mysteries.near = cfg.npc_voice.max_distance  # рядом с Владосом — как слышимость
     game.meet = memory.meet  # встречи (раса врага, Крик) — «впервые» или «уже встречали»
     npc_voice = NpcVoice(cfg.npc_voice, game, commands.send, commands.connected,
                          lip_generator=cfg.game.lip_generator if cfg.npc_voice.lip else None)
@@ -221,6 +222,8 @@ def create_app(cfg: Config) -> FastAPI:
                 book = JokeBook(jokes_file, cfg.character_path / "jokes_auto.yaml")
                 writer = JokeWriter(book, service.llm.complete_json, cfg.jokes.model) if cfg.jokes.refill else None
                 state["brain"].jokes = Jokes(book, game, places, memory, writer, cfg.jokes)
+                # те же заготовки — и в ответ на «скажи шутку» (справка jokes)
+                service.llm.set_tools([*service.llm.tools.values(), jokes_tool(state["brain"].jokes)])
             if cfg.brain.musings.enabled:  # размышления о мире в тишине — темы из базы знаний
                 state["brain"].musings = Musings(knowledge, memory, cfg.brain.musings.local)
             state["brain"].start()
@@ -348,7 +351,8 @@ def create_app(cfg: Config) -> FastAPI:
             mood.notify(seen)
         touched = personal.notify(seen) if personal and seen else []  # задело запись души — повод мозгу: от себя
         seen += touched
-        if odd := mysteries.on_event(event.type, event.data, changes, game.player):  # странность — пора сказать о ней
+        # Загадки — у спутника: незнакомец в таверне чужих «провалов во времени» не видел.
+        if not game.stranger and (odd := mysteries.on_event(event.type, event.data, changes, game.player)):
             memory.record_changes(odd)
             seen += odd
             touched += odd

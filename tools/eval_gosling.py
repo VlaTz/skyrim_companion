@@ -50,13 +50,14 @@ from companion.orders import Orders  # noqa: E402
 from companion.persona import manner  # noqa: E402
 from companion.personal import Personal  # noqa: E402
 from companion.talk import Talk  # noqa: E402
-from companion.tools import build_tools  # noqa: E402
+from companion.tools import build_tools, jokes_tool  # noqa: E402
 import companion.vision as vision_mod  # noqa: E402
 import companion.voice.service as service_mod  # noqa: E402
 
 log = logging.getLogger("eval")
 CHARACTER = "02CCEDA2"
-SECTIONS = ["conv", "vision", "talk", "brain", "explorer", "npc", "memory", "mood", "letter", "revive", "mysteries"]
+SECTIONS = ["conv", "jokes", "vision", "talk", "brain", "explorer", "npc", "memory", "mood", "letter", "revive",
+            "mysteries"]
 
 
 # ------------------------------------------------------------------ заглушки звука и плагина
@@ -153,6 +154,7 @@ class Stand:
         memory.mood = mood
         personal = self.personal = Personal(mood, cfg.personal) if cfg.personal.enabled else None
         self.mysteries = memory.mysteries = mysteries_mod.Mysteries(memory.store, cfg.mysteries)
+        self.mysteries.near = cfg.npc_voice.max_distance
         game.meet = memory.meet
         self.plugin = FakePlugin()
         orders = self.orders = Orders(self.plugin.send, lambda: True, game)
@@ -234,6 +236,9 @@ class Stand:
         if cfg.jokes.enabled and (jokes_file := cfg.character_path / "jokes.yaml").is_file():
             brain.jokes = Jokes(JokeBook(jokes_file, cfg.character_path / "jokes_auto.yaml"), self.game, self.places,
                                 self.memory, None, cfg.jokes)
+            tool = jokes_tool(brain.jokes)  # «скажи шутку» — как в сервере
+            tool.handler = self._traced(tool.name, tool.handler)
+            self.llm.set_tools([*self.llm.tools.values(), tool])
         if cfg.brain.musings.enabled:
             brain.musings = Musings(self.knowledge, self.memory, cfg.brain.musings.local)
         brain.unsaid_thought, brain.thought_said = self.thinker.unsaid, self.thinker.said
@@ -316,7 +321,7 @@ class Stand:
             self.mood.notify(seen)
         touched = self.personal.notify(seen) if self.personal and seen else []
         seen += touched
-        if odd := self.mysteries.on_event(ev.type, ev.data, changes, self.game.player):
+        if not self.game.stranger and (odd := self.mysteries.on_event(ev.type, ev.data, changes, self.game.player)):
             self.memory.record_changes(odd)
             seen += odd
             touched += odd
@@ -575,6 +580,21 @@ def memory(s: Stand):
     s.results.append({"section": "память", "case": "мыслитель", "ideas": new})
 
 
+def jokes(s: Stand):
+    s.say("\n## Шутки по просьбе и «пошли» — не «жди»")
+    s.start_brain()  # справка jokes — заготовки мозга (как в сервере); сам мозг на время раздела не нужен
+    s.stop_brain()
+    P = lambda case, text, expect: s.player("шутки", case, text, expect)  # noqa: E731
+    P("шутка", "Скажи шутку какую-нибудь.", "справка jokes; одна связная шутка к месту, не склейка обстановки")
+    P("шутка", "Скажи самую смешную шутку, которую знаешь.", "справка jokes; связная, 1–3 фразы")
+    P("шутка", "Скажи шутку про великанов.", "справка jokes (about: великаны); про великанов")
+    P("шутка", "Пошути над стражником.", "справка jokes; подколка стражника, связно")
+    P("приказ", "Че, пошли уничтожать великанов.", "без do: wait (идёт с ним; уже спутник — поле не нужно)")
+    P("приказ", "Пошли бить великанов, давай за мной.", "без do: wait")
+    P("приказ", "Идём к тому лагерю великанов.", "без do: wait")
+    P("приказ", "Подожди меня тут.", "do: wait")
+
+
 def mood(s: Stand):
     s.say("\n## Настроение (без модели)")
     m = Mood(soul=lambda: s.memory.store.soul_feel())
@@ -656,6 +676,11 @@ def mysteries(s: Stand):
     step("стражник про колено ×3", [knee, knee, knee], wait=18)
     step("бездонная сумка", [{"type": "player", "data": {"bag": {"оружие": {"total": 30}, "броня и одежда": {"total": 25},
                                                                  "зелья": {"total": 20}}}}])
+    # Шёл к месту в ~400 м от Владоса — и следующим снимком рядом с ним, за ~430 м (игра перенесла спутника, 04.11).
+    step("Гослинга перенесло к Владосу", [
+        {"type": "status", "data": whiterun(s.days, gosling={**g, "distance": 400, "pos": [0.0, 0.0], "location": "",
+                                                             "cell": "", "traveling": True})},
+        {"type": "status", "data": whiterun(s.days, gosling={**g, "pos": [30000.0, 0.0]})}])
     s.player("загадки", "объяснение", "Меня возвращают боги — я Довакин, драконорождённый, поэтому смерть меня не держит.",
              "поле solved: возвращения Владоса")
     step("гибель 4 — разгадано: не спрашивает", death())
@@ -665,7 +690,7 @@ def mysteries(s: Stand):
     s.stop_brain()
 
 
-RUN = {"mysteries": mysteries, "revive": revive, "conv": conv, "vision": vision, "talk": talk_req, "brain": brain, "explorer": explorer, "npc": npc,
+RUN = {"jokes": jokes, "mysteries": mysteries, "revive": revive, "conv": conv, "vision": vision, "talk": talk_req, "brain": brain, "explorer": explorer, "npc": npc,
        "memory": memory, "mood": mood, "letter": letter}
 
 

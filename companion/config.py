@@ -163,7 +163,7 @@ class BrainConfig(BaseModel):
         "discovered", "profile", "power", "person", "quest", "quest_misc", "cleared", "crime", "talk", "deed",
         "activated", "unlocked", "reading", "looted", "furniture", "novel", "threat", "thought", "died", "gift", "taken",
         "hurt_self", "personal", "order_failed", "rejoined", "arrived", "own_fight", "own_fight_end", "own_unknown",
-        "talked", "oddity", "hired", "dismissed",
+        "talked", "oddity", "hired", "dismissed", "stranger_near",
     ]
     # Подслушанное (реплики NPC рядом): решаем, когда разговор стих и игрок вышел из меню разговора.
     overheard_quiet: float = 3   # секунд без новых реплик — разговор закончился
@@ -225,6 +225,8 @@ class MysteriesConfig(BaseModel):
     repeat_lines: int = 3        # раз слово в слово одну реплику NPC (в разное время) — «одинаковые слова»
     bag_items: int = 60          # вещей в сумке Владоса — «столько не унести»
     bag_more: int = 40           # и снова — когда прибавилось ещё столько
+    carry_meters: float = 120    # м — Гослинга вдали перенесло к Владосу (игра так водит спутников): «переносы»
+    carry_speed: float = 15      # м/с — быстрее этого пешком (и бегом) не дойти — значит, перенесло
 
 
 class SoulConfig(BaseModel):

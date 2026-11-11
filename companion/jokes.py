@@ -399,6 +399,22 @@ class Jokes:
                     + "\n".join(f"- {hid}: {text}" for hid, text in history) + "\n")
         return out
 
+    def on_request(self, about: str = "") -> str:
+        """Справка «шутки»: Владос просит пошутить — заготовки к обстановке и к теме about («про великанов»).
+        Без неё модель на «скажи шутку» лепила шутку из обстановки: «в Вайтране дождь, в сумке топор» (04.11)."""
+        about = (about or "").lower()
+        topic = {tag for pattern, tag in TEXT_TAGS if pattern.search(about)}
+        topic |= {tag for tag in self.book.tags if about and tag.lower()[:5] in about}  # «великанов» -> «великан»
+        # Тема названа — заготовки о ней, а не к месту: в Вайтране метки места перевешивали «великанов» (04.11).
+        said, days = self._said()
+        on_topic = [j for j in self.book.pick(topic, said, days) if j.tags & topic] if topic else []
+        block = ("Заготовки шуток на эту тему (id — в \"joke\"):\n" + "\n".join(f"- {j.id}: {j.text}" for j in on_topic)
+                 + "\n" if on_topic else self.block(extra=topic))
+        # «Своими словами» модель на просьбе пересказывала заготовку и портила («дождь по четвергам», 04.11): байку
+        # рассказывают почти как есть — её и так все повторяют.
+        return (block + "Расскажи одну — почти как есть, лишь подстроив под момент; связно, без склеек из обстановки."
+                if block else "Заготовок к месту нет — пошути сам о том, что видите, или признайся, что не до шуток.")
+
     def said(self, joke_id: str) -> None:
         """Гослинг обыграл заготовку или строку истории — в память персонажа (по сейву)."""
         if not (joke_id.startswith("h-") or self.book.has(joke_id)):  # выдумал id или обыграл то, чего не давали

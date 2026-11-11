@@ -15,6 +15,7 @@ from companion.game.state import GameState
 from companion.knowledge import Knowledge
 
 if TYPE_CHECKING:  # память импортирует состояние игры — только для подсказок типов
+    from companion.jokes import Jokes
     from companion.memory.keeper import MemoryKeeper
     from companion.vision import Vision
 
@@ -29,6 +30,30 @@ class Tool:
     def schema(self) -> dict:
         return {"type": "function",
                 "function": {"name": self.name, "description": self.description, "parameters": self.parameters}}
+
+
+STRANGER_PRIVATE = ("Путник тебе незнаком: в его сумку и журнал заданий ты не заглядываешь — это не твоё дело. "
+                    "Позовёт в спутники — тогда.")
+
+
+def companion_only(game: GameState, handler: Callable[..., str]) -> Callable[..., str]:
+    """Справка о делах и вещах Владоса — только спутнику; незнакомцу (ещё не нанят) — отказ."""
+    return lambda **kwargs: STRANGER_PRIVATE if game.stranger else handler(**kwargs)
+
+
+def jokes_tool(jokes: Jokes) -> Tool:
+    """Справка «шутки» — заготовки к месту и из общей истории (companion/jokes.py), когда Владос просит пошутить."""
+    return Tool(
+        name="jokes",
+        description=(
+            "Заготовки шуток к месту: местные байки и поговорки Скайрима и подколки из вашей общей истории, ещё не "
+            "сказанные. Вызывай, когда Владос просит пошутить, рассказать шутку, анекдот или байку, подколоть "
+            "кого-то («скажи шутку», «пошути над ним», «расскажи что-нибудь смешное про великанов»). Шутку из "
+            "обстановки сам не сочиняй — сначала эта справка."),
+        parameters={"type": "object", "properties": {"about": {
+            "type": "string", "description": "О чём шутка, если Владос назвал тему («великаны», «стража»). Пусто — к месту."}}},
+        handler=jokes.on_request,
+    )
 
 
 def place_info(places: PlaceBook, name: str) -> str:
@@ -71,7 +96,7 @@ def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Kno
                 "заданий уже есть в «Сейчас в игре»; эта справка — когда нужен весь список: «какие у нас "
                 "задания?», «что ещё можно сделать?»."),
             parameters={"type": "object", "properties": {}},
-            handler=game.quest_log.summary,
+            handler=companion_only(game, game.quest_log.summary),
         ),
         Tool(
             name="quest_details",
@@ -85,7 +110,7 @@ def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Kno
                 "properties": {"name": {"type": "string", "description": "Название квеста или его часть."}},
                 "required": ["name"],
             },
-            handler=game.quest_log.details,
+            handler=companion_only(game, game.quest_log.details),
         ),
         Tool(
             name="player_details",
@@ -96,7 +121,7 @@ def build_tools(game: GameState, places: PlaceBook | None = None, knowledge: Kno
                 "«глянь, что у меня есть», «посмотрел, что в сумке?», «что продать?», «хватит ли денег?», "
                 "«чем лечиться?», «что надеть?» — не отказывайся и не обещай посмотреть потом."),
             parameters={"type": "object", "properties": {}},
-            handler=game.player_details,
+            handler=companion_only(game, game.player_details),
         ),
     ]
     if places:

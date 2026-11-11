@@ -5,6 +5,7 @@ TESDataHandler::LookupForm(номер, "Gosling.esp"). В C++ они проду�
 """
 
 PLUGIN = "Gosling.esp"
+NAME = "Гослинг"  # имя NPC в игре: так он и в «рядом» у плагина — себя Гослинг там не видит
 # Свой тип голоса для реплик сервиса (как MantellaVoice00 у Mantella): на время Say() Гослингу ставится
 # он, файлы лежат в его папке. Обычный голос Гослинга (бой, «веди») — MaleYoungEager Эрика, шаблоном.
 VOICE_TYPE = "GoslingVoice"

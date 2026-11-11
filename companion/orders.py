@@ -89,6 +89,9 @@ class Orders:
         соглашаясь: начиная вылазку, исследователь держится сказанного («пойдём к шахте» — первая цель шахта)."""
         if action not in ACTIONS:
             return
+        if self.game.stranger and action != "follow":  # незнакомец не слуга: «пойдём со мной» — наём, прочее — нет
+            log.info("Приказ %s: Гослинг ещё не нанят — не выполняет", action)
+            return
         if action in EXPLORE:
             self.on_explore(action, said)
             return

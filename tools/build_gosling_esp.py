@@ -55,7 +55,7 @@ SCRIPTS_SRC = ROOT / "mod" / "Scripts" / "Source"
 SCRIPTS_PREBUILT = ROOT / "mod" / "Scripts"  # готовые .pex в git: собрать мод можно и без Creation Kit
 BUILT_FROM = SCRIPTS_PREBUILT / "built_from.txt"
 
-NAME = "Гослинг"
+NAME = mod.NAME
 FORM_VERSION = 44  # версия записей Skyrim SE
 
 # Записи Skyrim.esm (найдены по EditorID, проверено: Update.esm их не меняет)

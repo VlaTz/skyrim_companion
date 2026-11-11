@@ -23,6 +23,7 @@ import re
 import time
 from typing import Callable
 
+from companion import naming
 from companion.game.books import book_key
 from companion.knowledge import stems
 from companion.game.places import PlaceBook
@@ -98,6 +99,10 @@ class MemoryKeeper:
             if event.type == "game_loaded" or memory_key(character, name) != self.store.key:
                 changed = self.store.open(character, name, self._days)
                 self.store.rename_encounters("раса", legacy_race_keys())
+                self._sync_stranger()
+                if self.game.stranger and event.type == "game_loaded":  # незнакомец: загрузку игрока он не видел
+                    for change in changes:
+                        change.unseen = True
                 if changed:
                     self.opened += 1
                     self._restore_heard()
@@ -117,11 +122,21 @@ class MemoryKeeper:
         if event.type == "status":
             if (g := self.game.status.gosling) and g.follower and self.store.is_open:  # взял в спутники — «вместе»
                 self.store.mark_companion(self._days)
+                self._sync_stranger()
             location = self.game.status.location
             area = None if location is None else (self._area(location) if location else "дикие земли")
             if area and self._area_now and area != self._area_now:
                 self.on_place_changed()
             self._area_now = area or self._area_now
+
+    def _sync_stranger(self) -> None:
+        """Ни разу не брал в спутники (companion_since) — Гослинг незнакомец: в игре «не рядом», пока игрок не подошёл
+        (GameState.set_stranger), имени не знает (naming.stranger). Взял — узнаёт имя, включается всё."""
+        stranger = self.store.is_open and self.store.companion_since is None
+        if stranger != self.game.stranger:
+            log.info("Память: Гослинг %s", "ещё не нанят — незнакомец" if stranger else "спутник — знает игрока")
+        self.game.set_stranger(stranger)
+        naming.stranger(stranger)
 
     def record_changes(self, changes: list[Change]) -> None:
         """Изменения в игре — в журнал. Без Гослинга (Change.unseen) — нет: он этого не видел, значит, и не помнит;
@@ -378,11 +393,12 @@ class MemoryKeeper:
         if self._days is None:
             return ""
         parts = []
-        if profile := self.game.profile.summary(self.game.player_name):
+        stranger = self.game.stranger  # незнакомцу — ни профиля игрока, ни загадок мира, что видел рядом с ним
+        if not stranger and (profile := self.game.profile.summary(self.game.player_name)):
             parts.append(profile)
         if soul := soul_block(self.store):  # что Гослинг решил о себе — о себе говорит в согласии с этим
             parts.append(soul)
-        if self.mysteries and (mysteries := self.mysteries.describe()):  # странности мира: что видел, что разгадано
+        if not stranger and self.mysteries and (mysteries := self.mysteries.describe()):  # странности мира: что видел, что разгадано
             parts.append(mysteries)
         goals = self.store.active_goals()
         for kind, title in GOAL_TITLES.items():
@@ -407,9 +423,9 @@ class MemoryKeeper:
                  if name not in together][:MAX_VISITS]
         if alone:  # вылазки без Владоса: он там не был — не «вместе»
             parts.append("Где ты был сам, без Владоса (последние): " + "; ".join(alone) + ".")
-        if self.store.companion_since is None:  # ещё не нанят: первая встреча, а не «мы же с тобой…»
-            parts.append("Владос ещё ни разу не брал тебя в спутники: вы не путешествовали вместе, общего прошлого у "
-                         "вас нет — что знаешь о нём, видишь сейчас.")
+        if stranger:  # ещё не нанят: первая встреча, а не «мы же с тобой…»
+            parts.append("Ты с этим путником не знаком: в спутники он тебя не звал, общего прошлого у вас нет, как его "
+                         "зовут — не знаешь (для тебя он незнакомец); что знаешь о нём — то, что видишь сейчас.")
         if parts:
             parts.append("Чего нет в памяти и дневнике, ты не помнишь — подробностей не выдумывай.")
         return "\n".join(parts)
